@@ -1,0 +1,5 @@
+# original and patched game files are copyrighted and must not be published
+backup/
+build/
+__pycache__/
+*.log

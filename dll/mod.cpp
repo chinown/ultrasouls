@@ -55,6 +55,16 @@ static void logf(const char *fmt, ...) {
 static volatile LONG g_di_dx = 0, g_di_dy = 0, g_di_events = 0;
 static volatile LONG g_raw_dx = 0, g_raw_dy = 0, g_raw_events = 0;
 static void *g_mouse_dev = nullptr;
+enum { MOUSE_DEVS = 64 };
+static void *volatile g_mouse_devs[MOUSE_DEVS];   // recent devices created with the mouse GUID
+static volatile LONG g_mouse_dev_n = 0, g_di_state_calls = 0, g_di_data_calls = 0;
+static volatile LONG g_cur_dx = 0, g_cur_dy = 0, g_cur_events = 0;   // third source: the Windows cursor
+
+static bool is_mouse_dev(void *dev) {
+    for (int i = 0; i < MOUSE_DEVS; i++)
+        if (g_mouse_devs[i] == dev) return true;
+    return false;
+}
 static GUID g_dev_guids[8];
 static volatile LONG g_dev_n = 0;
 static const GUID GUID_SYS_MOUSE = {0x6F1D2B60, 0xD5A0, 0x11CF, {0xBF, 0xC7, 0x44, 0x45, 0x53, 0x54, 0x00, 0x00}};
@@ -63,8 +73,30 @@ typedef HRESULT(WINAPI *CreateDeviceFn)(void *self, const GUID &guid, void **dev
 typedef HRESULT(WINAPI *GetStateFn)(void *self, DWORD cb, void *data);
 typedef HRESULT(WINAPI *GetDataFn)(void *self, DWORD cb_obj, void *rgdod, DWORD *in_out, DWORD flags);
 static CreateDeviceFn g_orig_create_device = nullptr;
-static GetStateFn g_orig_get_state = nullptr;
-static GetDataFn g_orig_get_data = nullptr;
+static const GUID GUID_SYS_KEYBOARD = {0x6F1D2B61, 0xD5A0, 0x11CF, {0xBF, 0xC7, 0x44, 0x45, 0x53, 0x54, 0x00, 0x00}};
+
+// While first person is on, the game must not see the keys ULTRAKILL uses (Space roll, Shift and Ctrl
+// bindings), so they are cleared from the keyboard state before it reaches the game. Our own controls
+// read the keys through GetAsyncKeyState, which this does not touch.
+static volatile bool g_block_keys = false;
+static const uint8_t BLOCKED_KEYS[] = {0x39, 0x2A, 0x36, 0x1D, 0x9D};   // DIK_SPACE, L/R SHIFT, L/R CONTROL
+
+// Devices of different kinds may have different vtables, so the originals are kept per vtable.
+struct DevVtable {
+    void **vt;
+    GetStateFn get_state;
+    GetDataFn get_data;
+};
+static DevVtable g_dev_vts[4];
+static volatile LONG g_dev_vt_n = 0;
+static volatile LONG g_keys_blocked = 0;
+
+static const DevVtable *find_vt(void *dev) {
+    void **vt = *(void ***)dev;
+    for (LONG i = 0; i < g_dev_vt_n; i++)
+        if (g_dev_vts[i].vt == vt) return &g_dev_vts[i];
+    return nullptr;
+}
 
 static void patch_vtable(void *obj, int index, void *replacement, void **original) {
     void **vt = *(void ***)obj;
@@ -77,19 +109,32 @@ static void patch_vtable(void *obj, int index, void *replacement, void **origina
 }
 
 static HRESULT WINAPI my_get_state(void *self, DWORD cb, void *data) {
-    HRESULT hr = g_orig_get_state(self, cb, data);
-    if (SUCCEEDED(hr) && self == g_mouse_dev && data && cb >= 8) {
+    const DevVtable *o = find_vt(self);
+    if (!o) return E_FAIL;
+    HRESULT hr = o->get_state(self, cb, data);
+    InterlockedIncrement(&g_di_state_calls);
+    // v0.12 matched on the device pointer and saw nothing: the game creates dozens of devices.
+    // The state size identifies a mouse instead (DIMOUSESTATE is 16 bytes, DIMOUSESTATE2 is 20).
+    if (SUCCEEDED(hr) && data && (cb == 16 || cb == 20)) {
         // DIMOUSESTATE starts with LONG lX, lY
         InterlockedExchangeAdd(&g_di_dx, ((LONG *)data)[0]);
         InterlockedExchangeAdd(&g_di_dy, ((LONG *)data)[1]);
         InterlockedIncrement(&g_di_events);
     }
+    if (SUCCEEDED(hr) && data && cb == 256 && g_block_keys) {
+        uint8_t *keys = (uint8_t *)data;
+        for (uint8_t k : BLOCKED_KEYS)
+            if (keys[k]) { keys[k] = 0; InterlockedIncrement(&g_keys_blocked); }
+    }
     return hr;
 }
 
 static HRESULT WINAPI my_get_data(void *self, DWORD cb_obj, void *rgdod, DWORD *in_out, DWORD flags) {
-    HRESULT hr = g_orig_get_data(self, cb_obj, rgdod, in_out, flags);
-    if (SUCCEEDED(hr) && self == g_mouse_dev && rgdod && in_out && !(flags & 1) && cb_obj >= 8) {
+    const DevVtable *o = find_vt(self);
+    if (!o) return E_FAIL;
+    HRESULT hr = o->get_data(self, cb_obj, rgdod, in_out, flags);
+    InterlockedIncrement(&g_di_data_calls);
+    if (SUCCEEDED(hr) && is_mouse_dev(self) && rgdod && in_out && !(flags & 1) && cb_obj >= 8) {
         // DIDEVICEOBJECTDATA starts with DWORD dwOfs, dwData; offsets 0 and 4 are the X and Y axes
         for (DWORD i = 0; i < *in_out; i++) {
             const DWORD *e = (const DWORD *)((const uint8_t *)rgdod + i * cb_obj);
@@ -97,8 +142,28 @@ static HRESULT WINAPI my_get_data(void *self, DWORD cb_obj, void *rgdod, DWORD *
             if (e[0] == 4) InterlockedExchangeAdd(&g_di_dy, (LONG)e[1]);
         }
         if (*in_out) InterlockedIncrement(&g_di_events);
+    } else if (SUCCEEDED(hr) && rgdod && in_out && cb_obj >= 8 && g_block_keys && !is_mouse_dev(self)) {
+        // buffered keyboard events: dwOfs is the key code; turn blocked keys into "released"
+        for (DWORD i = 0; i < *in_out; i++) {
+            DWORD *e = (DWORD *)((uint8_t *)rgdod + i * cb_obj);
+            for (uint8_t k : BLOCKED_KEYS)
+                if (e[0] == k && (e[1] & 0x80)) { e[1] = 0; InterlockedIncrement(&g_keys_blocked); }
+        }
     }
     return hr;
+}
+
+static void hook_device(void *dev) {
+    if (find_vt(dev) || g_dev_vt_n >= 4) return;
+    // record the originals before redirecting, so a call arriving mid-patch always finds them
+    DevVtable &d = g_dev_vts[g_dev_vt_n];
+    d.vt = *(void ***)dev;
+    d.get_state = (GetStateFn)d.vt[9];
+    d.get_data = (GetDataFn)d.vt[10];
+    InterlockedIncrement(&g_dev_vt_n);
+    void *unused;
+    patch_vtable(dev, 9, (void *)my_get_state, &unused);
+    patch_vtable(dev, 10, (void *)my_get_data, &unused);
 }
 
 static HRESULT WINAPI my_create_device(void *self, const GUID &guid, void **dev, void *outer) {
@@ -107,9 +172,10 @@ static HRESULT WINAPI my_create_device(void *self, const GUID &guid, void **dev,
     if (n < 8) g_dev_guids[n] = guid;
     if (SUCCEEDED(hr) && dev && *dev && IsEqualGUID(guid, GUID_SYS_MOUSE)) {
         g_mouse_dev = *dev;
-        patch_vtable(*dev, 9, (void *)my_get_state, (void **)&g_orig_get_state);
-        patch_vtable(*dev, 10, (void *)my_get_data, (void **)&g_orig_get_data);
+        g_mouse_devs[(InterlockedIncrement(&g_mouse_dev_n) - 1) % MOUSE_DEVS] = *dev;
+        hook_device(*dev);
     }
+    if (SUCCEEDED(hr) && dev && *dev && IsEqualGUID(guid, GUID_SYS_KEYBOARD)) hook_device(*dev);
     return hr;
 }
 
@@ -191,8 +257,44 @@ static volatile bool g_ctrl = false;        // first-person movement controller 
 static volatile float g_view_fwd[2] = {0, 1}, g_view_right[2] = {1, 0};   // horizontal view axes (x, z), unit length
 static float g_vx = 0, g_vz = 0;            // controller's horizontal velocity
 static const uintptr_t OFF_POS_YAW = 0x04;
-static const float RUN_SPEED = 9.0f;        // m/s, provisional until V1's real numbers are read from its code
-static const float AIR_CONTROL = 6.0f;      // 1/s, how fast held keys steer airborne momentum; provisional
+static const uintptr_t OFF_POS_AIR_TIME = 0x1B4;   // seconds since the grounded flag was last set (read from the disassembly, unverified)
+static float g_vy = 0;                      // controller's vertical velocity while airborne
+static bool g_air = false;
+static int g_air_steps = 0;                 // physics steps since takeoff
+static volatile LONG g_landings = 0, g_bonks = 0;
+
+// Height of the Havok character itself (what Step integrates), via the phantom's transform.
+static bool proxy_y(uintptr_t proxy, float &y) {
+    uintptr_t phantom = *(uintptr_t *)(proxy + 0x80);
+    uintptr_t body = phantom ? *(uintptr_t *)(phantom + 0x30) : 0;
+    if (!body) return false;
+    y = *(const float *)(body + 0x34);
+    return true;
+}
+static volatile bool g_jump_req = false;
+
+// V1's movement, read from ULTRAKILL (NewMovement.Move/Jump, the Player prefab, physics settings):
+// walkSpeed 750, jumpPower 90, airAcceleration 6000, mass 100, gravity 40, fixed step 0.008 s,
+// capsule 3.5 units tall. One unit is taken as 0.5 m so V1's capsule matches the character's height.
+static const float UK_UNIT = 0.5f;
+static const float V1_STEP = 0.008f;
+static const float V1_RUN_SPEED = 750.0f * V1_STEP * 2.75f * UK_UNIT;                    // 16.5 u/s -> 8.25 m/s
+static const float V1_JUMP_SPEED = 90.0f * 1500.0f * 2.6f * V1_STEP / 100.0f * UK_UNIT;  // 28.08 u/s -> 14.04 m/s
+static const float V1_SLIDE_JUMP_SPEED = V1_JUMP_SPEED * 2.0f / 2.6f;                    // 21.6 u/s -> 10.8 m/s
+static const float V1_DASH_JUMP_SPEED = V1_JUMP_SPEED * 1.5f / 2.6f;                     // 16.2 u/s -> 8.1 m/s
+static const float V1_GRAVITY = 40.0f * UK_UNIT;                                         // 20 m/s^2
+static const float V1_AIR_ACCEL = 6000.0f / 100.0f * UK_UNIT;                            // 60 u/s^2 -> 30 m/s^2
+// NewMovement.Dodge / TryDash / TryStartSlam / Update:
+static const float V1_DASH_SPEED = V1_RUN_SPEED * 3.0f;                                  // 49.5 u/s -> 24.75 m/s
+static const float V1_DASH_TIME = 25 * V1_STEP;                                         // boostLeft 100, -4 per step: 0.2 s
+static const float V1_SLIDE_SPEED = 750.0f * V1_STEP * 4.0f * UK_UNIT;                  // 24 u/s -> 12 m/s
+static const float V1_SLIDE_STEER = 5.0f * UK_UNIT;                                     // sideways input while sliding
+static const float V1_SLAM_SPEED = 100.0f * UK_UNIT;                                    // 100 u/s down -> 50 m/s
+static const float V1_BOOST_REGEN = 70.0f;                                              // stamina per second, 300 max, dash costs 100
+
+static float g_boost = 300.0f, g_dash_left = 0, g_dash_x = 0, g_dash_z = 0, g_slide_x = 0, g_slide_z = 0;
+static bool g_sliding = false, g_slamming = false, g_prev_shift = false, g_prev_ctrl = false;
+static volatile LONG g_dashes = 0, g_slides = 0, g_slams = 0;
 
 static int key_down(int vk) {
     DWORD pid = 0;
@@ -218,7 +320,8 @@ static const uintptr_t OFF_POS_NO_ADJUST = 0x1F8;
 
 static void hook_step(void *self, void *step_info, void *gravity) {
     uintptr_t proxy = 0;
-    bool rising = false;
+    bool rising = false, ctrl_air = false, have_y0 = false;
+    float ctrl_dt = 0, ctrl_vy = 0, y0 = 0;
     if ((uintptr_t)self == g_player_pos && g_player_pos) {
         proxy = *(uintptr_t *)((uintptr_t)self + OFF_POS_PROXY);
         if (proxy) {
@@ -231,28 +334,134 @@ static void hook_step(void *self, void *step_info, void *gravity) {
                 // First-person movement: WASD sets the horizontal velocity directly, relative to the view.
                 // On the ground it is instant; in the air the current momentum is steered, and kept if no key is held.
                 float dt = *(float *)((uintptr_t)step_info + 8);
-                bool grounded = *(uint8_t *)((uintptr_t)self + OFF_POS_GROUNDED) != 0;
+                // The grounded flag drops out for a frame or two on uneven ground, which in v0.12 left the
+                // character sliding on after the keys were released. The game's own air timer smooths that.
+                bool flag = *(uint8_t *)((uintptr_t)self + OFF_POS_GROUNDED) != 0;
+                float air_time = *(float *)((uintptr_t)self + OFF_POS_AIR_TIME);
+                if (g_jump_req && !g_air) {
+                    // NewMovement.Jump: a slide-jump is lower and keeps the slide speed; a dash-jump is lower
+                    // still and keeps the dash speed only if a stamina bar can be paid, else drops to run speed.
+                    if (g_sliding) {
+                        g_vy = V1_SLIDE_JUMP_SPEED;
+                    } else if (g_dash_left > 0) {
+                        g_vy = V1_DASH_JUMP_SPEED;
+                        if (g_boost >= 100.0f) {
+                            g_boost -= 100.0f;
+                        } else {
+                            g_vx = g_dash_x * V1_RUN_SPEED;
+                            g_vz = g_dash_z * V1_RUN_SPEED;
+                        }
+                    } else {
+                        g_vy = V1_JUMP_SPEED;
+                    }
+                    g_dash_left = 0;
+                    g_sliding = false;
+                    g_air = true;
+                    g_air_steps = 0;
+                } else if (!g_air && !flag && air_time >= 0.15f) {
+                    g_air = true;                       // walked off a ledge
+                    g_air_steps = 0;
+                    g_vy = vel[1] < 0 ? vel[1] : 0;
+                }
+                g_jump_req = false;
+
                 float f = (float)(key_down('W') - key_down('S')), s = (float)(key_down('D') - key_down('A'));
                 float wx = g_view_fwd[0] * f + g_view_right[0] * s, wz = g_view_fwd[1] * f + g_view_right[1] * s;
                 float wl = sqrtf(wx * wx + wz * wz);
                 if (wl > 1.0f) { wx /= wl; wz /= wl; }
-                if (grounded) {
-                    g_vx = wx * RUN_SPEED;
-                    g_vz = wz * RUN_SPEED;
-                } else if (wl > 0.01f) {
-                    float k = AIR_CONTROL * dt < 1.0f ? AIR_CONTROL * dt : 1.0f;
-                    g_vx += (wx * RUN_SPEED - g_vx) * k;
-                    g_vz += (wz * RUN_SPEED - g_vz) * k;
+                // direction for a dash or slide: the keys held, or straight ahead if none
+                float dir_x = wl > 0.01f ? wx / wl : g_view_fwd[0], dir_z = wl > 0.01f ? wz / wl : g_view_fwd[1];
+
+                bool shift = key_down(VK_SHIFT) != 0, ctrl = key_down(VK_CONTROL) != 0;
+                bool shift_edge = shift && !g_prev_shift, ctrl_edge = ctrl && !g_prev_ctrl;
+                g_prev_shift = shift;
+                g_prev_ctrl = ctrl;
+
+                // stamina: 3 bars of 100, refilling at 70/s except while sliding
+                if (!g_sliding) g_boost = g_boost + V1_BOOST_REGEN * dt > 300.0f ? 300.0f : g_boost + V1_BOOST_REGEN * dt;
+
+                if (shift_edge && g_boost >= 100.0f && !g_slamming) {
+                    g_boost -= 100.0f;
+                    g_dash_left = V1_DASH_TIME;
+                    g_dash_x = dir_x;
+                    g_dash_z = dir_z;
+                    g_sliding = false;
+                    InterlockedIncrement(&g_dashes);
+                }
+                if (ctrl_edge && g_air && !g_slamming) {
+                    g_slamming = true;          // ground slam: straight down, no horizontal speed
+                    g_dash_left = 0;
+                    InterlockedIncrement(&g_slams);
+                }
+                if (ctrl && !g_air && !g_sliding && g_dash_left <= 0) {
+                    g_sliding = true;
+                    g_slide_x = dir_x;
+                    g_slide_z = dir_z;
+                    InterlockedIncrement(&g_slides);
+                }
+                if (g_sliding && (!ctrl || g_air)) g_sliding = false;
+                if (!g_air) g_slamming = false;
+
+                if (g_slamming) {
+                    g_vx = g_vz = 0;
+                    g_vy = -V1_SLAM_SPEED;
+                    vel[1] = g_vy;
+                } else if (g_dash_left > 0) {
+                    // V1 dash: 3x run speed for 0.2 s, flat (gravity off). Afterwards on the ground it drops
+                    // back to run speed; in the air the momentum is kept.
+                    g_dash_left -= dt;
+                    g_vx = g_dash_x * V1_DASH_SPEED;
+                    g_vz = g_dash_z * V1_DASH_SPEED;
+                    if (g_dash_left <= 0) {
+                        g_vx = g_dash_x * V1_RUN_SPEED;
+                        g_vz = g_dash_z * V1_RUN_SPEED;
+                    }
+                    if (g_air) {
+                        g_vy = 0;
+                        vel[1] = 0;
+                    }
+                } else if (g_sliding) {
+                    // V1 slide: fixed direction at slide speed, A/D nudge it sideways
+                    g_vx = g_slide_x * V1_SLIDE_SPEED + g_view_right[0] * s * V1_SLIDE_STEER;
+                    g_vz = g_slide_z * V1_SLIDE_SPEED + g_view_right[1] * s * V1_SLIDE_STEER;
+                } else if (!g_air) {
+                    // V1 on the ground: velocity = Lerp(velocity, input * 16.5, 0.25) every 8 ms physics step
+                    float k = 1.0f - powf(0.75f, dt / V1_STEP);
+                    g_vx += (wx * V1_RUN_SPEED - g_vx) * k;
+                    g_vz += (wz * V1_RUN_SPEED - g_vz) * k;
+                } else {
+                    // V1 in the air: each view axis accelerates only until its speed reaches run speed;
+                    // momentum above that, and momentum with no key held, is left alone.
+                    float axes[2][3] = {{g_view_fwd[0], g_view_fwd[1], f}, {g_view_right[0], g_view_right[1], s}};
+                    for (auto &a : axes) {
+                        if (a[2] == 0) continue;
+                        float dx = a[0] * a[2], dz = a[1] * a[2];
+                        float cur = g_vx * dx + g_vz * dz, add = V1_AIR_ACCEL * dt;
+                        if (cur + add > V1_RUN_SPEED) add = V1_RUN_SPEED - cur > 0 ? V1_RUN_SPEED - cur : 0;
+                        g_vx += dx * add;
+                        g_vz += dz * add;
+                    }
+                    g_vy -= V1_GRAVITY * dt;
+                    vel[1] = g_vy;
                 }
                 vel[0] = g_vx;
                 vel[2] = g_vz;
+                rising = g_air && g_vy > 0;
+                if (g_air) {
+                    ctrl_air = true;
+                    ctrl_dt = dt;
+                    ctrl_vy = g_vy;
+                    have_y0 = proxy_y(proxy, y0);
+                }
                 // the character faces where the view looks; yaw 0 faces -Z (worked out from the probe log)
                 *(float *)((uintptr_t)self + OFF_POS_YAW) = atan2f(-g_view_fwd[0], -g_view_fwd[1]);
             } else {
                 g_vx = vel[0];
                 g_vz = vel[2];
+                g_air = false;
+                g_vy = 0;
             }
-            if (g_vjump && g_vel_ok) {
+            if (!g_ctrl && g_vjump && g_vel_ok) {
                 float e = (float)(now_s() - g_vjump_t0);
                 rising = e < JUMP_V0 / JUMP_G;
                 if (rising) vel[1] = JUMP_V0 - JUMP_G * e;
@@ -266,6 +475,23 @@ static void hook_step(void *self, void *step_info, void *gravity) {
     }
     g_orig_step(self, step_info, gravity);
     if (!proxy) return;
+    // v0.14 waited for the game's grounded flag to land, and it never came back while we drove the
+    // fall: the character stayed 'airborne' for 20 s, sliding. Instead, compare how far the physics
+    // actually moved us with how far we asked. Blocked going down = landed; going up = ceiling.
+    float y1;
+    if (ctrl_air && have_y0 && proxy_y(proxy, y1)) {
+        float want = ctrl_vy * ctrl_dt, got = y1 - y0;
+        g_air_steps++;
+        if (ctrl_vy < -0.5f && got > want * 0.3f) {
+            g_air = false;
+            g_vy = 0;
+            InterlockedIncrement(&g_landings);
+        } else if (ctrl_vy > 0.5f && g_air_steps > 3 && got < want * 0.3f) {
+            g_vy = 0;
+            InterlockedIncrement(&g_bonks);
+        }
+    }
+    if (g_air && g_air_steps > 2000) g_air = false;   // safety net: never stay airborne for ever
     // After integrating, the game moves the character vertically by these two offsets to keep it
     // glued to the ground. On takeoff, put that back so the character leaves the ground.
     float snap = *(float *)((uintptr_t)self + OFF_POS_SNAP_A) + *(float *)((uintptr_t)self + OFF_POS_SNAP_B);
@@ -303,7 +529,10 @@ static volatile float g_lens_seen[4];
 static volatile float g_fov_scale = 1.6f;
 static volatile LONG g_cam_calls = 0;
 static float g_yaw = 0, g_pitch = 0;            // our view direction, radians; yaw 0 looks along +Z
-static volatile float g_sens = 0.0025f;         // radians per mouse count
+static bool g_cursor_centred = false;
+static float g_eye_drop = 0;                    // how far the view is currently lowered (slide)
+static const float SLIDE_EYE_DROP = 0.6f;       // V1's view drops while sliding; 0.6 m is a guess, not from its code
+static volatile float g_sens = 0.0008f;          // radians per mouse count
 
 static uint64_t hook_cam(void *self, float dt, void *a3, void *a4, uint64_t a5, uint64_t a6) {
     uint64_t r = g_orig_cam(self, dt, a3, a4, a5, a6);
@@ -316,7 +545,33 @@ static uint64_t hook_cam(void *self, float dt, void *a3, void *a4, uint64_t a5, 
     // mouse movement since the last frame, from whichever source is live
     LONG dix = InterlockedExchange(&g_di_dx, 0), diy = InterlockedExchange(&g_di_dy, 0);
     LONG rawx = InterlockedExchange(&g_raw_dx, 0), rawy = InterlockedExchange(&g_raw_dy, 0);
-    LONG mx = g_di_events ? dix : rawx, my = g_di_events ? diy : rawy;
+    // Windows cursor: measure how far it moved from the window centre, then put it back there
+    LONG curx = 0, cury = 0;
+    HWND wnd = GetForegroundWindow();
+    DWORD wpid = 0;
+    GetWindowThreadProcessId(wnd, &wpid);
+    if (g_first_person && wpid == GetCurrentProcessId()) {
+        RECT rc;
+        POINT c, now;
+        if (GetClientRect(wnd, &rc) && GetCursorPos(&now)) {
+            c.x = (rc.left + rc.right) / 2;
+            c.y = (rc.top + rc.bottom) / 2;
+            ClientToScreen(wnd, &c);
+            if (g_cursor_centred) {
+                curx = now.x - c.x;
+                cury = now.y - c.y;
+                if (curx || cury) InterlockedIncrement(&g_cur_events);
+            }
+            if (curx || cury || !g_cursor_centred) SetCursorPos(c.x, c.y);
+            g_cursor_centred = true;
+        }
+    } else {
+        g_cursor_centred = false;
+    }
+    g_cur_dx = curx;
+    g_cur_dy = cury;
+    LONG mx = g_di_events ? dix : g_raw_events ? rawx : curx;
+    LONG my = g_di_events ? diy : g_raw_events ? rawy : cury;
 
     bool on = g_first_person && pos;
     if (on && !g_ctrl) {
@@ -326,6 +581,7 @@ static uint64_t hook_cam(void *self, float dt, void *a3, void *a4, uint64_t a5, 
         g_pitch = atan2f(m[9], fl);
     }
     g_ctrl = on;
+    g_block_keys = on;
     if (!on) return r;
 
     // The view direction is ours: the follow camera's own direction drifts when the character moves,
@@ -346,9 +602,54 @@ static uint64_t hook_cam(void *self, float dt, void *a3, void *a4, uint64_t a5, 
     if (lens[0] > 0.2f && lens[0] < 2.5f) lens[0] *= g_fov_scale;
     const float *p = (const float *)(pos + OFF_POS_X);
     m[12] = p[0] + sy * EYE_FORWARD;
-    m[13] = p[1] + g_eye_height;
+    float drop_target = g_sliding ? SLIDE_EYE_DROP : 0.0f, k = dt > 0 && dt < 0.1f ? 1.0f - expf(-dt / 0.06f) : 1.0f;
+    g_eye_drop += (drop_target - g_eye_drop) * k;
+    m[13] = p[1] + g_eye_height - g_eye_drop;
     m[14] = p[2] + cy * EYE_FORWARD;
     return r;
+}
+
+// ---- projectile hook. BulletIns::Init(bullet, params, matrix, ...) sets up every projectile the game
+// fires; `matrix` is its starting transform (rows: right, up, forward, position), copied to bullet+0x290.
+// In first person, anything the player fires is re-aimed along the view from the eye, so bows and
+// crossbows shoot where you look.
+static const uintptr_t RVA_BULLET_INIT = 0x4241D0;
+static const uint8_t BULLET_PROLOGUE[8] = {0x48, 0x8B, 0xC4, 0x48, 0x89, 0x58, 0x18, 0x55};
+typedef uint64_t (*BulletInitFn)(void *bullet, void *params, float *matrix, void *a4, uint64_t a5, uint64_t a6);
+static BulletInitFn g_orig_bullet_init = nullptr;
+enum { BULLET_LOG = 6, BULLET_PARAM_BYTES = 0x160 };
+static volatile LONG g_bullets = 0, g_bullets_aimed = 0;
+static float g_bullet_mats[BULLET_LOG][16];
+static uint8_t g_bullet_params[BULLET_LOG][BULLET_PARAM_BYTES];
+static bool g_bullet_was_player[BULLET_LOG];
+
+static uint64_t hook_bullet_init(void *bullet, void *params, float *matrix, void *a4, uint64_t a5, uint64_t a6) {
+    LONG n = InterlockedIncrement(&g_bullets) - 1;
+    uintptr_t pos = g_player_pos;
+    bool mine = false;
+    if (pos && matrix) {
+        // no owner field identified yet: a projectile that starts within 3 m of the player is taken as theirs
+        const float *p = (const float *)(pos + OFF_POS_X);
+        float dx = matrix[12] - p[0], dy = matrix[13] - p[1], dz = matrix[14] - p[2];
+        mine = dx * dx + dy * dy + dz * dz < 9.0f;
+    }
+    if (n < BULLET_LOG) {
+        if (matrix) memcpy(g_bullet_mats[n], matrix, sizeof(g_bullet_mats[n]));
+        if (params) memcpy(g_bullet_params[n], params, BULLET_PARAM_BYTES);
+        g_bullet_was_player[n] = mine;
+    }
+    if (mine && g_ctrl) {
+        const float *p = (const float *)(pos + OFF_POS_X);
+        float sy = sinf(g_yaw), cy = cosf(g_yaw), sp = sinf(g_pitch), cp = cosf(g_pitch);
+        alignas(16) float m[16] = {
+            cy,       0,  -sy,      0,
+            -sp * sy, cp, -sp * cy, 0,
+            sy * cp,  sp, cy * cp,  0,
+            p[0] + sy * cp * 0.6f, p[1] + g_eye_height - g_eye_drop + sp * 0.6f - 0.1f, p[2] + cy * cp * 0.6f, 1.0f};
+        InterlockedIncrement(&g_bullets_aimed);
+        return g_orig_bullet_init(bullet, params, m, a4, a5, a6);
+    }
+    return g_orig_bullet_init(bullet, params, matrix, a4, a5, a6);
 }
 
 struct Hook {
@@ -464,7 +765,7 @@ static DWORD WINAPI mod_thread(LPVOID) {
     char *slash = strrchr(path, '\\');
     strcpy(slash ? slash + 1 : path, "ultrasouls.log");
     g_log = fopen(path, "w");
-    logf("ultrasouls v0.12 loaded\n");
+    logf("ultrasouls v0.19 loaded\n");
     // Patching the code at startup made the game exit before showing a window (v0.7), so the hook
     // goes in later, once a character is loaded.
     bool hooked = false, hook_tried = false;
@@ -479,8 +780,11 @@ static DWORD WINAPI mod_thread(LPVOID) {
 
     float speed = 1.5f;
     bool speed_on = true, speed_ok = false, speed_checked = false;
-    bool k6 = false, k7 = false, k8 = false, kj = false, kk = false, k3 = false, k4 = false, k5 = false, k1 = false, k2 = false, k9 = false, k10 = false;
-    double mouse_log = 0;
+    bool k6 = false, k7 = false, k8 = false, kj = false, kk = false, kspace = false, k3 = false, k4 = false, k5 = false, k1 = false, k2 = false, k9 = false, k10 = false;
+    double mouse_log = 0, fp_t0 = 0;
+    int bullets_logged = 0;
+    bool fp_air = false;
+    float fp_y0 = 0, fp_peak = 0, fp_x0 = 0, fp_z0 = 0;
     double hook_check = 0, t_start = now_s();
     uintptr_t last_player = 0;
     int air = 0;   // 0 grounded, 1 K-jump rising (we write height), 2 falling, 3 J-jump (velocity)
@@ -516,6 +820,8 @@ static DWORD WINAPI mod_thread(LPVOID) {
             g_orig_step = (StepFn)install_hook(RVA_STEP, STEP_PROLOGUE, sizeof(STEP_PROLOGUE), (void *)hook_step);
             hooked = g_orig_step != nullptr;
             g_orig_cam = (CamFn)install_hook(RVA_CAM_UPDATE, CAM_PROLOGUE, sizeof(CAM_PROLOGUE), (void *)hook_cam);
+            g_orig_bullet_init = (BulletInitFn)install_hook(RVA_BULLET_INIT, BULLET_PROLOGUE, sizeof(BULLET_PROLOGUE), (void *)hook_bullet_init);
+            logf("projectile hook: %s\n", g_orig_bullet_init ? "installed" : "NOT installed (code mismatch)");
             logf("camera hook: %s\n", g_orig_cam ? "installed" : "NOT installed (code mismatch); F5 disabled");
             logf("raw input watch: %s; DirectInput devices created: %ld, mouse device %s\n", watch_raw_input() ? "installed" : "no window found",
                  (long)g_dev_n, g_mouse_dev ? "found" : "not seen");
@@ -559,11 +865,25 @@ static DWORD WINAPI mod_thread(LPVOID) {
                 logf("  (%.3f, %.3f, %.3f, %.3f)\n", g_cam_seen[i], g_cam_seen[i + 1], g_cam_seen[i + 2], g_cam_seen[i + 3]);
             logf("  lens (%.4f, %.4f, %.4f, %.4f) camera calls %ld\n", g_lens_seen[0], g_lens_seen[1], g_lens_seen[2], g_lens_seen[3], (long)g_cam_calls);
         }
+        while (bullets_logged < BULLET_LOG && bullets_logged < g_bullets) {
+            int b = bullets_logged++;
+            const float *bm = g_bullet_mats[b];
+            logf("projectile %d: bullet id %d, %s; start matrix:\n", b, *(int *)(g_bullet_params[b] + 4), g_bullet_was_player[b] ? "near player" : "not near player");
+            for (int i = 0; i < 16; i += 4)
+                logf("  (%.3f, %.3f, %.3f, %.3f)\n", bm[i], bm[i + 1], bm[i + 2], bm[i + 3]);
+            for (int i = 0; i < BULLET_PARAM_BYTES; i += 32) {
+                logf("  params+%03X:", i);
+                for (int j = 0; j < 32; j++) logf(" %02X", g_bullet_params[b][i + j]);
+                logf("\n");
+            }
+        }
         if (pressed(VK_F9, k9)) { g_sens = g_sens * 0.8f; logf("mouse sensitivity %.5f\n", g_sens); }
         if (pressed(VK_F10, k10)) { g_sens = g_sens * 1.25f; logf("mouse sensitivity %.5f\n", g_sens); }
         if (g_first_person && t - mouse_log > 5.0) {
             mouse_log = t;
-            logf("mouse: DirectInput reads %ld, raw input messages %ld; yaw %.2f pitch %.2f\n", (long)g_di_events, (long)g_raw_events, g_yaw, g_pitch);
+            logf("mouse: DirectInput mouse reads %ld (state calls %ld, data calls %ld), raw input %ld, cursor moves %ld; yaw %.2f pitch %.2f; keys hidden from game %ld; projectiles %ld, re-aimed %ld\n",
+                 (long)g_di_events, (long)g_di_state_calls, (long)g_di_data_calls, (long)g_raw_events, (long)g_cur_events, g_yaw, g_pitch,
+                 (long)g_keys_blocked, (long)g_bullets, (long)g_bullets_aimed);
         }
         if (pressed(VK_F1, k1)) { g_fov_scale = g_fov_scale - 0.1f; logf("fov scale %.1f\n", g_fov_scale); }
         if (pressed(VK_F2, k2)) { g_fov_scale = g_fov_scale + 0.1f; logf("fov scale %.1f\n", g_fov_scale); }
@@ -607,6 +927,20 @@ static DWORD WINAPI mod_thread(LPVOID) {
         }
 
         bool want_j = !air && pressed('J', kj), want_k = !air && pressed('K', kk);
+        if (pressed(VK_SPACE, kspace) && g_ctrl) want_j = true;
+        if (want_j && g_ctrl) {
+            g_jump_req = true;   // first person: the controller in the physics hook owns the whole jump
+            want_j = false;
+        }
+        if (g_ctrl) {
+            if (g_air && !fp_air) { fp_y0 = fp_peak = y; fp_t0 = t; fp_x0 = x; fp_z0 = z; }
+            if (g_air && y > fp_peak) fp_peak = y;
+            if (!g_air && fp_air)
+                logf("first-person air: peak +%.2f m, %.2fs, travelled %.2f m (landings %ld, ceiling hits %ld; dashes %ld, slides %ld, slams %ld)\n", fp_peak - fp_y0, t - fp_t0,
+                     sqrtf((x - fp_x0) * (x - fp_x0) + (z - fp_z0) * (z - fp_z0)), (long)g_landings, (long)g_bonks,
+                     (long)g_dashes, (long)g_slides, (long)g_slams);
+            fp_air = g_air;
+        }
         if (want_j && (!hooked || !g_vel_ok)) {
             logf("J ignored: %s\n", !hooked ? "hook not installed" : "velocity field not confirmed yet (run for a second first)");
             want_j = false;

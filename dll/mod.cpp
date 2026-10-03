@@ -9,6 +9,8 @@
 // Log: ultrasouls.log next to the exe.
 #include <windows.h>
 #include <psapi.h>
+#include <d3d11_1.h>
+#include <dxgi.h>
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
@@ -78,7 +80,7 @@ static const GUID GUID_SYS_KEYBOARD = {0x6F1D2B61, 0xD5A0, 0x11CF, {0xBF, 0xC7, 
 // While first person is on, the game must not see the keys ULTRAKILL uses (Space roll, Shift and Ctrl
 // bindings), so they are cleared from the keyboard state before it reaches the game. Our own controls
 // read the keys through GetAsyncKeyState, which this does not touch.
-static volatile bool g_block_keys = false;
+static volatile bool g_block_keys = false, g_block_lmb = false;
 static const uint8_t BLOCKED_KEYS[] = {0x39, 0x2A, 0x36, 0x1D, 0x9D};   // DIK_SPACE, L/R SHIFT, L/R CONTROL
 
 // Devices of different kinds may have different vtables, so the originals are kept per vtable.
@@ -120,6 +122,7 @@ static HRESULT WINAPI my_get_state(void *self, DWORD cb, void *data) {
         InterlockedExchangeAdd(&g_di_dx, ((LONG *)data)[0]);
         InterlockedExchangeAdd(&g_di_dy, ((LONG *)data)[1]);
         InterlockedIncrement(&g_di_events);
+        if (g_block_lmb) ((uint8_t *)data)[12] = 0;   // rgbButtons[0] follows lX, lY, lZ
     }
     if (SUCCEEDED(hr) && data && cb == 256 && g_block_keys) {
         uint8_t *keys = (uint8_t *)data;
@@ -206,10 +209,12 @@ static BOOL CALLBACK find_game_window(HWND wnd, LPARAM out) {
     return FALSE;
 }
 
+static HWND g_game_wnd_early = nullptr;
 static bool watch_raw_input() {
     HWND wnd = nullptr;
     EnumWindows(find_game_window, (LPARAM)&wnd);
     if (!wnd) return false;
+    g_game_wnd_early = wnd;
     g_orig_wndproc = (WNDPROC)SetWindowLongPtrW(wnd, GWLP_WNDPROC, (LONG_PTR)my_wndproc);
     return g_orig_wndproc != nullptr;
 }
@@ -257,6 +262,7 @@ static volatile bool g_ctrl = false;        // first-person movement controller 
 static volatile float g_view_fwd[2] = {0, 1}, g_view_right[2] = {1, 0};   // horizontal view axes (x, z), unit length
 static float g_vx = 0, g_vz = 0;            // controller's horizontal velocity
 static const uintptr_t OFF_POS_YAW = 0x04;
+static const uintptr_t OFF_POS_FORCE_STEP = 0x1FA;
 static const uintptr_t OFF_POS_AIR_TIME = 0x1B4;   // seconds since the grounded flag was last set (read from the disassembly, unverified)
 static float g_vy = 0;                      // controller's vertical velocity while airborne
 static bool g_air = false;
@@ -304,7 +310,8 @@ static int key_down(int vk) {
 static double g_vjump_t0 = 0;
 static float g_carry = 0, g_dir_x = 0, g_dir_z = 0;
 static volatile float g_seen_vel[3];        // what the game asked for this frame, before we touch it
-static volatile LONG g_steps = 0;
+static volatile LONG g_steps = 0, g_steps_alt = 0;
+static StepFn g_orig_step_alt = nullptr;
 static volatile float g_seen_snap = 0;
 static volatile uint8_t g_seen_grounded = 0;
 
@@ -318,7 +325,12 @@ static const uintptr_t OFF_POS_SNAP_B = 0x154;
 static const uintptr_t OFF_POS_GROUNDED = 0x32;
 static const uintptr_t OFF_POS_NO_ADJUST = 0x1F8;
 
-static void hook_step(void *self, void *step_info, void *gravity) {
+static void try_instant_fire();
+
+// The game steps a character through one of two functions with the same arguments, chosen by a flag
+// on the character (ChrPosData+0x6D). Hooking only the first meant the controller did not run on
+// frames that used the second, which showed up as input lag (a jump waited for the next 'full' step).
+static void step_common(void *self, void *step_info, void *gravity, StepFn orig) {
     uintptr_t proxy = 0;
     bool rising = false, ctrl_air = false, have_y0 = false;
     float ctrl_dt = 0, ctrl_vy = 0, y0 = 0;
@@ -330,6 +342,7 @@ static void hook_step(void *self, void *step_info, void *gravity) {
             g_seen_vel[1] = vel[1];
             g_seen_vel[2] = vel[2];
             InterlockedIncrement(&g_steps);
+            if (orig == g_orig_step_alt) InterlockedIncrement(&g_steps_alt);
             if (g_ctrl) {
                 // First-person movement: WASD sets the horizontal velocity directly, relative to the view.
                 // On the ground it is instant; in the air the current momentum is steered, and kept if no key is held.
@@ -378,7 +391,6 @@ static void hook_step(void *self, void *step_info, void *gravity) {
                 g_prev_ctrl = ctrl;
 
                 // stamina: 3 bars of 100, refilling at 70/s except while sliding
-                if (!g_sliding) g_boost = g_boost + V1_BOOST_REGEN * dt > 300.0f ? 300.0f : g_boost + V1_BOOST_REGEN * dt;
 
                 if (shift_edge && g_boost >= 100.0f && !g_slamming) {
                     g_boost -= 100.0f;
@@ -473,7 +485,7 @@ static void hook_step(void *self, void *step_info, void *gravity) {
             }
         }
     }
-    g_orig_step(self, step_info, gravity);
+    orig(self, step_info, gravity);
     if (!proxy) return;
     // v0.14 waited for the game's grounded flag to land, and it never came back while we drove the
     // fall: the character stayed 'airborne' for 20 s, sliding. Instead, compare how far the physics
@@ -514,6 +526,11 @@ static void hook_step(void *self, void *step_info, void *gravity) {
         }
     }
 }
+
+static void hook_step(void *self, void *step_info, void *gravity) { step_common(self, step_info, gravity, g_orig_step); }
+static void hook_step_alt(void *self, void *step_info, void *gravity) { step_common(self, step_info, gravity, g_orig_step_alt); }
+static const uintptr_t RVA_STEP_ALT = 0x2BC9B0;
+static const uint8_t STEP_ALT_PROLOGUE[11] = {0x40, 0x55, 0x56, 0x57, 0x48, 0x81, 0xEC, 0x90, 0x04, 0x00, 0x00};
 
 // ---- camera hook. ChrCam::Update(this, float dt, ...) finishes by writing the view matrix at this+0x10:
 // three rotation rows, then the position row.
@@ -582,6 +599,25 @@ static uint64_t hook_cam(void *self, float dt, void *a3, void *a4, uint64_t a5, 
     }
     g_ctrl = on;
     g_block_keys = on;
+    {
+        // per-frame work: stamina refill (3 bars of 100, 70/s, not while sliding) and instant fire.
+        // The physics step is not called every frame, so in v0.21 both stalled while standing still.
+        static double last = 0;
+        double now = now_s();
+        float frame = last > 0 && now - last < 0.1 ? (float)(now - last) : 0.0f;
+        last = now;
+        if (on && !g_sliding) g_boost = g_boost + V1_BOOST_REGEN * frame > 300.0f ? 300.0f : g_boost + V1_BOOST_REGEN * frame;
+        if (on) try_instant_fire();
+        // The game's character update (exe+2BB150) skips the physics step when the character is at
+        // rest and the game asked for no movement, except on every 10th frame. Since the game never
+        // sees our keys, a jump, dash or slide from standstill waited for that 10th frame, or never
+        // started. The same update has a 'step this frame' byte that it clears after stepping.
+        if (on) *(uint8_t *)(pos + OFF_POS_FORCE_STEP) = 1;
+        static bool prev_space = false;
+        bool space = on && key_down(VK_SPACE);
+        if (space && !prev_space) g_jump_req = true;
+        prev_space = space;
+    }
     if (!on) return r;
 
     // The view direction is ours: the follow camera's own direction drifts when the character moves,
@@ -609,47 +645,265 @@ static uint64_t hook_cam(void *self, float dt, void *a3, void *a4, uint64_t a5, 
     return r;
 }
 
-// ---- projectile hook. BulletIns::Init(bullet, params, matrix, ...) sets up every projectile the game
-// fires; `matrix` is its starting transform (rows: right, up, forward, position), copied to bullet+0x290.
-// In first person, anything the player fires is re-aimed along the view from the eye, so bows and
-// crossbows shoot where you look.
+// ---- projectile hook. BulletIns::Init(bullet, params, aim, ...) sets up every projectile the game fires.
+// Layout worked out from the shots recorded in the v0.19 log:
+//   params+0x04  bullet id                     params+0xC0  shooter (ChrIns*)
+//   params+0xB0  point the shot is aimed at    params+0xD4  range (100)
+//   params+0xE0  start transform, 3 rows of 4: columns are -right, up, -forward, then position
+//   aim+0x20     the same aim point
+//   a4           launch transform, 3 rows of 4: columns right, up, forward, position
+// In first person the player's shots are re-aimed from the eye along the view.
 static const uintptr_t RVA_BULLET_INIT = 0x4241D0;
 static const uint8_t BULLET_PROLOGUE[8] = {0x48, 0x8B, 0xC4, 0x48, 0x89, 0x58, 0x18, 0x55};
-typedef uint64_t (*BulletInitFn)(void *bullet, void *params, float *matrix, void *a4, uint64_t a5, uint64_t a6);
+typedef uint64_t (*BulletInitFn)(void *bullet, uint8_t *params, float *aim, void *a4, uint64_t a5, uint64_t a6);
 static BulletInitFn g_orig_bullet_init = nullptr;
 enum { BULLET_LOG = 6, BULLET_PARAM_BYTES = 0x160 };
-static volatile LONG g_bullets = 0, g_bullets_aimed = 0;
-static float g_bullet_mats[BULLET_LOG][16];
+static volatile LONG g_bullets = 0, g_bullets_aimed = 0, g_player_shots = 0;
 static uint8_t g_bullet_params[BULLET_LOG][BULLET_PARAM_BYTES];
-static bool g_bullet_was_player[BULLET_LOG];
+static uint8_t g_bullet_a4[BULLET_LOG][0x40];
+static uintptr_t g_bullet_emitter[BULLET_LOG];
+static volatile uintptr_t g_player_chr = 0;
+// the object that fired the player's last shot (params live at +0x1A0 inside it), for the instant-fire test
+static volatile uintptr_t g_last_emitter = 0;
+static volatile bool g_in_instant_fire = false;
+static volatile LONG g_real_shots = 0;
+static volatile int g_ammo_id = 0;
 
-static uint64_t hook_bullet_init(void *bullet, void *params, float *matrix, void *a4, uint64_t a5, uint64_t a6) {
-    LONG n = InterlockedIncrement(&g_bullets) - 1;
+static uint64_t hook_bullet_init(void *bullet, uint8_t *params, float *aim, void *a4, uint64_t a5, uint64_t a6) {
+    InterlockedIncrement(&g_bullets);
     uintptr_t pos = g_player_pos;
-    bool mine = false;
-    if (pos && matrix) {
-        // no owner field identified yet: a projectile that starts within 3 m of the player is taken as theirs
-        const float *p = (const float *)(pos + OFF_POS_X);
-        float dx = matrix[12] - p[0], dy = matrix[13] - p[1], dz = matrix[14] - p[2];
-        mine = dx * dx + dy * dy + dz * dz < 9.0f;
+    uintptr_t shooter = params ? *(uintptr_t *)(params + 0xC0) : 0;
+    bool mine = shooter && g_player_chr && shooter + 0x100 >= g_player_chr && shooter <= g_player_chr + 0x100;
+    if (mine) {
+        LONG n = InterlockedIncrement(&g_player_shots) - 1;
+        if (n < BULLET_LOG) {
+            memcpy(g_bullet_params[n], params, BULLET_PARAM_BYTES);
+            if (a4) safe_read((uintptr_t)a4, g_bullet_a4[n], sizeof(g_bullet_a4[n]));
+            g_bullet_emitter[n] = (uintptr_t)params - 0x1A0;
+        }
+        g_last_emitter = (uintptr_t)params - 0x1A0;
+        if (!g_in_instant_fire) {
+            g_ammo_id = *(int *)(params + 0x70);   // item id of the arrow or bolt, as seen in the v0.19 log
+            InterlockedIncrement(&g_real_shots);
+        }
     }
-    if (n < BULLET_LOG) {
-        if (matrix) memcpy(g_bullet_mats[n], matrix, sizeof(g_bullet_mats[n]));
-        if (params) memcpy(g_bullet_params[n], params, BULLET_PARAM_BYTES);
-        g_bullet_was_player[n] = mine;
-    }
-    if (mine && g_ctrl) {
+    if (mine && g_ctrl && pos) {
         const float *p = (const float *)(pos + OFF_POS_X);
         float sy = sinf(g_yaw), cy = cosf(g_yaw), sp = sinf(g_pitch), cp = cosf(g_pitch);
-        alignas(16) float m[16] = {
-            cy,       0,  -sy,      0,
-            -sp * sy, cp, -sp * cy, 0,
-            sy * cp,  sp, cy * cp,  0,
-            p[0] + sy * cp * 0.6f, p[1] + g_eye_height - g_eye_drop + sp * 0.6f - 0.1f, p[2] + cy * cp * 0.6f, 1.0f};
+        float right[3] = {cy, 0, -sy}, up[3] = {-sp * sy, cp, -sp * cy}, fwd[3] = {sy * cp, sp, cy * cp};
+        float start[3] = {p[0] + fwd[0] * 0.6f, p[1] + g_eye_height - g_eye_drop + fwd[1] * 0.6f, p[2] + fwd[2] * 0.6f};
+        float range = *(float *)(params + 0xD4);
+        if (!(range > 1.0f && range < 1000.0f)) range = 100.0f;
+        float *m = (float *)(params + 0xE0), *target = (float *)(params + 0xB0);
+        for (int r = 0; r < 3; r++) {
+            m[r * 4 + 0] = -right[r];
+            m[r * 4 + 1] = up[r];
+            m[r * 4 + 2] = -fwd[r];
+            m[r * 4 + 3] = start[r];
+            target[r] = start[r] + fwd[r] * range;
+            if (aim) aim[8 + r] = target[r];
+        }
+        // The fourth argument is the projectile's actual starting transform: 3 rows of 4 whose columns
+        // are right, up, forward, position (decoded from the a4 dumps in the v0.21 log, where the
+        // forward column matched the view pitch). The game computes it from `params` before calling
+        // Init, so editing only `params` re-aimed each shot with the previous shot's direction.
+        float *launch = (float *)a4;
+        if (launch) {
+            for (int r = 0; r < 3; r++) {
+                launch[r * 4 + 0] = right[r];
+                launch[r * 4 + 1] = up[r];
+                launch[r * 4 + 2] = fwd[r];
+                launch[r * 4 + 3] = start[r];
+            }
+            // Exactly 12 floats and no more: on the instant-fire path this buffer is 0x30 bytes on the
+            // game's stack, and v0.23 wrote a 14th value over a saved register, which crashed the game.
+        }
         InterlockedIncrement(&g_bullets_aimed);
-        return g_orig_bullet_init(bullet, params, m, a4, a5, a6);
     }
-    return g_orig_bullet_init(bullet, params, matrix, a4, a5, a6);
+    return g_orig_bullet_init(bullet, params, aim, a4, a5, a6);
+}
+
+// Experimental instant fire (F11): asks the object that fired the player's last shot to fire again.
+// 421390(emitter, index) is the game's own "fire bullet number index" helper.
+static const uintptr_t RVA_EMITTER_FIRE = 0x421390;
+static const uint8_t EMITTER_FIRE_BYTES[8] = {0x40, 0x53, 0x48, 0x83, 0xEC, 0x50, 0x44, 0x8B};
+static volatile bool g_instant_fire = true;
+static volatile LONG g_instant_shots = 0;
+static double g_next_shot = 0;
+static const double FIRE_INTERVAL = 0.5;   // V1's revolver: Revolver.Update refills shootCharge at 200/s up to 100
+
+static void try_instant_fire() {
+    if (!g_instant_fire || !g_ctrl || !key_down(VK_LBUTTON)) return;
+    uintptr_t emitter = g_last_emitter;
+    double t = now_s();
+    if (!emitter || t < g_next_shot) return;
+    uint8_t *fn = (uint8_t *)GetModuleHandleA(nullptr) + RVA_EMITTER_FIRE;
+    uintptr_t owner = 0;
+    // only if the code is what we expect and the emitter still names the player as its shooter
+    if (memcmp(fn, EMITTER_FIRE_BYTES, sizeof(EMITTER_FIRE_BYTES)) != 0) return;
+    if (!rd(emitter + 0x1A0 + 0xC0, owner) || owner + 0x100 < g_player_chr || owner > g_player_chr + 0x100) { g_last_emitter = 0; return; }
+    g_next_shot = t + FIRE_INTERVAL;
+    InterlockedIncrement(&g_instant_shots);
+    g_in_instant_fire = true;
+    ((void (*)(uintptr_t, int))fn)(emitter, 0);
+    g_in_instant_fire = false;
+}
+
+// ---- HUD, drawn into the game's back buffer just before it is presented. Only solid rectangles,
+// through ID3D11DeviceContext1::ClearView, so no shaders or render state are touched.
+typedef HRESULT(WINAPI *PresentFn)(IDXGISwapChain *, UINT, UINT);
+static PresentFn g_orig_present = nullptr;
+static volatile LONG g_presents = 0, g_hud_draws = 0;
+
+static void fill(ID3D11DeviceContext1 *ctx, ID3D11RenderTargetView *rtv, float r, float g, float b, const D3D11_RECT *rects, UINT n) {
+    const float color[4] = {r, g, b, 1.0f};
+    ctx->ClearView(rtv, color, rects, n);
+}
+
+static void draw_hud(IDXGISwapChain *sc) {
+    ID3D11Device *dev = nullptr;
+    ID3D11DeviceContext *ctx = nullptr;
+    ID3D11DeviceContext1 *ctx1 = nullptr;
+    ID3D11Texture2D *back = nullptr;
+    ID3D11RenderTargetView *rtv = nullptr;
+    if (SUCCEEDED(sc->GetDevice(__uuidof(ID3D11Device), (void **)&dev)) && dev) {
+        dev->GetImmediateContext(&ctx);
+        if (ctx) ctx->QueryInterface(__uuidof(ID3D11DeviceContext1), (void **)&ctx1);
+        sc->GetBuffer(0, __uuidof(ID3D11Texture2D), (void **)&back);
+        if (ctx1 && back && SUCCEEDED(dev->CreateRenderTargetView(back, nullptr, &rtv)) && rtv) {
+            D3D11_TEXTURE2D_DESC d;
+            back->GetDesc(&d);
+            LONG w = (LONG)d.Width, h = (LONG)d.Height, cx = w / 2, cy = h / 2;
+            LONG u = h / 540 > 0 ? h / 540 : 1;   // one HUD unit: 2 px at 1080p
+            // crosshair: four ticks and a centre dot, dark outline under a white core
+            D3D11_RECT outline[] = {{cx - u, cy - 6 * u, cx + u, cy - 2 * u}, {cx - u, cy + 2 * u, cx + u, cy + 6 * u},
+                                    {cx - 6 * u, cy - u, cx - 2 * u, cy + u}, {cx + 2 * u, cy - u, cx + 6 * u, cy + u},
+                                    {cx - u, cy - u, cx + u, cy + u}};
+            fill(ctx1, rtv, 0.05f, 0.05f, 0.05f, outline, 5);
+            LONG v = u > 1 ? u / 2 : 1;
+            D3D11_RECT core[] = {{cx - v, cy - 6 * u + v, cx + v, cy - 2 * u - v}, {cx - v, cy + 2 * u + v, cx + v, cy + 6 * u - v},
+                                 {cx - 6 * u + v, cy - v, cx - 2 * u - v, cy + v}, {cx + 2 * u + v, cy - v, cx + 6 * u - v, cy + v},
+                                 {cx - v, cy - v, cx + v, cy + v}};
+            fill(ctx1, rtv, 1.0f, 1.0f, 1.0f, core, 5);
+            // stamina: three bars, bottom left, filled in proportion
+            LONG bw = 40 * u, bh = 5 * u, gap = 3 * u, x0 = 30 * u, y0 = h - 40 * u;
+            D3D11_RECT bg[3], fg[3];
+            UINT nfg = 0;
+            float boost = g_boost;
+            for (int i = 0; i < 3; i++) {
+                LONG x = x0 + i * (bw + gap);
+                bg[i] = {x, y0, x + bw, y0 + bh};
+                float part = boost - 100.0f * i;
+                part = part < 0 ? 0 : part > 100.0f ? 100.0f : part;
+                if (part > 0) fg[nfg++] = {x, y0, x + (LONG)(bw * part / 100.0f), y0 + bh};
+            }
+            fill(ctx1, rtv, 0.08f, 0.08f, 0.10f, bg, 3);
+            if (nfg) fill(ctx1, rtv, 0.25f, 0.85f, 1.0f, fg, nfg);
+            InterlockedIncrement(&g_hud_draws);
+        }
+    }
+    if (rtv) rtv->Release();
+    if (back) back->Release();
+    if (ctx1) ctx1->Release();
+    if (ctx) ctx->Release();
+    if (dev) dev->Release();
+}
+
+static HRESULT WINAPI my_present(IDXGISwapChain *sc, UINT sync, UINT flags) {
+    InterlockedIncrement(&g_presents);
+    if (g_ctrl) draw_hud(sc);
+    return g_orig_present(sc, sync, flags);
+}
+
+// Every swap chain shares one vtable, so a throwaway one on a hidden window gives us the slot to patch.
+static bool hook_present() {
+    HWND wnd = CreateWindowExW(0, L"STATIC", L"", WS_OVERLAPPED, 0, 0, 16, 16, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+    if (!wnd) return false;
+    DXGI_SWAP_CHAIN_DESC desc{};
+    desc.BufferCount = 1;
+    desc.BufferDesc.Width = 16;
+    desc.BufferDesc.Height = 16;
+    desc.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    desc.OutputWindow = wnd;
+    desc.SampleDesc.Count = 1;
+    desc.Windowed = TRUE;
+    IDXGISwapChain *sc = nullptr;
+    ID3D11Device *dev = nullptr;
+    ID3D11DeviceContext *ctx = nullptr;
+    HRESULT hr = D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION, &desc, &sc, &dev, nullptr, &ctx);
+    bool ok = false;
+    if (SUCCEEDED(hr) && sc) {
+        patch_vtable(sc, 8, (void *)my_present, (void **)&g_orig_present);   // IDXGISwapChain::Present
+        ok = g_orig_present != nullptr;
+    }
+    if (ctx) ctx->Release();
+    if (dev) dev->Release();
+    if (sc) sc->Release();
+    DestroyWindow(wnd);
+    return ok;
+}
+
+// ---- endless ammo. A real shot tells us the arrow or bolt's item id. Its count in the inventory is found
+// by searching memory for that id followed by a small number, and confirmed by seeing that number drop by
+// exactly one on the next real shot. Only confirmed addresses are ever written.
+struct AmmoCand {
+    uintptr_t addr;
+    int qty;
+};
+enum { AMMO_CANDS = 4096, AMMO_SLOTS = 8 };
+static AmmoCand g_ammo_cands[AMMO_CANDS];
+static int g_ammo_cand_n = 0, g_ammo_cand_id = 0;
+static uintptr_t g_ammo_slots[AMMO_SLOTS];
+static int g_ammo_slot_n = 0, g_ammo_slot_id = 0;
+
+static void ammo_scan(int id) {
+    static uint8_t buf[1 << 20];
+    g_ammo_cand_n = 0;
+    g_ammo_cand_id = id;
+    MEMORY_BASIC_INFORMATION mbi;
+    for (uintptr_t p = 0x10000; p < 0x7FFFFFFF0000 && VirtualQuery((LPCVOID)p, &mbi, sizeof(mbi)); p = (uintptr_t)mbi.BaseAddress + mbi.RegionSize) {
+        if (mbi.State != MEM_COMMIT || mbi.Type != MEM_PRIVATE || mbi.Protect != PAGE_READWRITE) continue;
+        uintptr_t rs = (uintptr_t)mbi.BaseAddress, re = rs + mbi.RegionSize;
+        for (uintptr_t c = rs; c < re; c += sizeof(buf)) {
+            size_t n = re - c < sizeof(buf) ? re - c : sizeof(buf);
+            if (!safe_read(c, buf, n)) continue;
+            for (size_t i = 0; i + 8 <= n; i += 4) {
+                int v[2];
+                memcpy(v, buf + i, 8);
+                if (v[0] == id && v[1] >= 1 && v[1] <= 999 && g_ammo_cand_n < AMMO_CANDS)
+                    g_ammo_cands[g_ammo_cand_n++] = {c + i, v[1]};
+            }
+        }
+    }
+}
+
+// called after each real shot
+static void ammo_on_shot(int id) {
+    if (g_ammo_slot_n && g_ammo_slot_id == id) return;
+    if (g_ammo_cand_n && g_ammo_cand_id == id) {
+        int found = 0;
+        g_ammo_slot_n = 0;
+        for (int i = 0; i < g_ammo_cand_n; i++) {
+            int v[2];
+            if (safe_read(g_ammo_cands[i].addr, v, 8) && v[0] == id && v[1] == g_ammo_cands[i].qty - 1 && g_ammo_slot_n < AMMO_SLOTS) {
+                g_ammo_slots[g_ammo_slot_n++] = g_ammo_cands[i].addr;
+                found++;
+            }
+        }
+        g_ammo_slot_id = id;
+        logf("ammo %d: %d of %d candidates dropped by one -> %s\n", id, found, g_ammo_cand_n, found ? "locked at 99" : "none confirmed, searching again");
+        if (found) return;
+    }
+    ammo_scan(id);
+    logf("ammo %d: %d candidate counts found, waiting for the next shot to confirm\n", id, g_ammo_cand_n);
+}
+
+static void ammo_keep_full() {
+    for (int i = 0; i < g_ammo_slot_n; i++) {
+        int v[2];
+        if (safe_read(g_ammo_slots[i], v, 8) && v[0] == g_ammo_slot_id && v[1] >= 0 && v[1] < 99) wr(g_ammo_slots[i] + 4, 99);
+    }
 }
 
 struct Hook {
@@ -662,11 +916,12 @@ static Hook g_hooks[MAX_HOOKS];
 static int g_hook_n = 0;
 
 // Redirects a game function to `hook` and returns a trampoline that runs the original.
-// `n` (5..8) prologue bytes are moved; they must be whole, position-independent instructions.
-// `fn` must be 8-byte aligned so the patch is a single store.
+// `n` (5..14) prologue bytes are moved; they must be whole, position-independent instructions.
+// `fn` must be 8-byte aligned so the patch is a single store. Only the first 8 bytes are rewritten;
+// with a longer prologue the rest is left as it was and is never reached.
 static void *install_hook(uintptr_t rva, const uint8_t *prologue, size_t n, void *hook) {
     uint8_t *fn = (uint8_t *)GetModuleHandleA(nullptr) + rva;
-    if (n < 5 || n > 8 || ((uintptr_t)fn & 7) || memcmp(fn, prologue, n) != 0) return nullptr;
+    if (n < 5 || n > 14 || ((uintptr_t)fn & 7) || memcmp(fn, prologue, n) != 0) return nullptr;
     uint8_t *t = nullptr;
     for (uintptr_t a = ((uintptr_t)fn & ~(uintptr_t)0xFFFF) - 0x10000; !t && a > (uintptr_t)fn - 0x70000000; a -= 0x10000)
         t = (uint8_t *)VirtualAlloc((void *)a, 64, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
@@ -684,7 +939,7 @@ static void *install_hook(uintptr_t rva, const uint8_t *prologue, size_t n, void
     patch[0] = 0xE9;
     int32_t rel = (int32_t)((t + 32) - (fn + 5));
     memcpy(patch + 1, &rel, 4);
-    for (size_t i = 5; i < n; i++) patch[i] = 0x90;
+    for (size_t i = 5; i < n && i < 8; i++) patch[i] = 0x90;
     DWORD old;
     if (!VirtualProtect(fn, 8, PAGE_EXECUTE_READWRITE, &old)) return nullptr;
     // one aligned 8-byte store, so a thread entering the function never sees half a patch
@@ -765,7 +1020,7 @@ static DWORD WINAPI mod_thread(LPVOID) {
     char *slash = strrchr(path, '\\');
     strcpy(slash ? slash + 1 : path, "ultrasouls.log");
     g_log = fopen(path, "w");
-    logf("ultrasouls v0.19 loaded\n");
+    logf("ultrasouls v0.27 loaded\n");
     // Patching the code at startup made the game exit before showing a window (v0.7), so the hook
     // goes in later, once a character is loaded.
     bool hooked = false, hook_tried = false;
@@ -780,9 +1035,12 @@ static DWORD WINAPI mod_thread(LPVOID) {
 
     float speed = 1.5f;
     bool speed_on = true, speed_ok = false, speed_checked = false;
-    bool k6 = false, k7 = false, k8 = false, kj = false, kk = false, kspace = false, k3 = false, k4 = false, k5 = false, k1 = false, k2 = false, k9 = false, k10 = false;
+    bool k6 = false, k7 = false, k8 = false, kj = false, kk = false, k3 = false, k4 = false, k5 = false, k1 = false, k2 = false, k9 = false, k10 = false, k11 = false;
     double mouse_log = 0, fp_t0 = 0;
     int bullets_logged = 0;
+    LONG shots_seen = 0;
+    bool shot_pending = false;
+    double shot_seen_t = 0, ammo_t = 0;
     bool fp_air = false;
     float fp_y0 = 0, fp_peak = 0, fp_x0 = 0, fp_z0 = 0;
     double hook_check = 0, t_start = now_s();
@@ -813,15 +1071,20 @@ static DWORD WINAPI mod_thread(LPVOID) {
         rd(map + OFF_MAP_ANIM, anim);
         rd(map + OFF_MAP_POS, pos);
         g_player_pos = pos;
+        g_player_chr = player;
+        g_block_lmb = g_instant_fire && g_ctrl && g_last_emitter != 0;
 
         if (!hook_tried && speed_checked) {
             hook_tried = true;
             logf("installing physics step hook...\n");
             g_orig_step = (StepFn)install_hook(RVA_STEP, STEP_PROLOGUE, sizeof(STEP_PROLOGUE), (void *)hook_step);
+            g_orig_step_alt = (StepFn)install_hook(RVA_STEP_ALT, STEP_ALT_PROLOGUE, sizeof(STEP_ALT_PROLOGUE), (void *)hook_step_alt);
+            logf("second physics step hook: %s\n", g_orig_step_alt ? "installed" : "NOT installed (code mismatch)");
             hooked = g_orig_step != nullptr;
             g_orig_cam = (CamFn)install_hook(RVA_CAM_UPDATE, CAM_PROLOGUE, sizeof(CAM_PROLOGUE), (void *)hook_cam);
             g_orig_bullet_init = (BulletInitFn)install_hook(RVA_BULLET_INIT, BULLET_PROLOGUE, sizeof(BULLET_PROLOGUE), (void *)hook_bullet_init);
             logf("projectile hook: %s\n", g_orig_bullet_init ? "installed" : "NOT installed (code mismatch)");
+            logf("HUD (Present) hook: %s\n", hook_present() ? "installed" : "NOT installed");
             logf("camera hook: %s\n", g_orig_cam ? "installed" : "NOT installed (code mismatch); F5 disabled");
             logf("raw input watch: %s; DirectInput devices created: %ld, mouse device %s\n", watch_raw_input() ? "installed" : "no window found",
                  (long)g_dev_n, g_mouse_dev ? "found" : "not seen");
@@ -865,25 +1128,29 @@ static DWORD WINAPI mod_thread(LPVOID) {
                 logf("  (%.3f, %.3f, %.3f, %.3f)\n", g_cam_seen[i], g_cam_seen[i + 1], g_cam_seen[i + 2], g_cam_seen[i + 3]);
             logf("  lens (%.4f, %.4f, %.4f, %.4f) camera calls %ld\n", g_lens_seen[0], g_lens_seen[1], g_lens_seen[2], g_lens_seen[3], (long)g_cam_calls);
         }
-        while (bullets_logged < BULLET_LOG && bullets_logged < g_bullets) {
+        while (bullets_logged < BULLET_LOG && bullets_logged < g_player_shots) {
             int b = bullets_logged++;
-            const float *bm = g_bullet_mats[b];
-            logf("projectile %d: bullet id %d, %s; start matrix:\n", b, *(int *)(g_bullet_params[b] + 4), g_bullet_was_player[b] ? "near player" : "not near player");
-            for (int i = 0; i < 16; i += 4)
-                logf("  (%.3f, %.3f, %.3f, %.3f)\n", bm[i], bm[i + 1], bm[i + 2], bm[i + 3]);
-            for (int i = 0; i < BULLET_PARAM_BYTES; i += 32) {
-                logf("  params+%03X:", i);
-                for (int j = 0; j < 32; j++) logf(" %02X", g_bullet_params[b][i + j]);
-                logf("\n");
-            }
+            logf("player shot %d: bullet id %d, emitter %p, a4:", b, *(int *)(g_bullet_params[b] + 4), (void *)g_bullet_emitter[b]);
+            for (int j = 0; j < 0x40; j++) logf(" %02X", g_bullet_a4[b][j]);
+            logf("\n");
+        }
+        if (g_real_shots != shots_seen && t - shot_seen_t > 0.4) {
+            // a little after the shot, so the game has taken the arrow out of the inventory
+            if (shot_pending) { shots_seen = g_real_shots; shot_pending = false; ammo_on_shot(g_ammo_id); }
+            else { shot_pending = true; shot_seen_t = t; }
+        }
+        if (t - ammo_t > 0.25) { ammo_t = t; ammo_keep_full(); }
+        if (pressed(VK_F11, k11)) {
+            g_instant_fire = !g_instant_fire;
+            logf("instant fire %s (last emitter %p)\n", g_instant_fire ? "on" : "off", (void *)g_last_emitter);
         }
         if (pressed(VK_F9, k9)) { g_sens = g_sens * 0.8f; logf("mouse sensitivity %.5f\n", g_sens); }
         if (pressed(VK_F10, k10)) { g_sens = g_sens * 1.25f; logf("mouse sensitivity %.5f\n", g_sens); }
         if (g_first_person && t - mouse_log > 5.0) {
             mouse_log = t;
-            logf("mouse: DirectInput mouse reads %ld (state calls %ld, data calls %ld), raw input %ld, cursor moves %ld; yaw %.2f pitch %.2f; keys hidden from game %ld; projectiles %ld, re-aimed %ld\n",
+            logf("mouse: DirectInput mouse reads %ld (state calls %ld, data calls %ld), raw input %ld, cursor moves %ld; yaw %.2f pitch %.2f; keys hidden from game %ld; projectiles %ld, player shots %ld, re-aimed %ld, instant shots %ld; frames %ld, HUD draws %ld; steps %ld (second kind %ld)\n",
                  (long)g_di_events, (long)g_di_state_calls, (long)g_di_data_calls, (long)g_raw_events, (long)g_cur_events, g_yaw, g_pitch,
-                 (long)g_keys_blocked, (long)g_bullets, (long)g_bullets_aimed);
+                 (long)g_keys_blocked, (long)g_bullets, (long)g_player_shots, (long)g_bullets_aimed, (long)g_instant_shots, (long)g_presents, (long)g_hud_draws, (long)g_steps, (long)g_steps_alt);
         }
         if (pressed(VK_F1, k1)) { g_fov_scale = g_fov_scale - 0.1f; logf("fov scale %.1f\n", g_fov_scale); }
         if (pressed(VK_F2, k2)) { g_fov_scale = g_fov_scale + 0.1f; logf("fov scale %.1f\n", g_fov_scale); }
@@ -927,7 +1194,6 @@ static DWORD WINAPI mod_thread(LPVOID) {
         }
 
         bool want_j = !air && pressed('J', kj), want_k = !air && pressed('K', kk);
-        if (pressed(VK_SPACE, kspace) && g_ctrl) want_j = true;
         if (want_j && g_ctrl) {
             g_jump_req = true;   // first person: the controller in the physics hook owns the whole jump
             want_j = false;

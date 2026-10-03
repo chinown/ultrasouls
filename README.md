@@ -6,20 +6,28 @@ No game files are included. You need your own copy of Dark Souls Remastered. Pla
 
 ## What works so far
 
-- **Params (`tools/patch_v1.py`)**: attacks cost no stamina, every melee weapon heals on hit, arrows and bolts fly fast and flat.
-- **DLL (`dll/mod.cpp`)**: a `dinput8.dll` proxy. Stamina is locked at max and animations run faster. F5 switches to first person, which replaces Dark Souls' movement with V1's: mouse look, run, jump, dash, slide and ground slam, all driven through the game's own physics step so walls, floors and ceilings collide. The numbers come from ULTRAKILL's own code and Player prefab (run 16.5 u/s, jump 28.08 u/s, gravity 40 u/s², dash 49.5 u/s for 0.2 s, slide 24 u/s, slam 100 u/s, 3 stamina bars at 70/s), converted at 1 unit = 0.5 m so V1's 3.5-unit capsule matches the character's height. Projectiles fired in first person are re-aimed along the view; this last part is the newest and still being tested.
+- **Params (`tools/patch_v1.py`)**: attacks cost no stamina, every melee weapon heals on hit, arrows and bolts fly fast and flat, and merchants sell them for 1 soul.
+- **DLL (`dll/mod.cpp`)**: a `dinput8.dll` proxy. Stamina is locked at max and animations run faster. F5 switches to first person, which replaces Dark Souls' controls with V1's.
+  - **Movement**: mouse look, run, jump, dash, slide and ground slam, driven through the game's own physics step so walls, floors and ceilings collide. The numbers come from ULTRAKILL's code and Player prefab (run 16.5 u/s, jump 28.08 u/s, gravity 40 u/s², dash 49.5 u/s for 0.2 s, slide 24 u/s, slam 100 u/s, 3 stamina bars at 70/s), converted at 1 unit = 0.5 m so V1's 3.5-unit capsule matches the character's height.
+  - **Shooting**: with a bow or crossbow equipped, fire one normal shot; after that, holding the left mouse button fires every 0.5 s (V1's revolver rate) with no animation, from the eye along the crosshair. The projectile is still the game's arrow or bolt.
+  - **Ammo**: after two normal shots the count of the equipped arrows or bolts is found and held at 99. Instant shots use none.
+  - **HUD**: a crosshair and three stamina bars, drawn into the game's back buffer.
 
 First person (F5 toggles it; third person plays as normal Dark Souls):
 
 | Key | Action |
 |---|---|
 | Mouse / WASD | Look / move |
-| Space | Jump (Space, Shift and Ctrl are hidden from the game while first person is on) |
+| Left mouse | Fire (hold to keep firing) |
+| Space | Jump |
 | Shift | Dash |
 | Ctrl | Slide on the ground, slam in the air |
 | F1 / F2 | Field of view |
 | F3 / F4 | Eye height |
 | F9 / F10 | Mouse sensitivity |
+| F11 | Instant fire on/off |
+
+Space, Shift, Ctrl and the left mouse button are hidden from the game while first person is on, so its own binds on them do nothing.
 
 Always: F6 / F7 / F8 animation speed down / up / toggle.
 
@@ -43,11 +51,11 @@ python tools/patch_v1.py --install
 ```
 
 ```bash
-g++ -O2 -shared -static -o build/dinput8.dll dll/mod.cpp dll/dinput8.def -lpsapi
+g++ -O2 -shared -static -o build/dinput8.dll dll/mod.cpp dll/dinput8.def -lpsapi -ld3d11 -ldxgi
 ```
 
 Copy `build/dinput8.dll` next to `DarkSoulsRemastered.exe`. Delete it to uninstall.
 
 ## Roadmap
 
-Instant-fire guns without the bow animation, wall jump and slam bounce, coins and parry, HUD and style meter.
+Shooting without needing a bow or a first normal shot, V1's hitscan revolver and the other weapons, wall jump and slam bounce, fall damage, coins and parry, style meter.

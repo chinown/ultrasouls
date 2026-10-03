@@ -3,6 +3,7 @@
   1. No stamina cost on any player action that goes through BehaviorParam_PC.
   2. Blood healing: every melee weapon heals the attacker on hit.
   3. Arrows and bolts fly fast and flat, like hitscan shots.
+  4. Merchants sell arrows and bolts for 1 soul.
 
 Always patches from backup/GameParam.parambnd.dcx.current, so re-running is safe.
 Pass --install to copy the result into the game folder.
@@ -69,6 +70,14 @@ for r in SHOT_BULLETS:
         bul.set(r, k, v)
     n_shot += 1
 
+# 4. arrows and bolts cost 1 soul at every merchant
+shop = g["ShopLineupParam"]
+n_shop = 0
+for r in shop.order:
+    if shop.get(r, "equipType") == 0 and 2000000 <= shop.get(r, "equipId") < 2200000 and shop.get(r, "value") > 1:
+        shop.set(r, "value", 1)
+        n_shop += 1
+
 os.makedirs(os.path.dirname(OUT), exist_ok=True)
 g.save(OUT)
 
@@ -78,7 +87,7 @@ assert len(chk.bnd.buf) == len(g.bnd.buf)
 assert all(chk["BehaviorParam_PC"].get(r, "stamina") == 0 for r in chk["BehaviorParam_PC"].order)
 assert chk["SpEffectParam"].get(HEAL_SPEFFECT, "changeHpPoint") == -HEAL_PER_HIT
 assert chk["Bullet"].get(600, "initVellocity") == SHOT_SPEED
-print(f"stamina zeroed on {n_stam} behaviours; heal-on-hit on {n_heal} melee weapons ({n_full} had no free slot); {n_shot} projectiles retuned")
+print(f"stamina zeroed on {n_stam} behaviours; heal-on-hit on {n_heal} melee weapons ({n_full} had no free slot); {n_shot} projectiles retuned; {n_shop} ammo shop prices set to 1")
 print("built", os.path.normpath(OUT), os.path.getsize(OUT), "bytes")
 
 if "--install" in sys.argv:

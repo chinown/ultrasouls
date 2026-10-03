@@ -11,6 +11,8 @@
 #include <psapi.h>
 #include <d3d11_1.h>
 #include <dxgi.h>
+
+#include "hud.h"
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
@@ -122,7 +124,7 @@ static HRESULT WINAPI my_get_state(void *self, DWORD cb, void *data) {
         InterlockedExchangeAdd(&g_di_dx, ((LONG *)data)[0]);
         InterlockedExchangeAdd(&g_di_dy, ((LONG *)data)[1]);
         InterlockedIncrement(&g_di_events);
-        if (g_block_lmb) ((uint8_t *)data)[12] = 0;   // rgbButtons[0] follows lX, lY, lZ
+        if (g_block_lmb) ((uint8_t *)data)[12] = ((uint8_t *)data)[13] = 0;   // rgbButtons[0..1] follow lX, lY, lZ
     }
     if (SUCCEEDED(hr) && data && cb == 256 && g_block_keys) {
         uint8_t *keys = (uint8_t *)data;
@@ -647,9 +649,10 @@ static uint64_t hook_cam(void *self, float dt, void *a3, void *a4, uint64_t a5, 
 
 // ---- projectile hook. BulletIns::Init(bullet, params, aim, ...) sets up every projectile the game fires.
 // Layout worked out from the shots recorded in the v0.19 log:
-//   params+0x04  bullet id                     params+0xC0  shooter (ChrIns*)
+//   params+0x04  bullet id
 //   params+0xB0  point the shot is aimed at    params+0xD4  range (100)
 //   params+0xE0  start transform, 3 rows of 4: columns are -right, up, -forward, then position
+//   params+0x0C  shooter handle (0x10044000 is the player)
 //   aim+0x20     the same aim point
 //   a4           launch transform, 3 rows of 4: columns right, up, forward, position
 // In first person the player's shots are re-aimed from the eye along the view.
@@ -672,8 +675,7 @@ static volatile int g_ammo_id = 0;
 static uint64_t hook_bullet_init(void *bullet, uint8_t *params, float *aim, void *a4, uint64_t a5, uint64_t a6) {
     InterlockedIncrement(&g_bullets);
     uintptr_t pos = g_player_pos;
-    uintptr_t shooter = params ? *(uintptr_t *)(params + 0xC0) : 0;
-    bool mine = shooter && g_player_chr && shooter + 0x100 >= g_player_chr && shooter <= g_player_chr + 0x100;
+    bool mine = params && *(int *)(params + 0x0C) == 0x10044000;   // params+0x0C is the shooter's handle
     if (mine) {
         LONG n = InterlockedIncrement(&g_player_shots) - 1;
         if (n < BULLET_LOG) {
@@ -682,7 +684,7 @@ static uint64_t hook_bullet_init(void *bullet, uint8_t *params, float *aim, void
             g_bullet_emitter[n] = (uintptr_t)params - 0x1A0;
         }
         g_last_emitter = (uintptr_t)params - 0x1A0;
-        if (!g_in_instant_fire) {
+        if (*(int *)(params + 0x04) < 9000000) {   // not one of the revolver's own rows
             g_ammo_id = *(int *)(params + 0x70);   // item id of the arrow or bolt, as seen in the v0.19 log
             InterlockedIncrement(&g_real_shots);
         }
@@ -723,30 +725,125 @@ static uint64_t hook_bullet_init(void *bullet, uint8_t *params, float *aim, void
     return g_orig_bullet_init(bullet, params, aim, a4, a5, a6);
 }
 
-// Experimental instant fire (F11): asks the object that fired the player's last shot to fire again.
-// 421390(emitter, index) is the game's own "fire bullet number index" helper.
-static const uintptr_t RVA_EMITTER_FIRE = 0x421390;
-static const uint8_t EMITTER_FIRE_BYTES[8] = {0x40, 0x53, 0x48, 0x83, 0xEC, 0x50, 0x44, 0x8B};
-static volatile bool g_instant_fire = true;
-static volatile LONG g_instant_shots = 0;
-static double g_next_shot = 0;
-static const double FIRE_INTERVAL = 0.5;   // V1's revolver: Revolver.Update refills shootCharge at 200/s up to 100
+// ---- V1's Piercer revolver. Shots go through the game's own entry point for spawning a projectile,
+// BulletMan::Shoot(request) at exe+429BA0, so no bow, ammo or attack animation is involved. The request
+// layout was read from the function that unpacks it (exe+42A1C0):
+//   +00 shooter handle     +04 BehaviorParam id      +08 magic id (-1)     +0C bullet id (-1: from behaviour)
+//   +10 goods id (-1)      +14 dummy poly (-1)       +1C target handle (-1)
+//   +20 ammo slot code     +24 weapon slot code      +28, +2C multipliers (1.0)
+//   +40 start transform, +70 shooter transform: 3 rows of 4 each
+// The behaviour rows 9000100 and 9000110 are added to the game's params by tools/patch_v1.py.
+struct alignas(16) ShootRequest {
+    int shooter, behavior, magic, bullet, goods, dummy_poly;
+    uint8_t flag18, pad19[3];
+    int target;
+    int ammo_slot, weapon_slot;
+    float mul_a, mul_b;
+    uint8_t flag30, flag31, flag32, pad33[13];
+    float start[12];
+    float root[12];
+};
+static_assert(sizeof(ShootRequest) == 0xA0, "request layout");
 
+static const uintptr_t RVA_BULLET_MAN = 0x1C7A488;
+static const uintptr_t RVA_BULLET_SHOOT = 0x429BA0;
+static const uint8_t BULLET_SHOOT_BYTES[8] = {0x48, 0x8B, 0xC4, 0x57, 0x48, 0x81, 0xEC, 0xA0};
+static const int PLAYER_HANDLE = 0x10044000;      // seen as the shooter in every recorded player shot
+static const int BEHAVIOR_REVOLVER = 9000100, BEHAVIOR_PIERCER = 9000110;
+// Revolver.Update: shootCharge refills at 200/s (0.5 s between shots); the alt fire charges at 175/s
+// while held and fires on release at full charge, then pierceCharge refills at 40/s (2.5 s).
+static const double FIRE_INTERVAL = 0.5;
+static const float PIERCE_CHARGE_RATE = 175.0f, PIERCE_RECHARGE_RATE = 40.0f;
+
+static volatile bool g_instant_fire = true;      // F11: off hands both mouse buttons back to the game
+static volatile bool g_item_style = true;        // Insert: which kind of request the shots use
+static const int GOODS_THROWING_KNIFE = 290;
+static volatile LONG g_instant_shots = 0, g_pierce_shots = 0, g_shoot_fails = 0;
+static double g_next_shot = 0;
+static volatile float g_pierce_charge = 0;        // 0..100 while the alt fire is held
+static volatile float g_pierce_ready = 100.0f;    // 0..100, recharging after a charged shot
+static bool g_prev_rmb = false;
+static volatile double g_last_shot_time = -100.0, g_last_pierce_time = -100.0;
+
+static bool send_shot(int behavior, bool item_style) {
+    uintptr_t exe = (uintptr_t)GetModuleHandleA(nullptr), pos = g_player_pos;
+    uintptr_t man = *(uintptr_t *)(exe + RVA_BULLET_MAN);
+    if (!man || !pos || memcmp((void *)(exe + RVA_BULLET_SHOOT), BULLET_SHOOT_BYTES, sizeof(BULLET_SHOOT_BYTES)) != 0) return false;
+    const float *p = (const float *)(pos + OFF_POS_X);
+    float sy = sinf(g_yaw), cy = cosf(g_yaw), sp = sinf(g_pitch), cp = cosf(g_pitch);
+    float right[3] = {cy, 0, -sy}, up[3] = {-sp * sy, cp, -sp * cy}, fwd[3] = {sy * cp, sp, cy * cp};
+    float eye[3] = {p[0], p[1] + g_eye_height - g_eye_drop, p[2]};
+    float flat_fwd[3] = {sy, 0, cy}, flat_up[3] = {0, 1, 0};
+    ShootRequest r{};
+    r.shooter = PLAYER_HANDLE;
+    r.behavior = behavior;
+    r.magic = r.bullet = r.goods = r.dummy_poly = r.target = -1;
+    r.ammo_slot = r.weapon_slot = -1;
+    if (item_style) {
+        // Fired the way a thrown item is: the bullet row is named directly and the request carries an
+        // item id, which makes the game skip looking up the equipped weapon and ammo. Damage then comes
+        // only from the bullet's own attack row, like a throwing knife. (In v0.28 the shot was set up
+        // like a crossbow's and did no damage.)
+        r.goods = GOODS_THROWING_KNIFE;
+        r.bullet = behavior;   // patch_v1.py gives the bullet row the same id as the behaviour row
+    } else {
+        r.ammo_slot = -3;      // the slot codes a crossbow shot uses
+    }
+    r.mul_a = r.mul_b = 1.0f;
+    for (int i = 0; i < 3; i++) {
+        // the game's own transforms here have columns -right, up, -forward, then position
+        r.start[i * 4 + 0] = -right[i];
+        r.start[i * 4 + 1] = up[i];
+        r.start[i * 4 + 2] = -fwd[i];
+        r.start[i * 4 + 3] = eye[i] + fwd[i] * 0.6f;
+        r.root[i * 4 + 0] = -right[i];
+        r.root[i * 4 + 1] = flat_up[i];
+        r.root[i * 4 + 2] = -flat_fwd[i];
+        r.root[i * 4 + 3] = p[i];
+    }
+    int id = ((int (*)(uintptr_t, ShootRequest *))(exe + RVA_BULLET_SHOOT))(man, &r);
+    return id != -1;
+}
+
+static bool shoot(int behavior) {
+    bool ok = send_shot(behavior, g_item_style);
+    if (!ok && g_item_style) ok = send_shot(behavior, false);   // refused: fall back to the weapon-style request
+    if (!ok) InterlockedIncrement(&g_shoot_fails);
+    return ok;
+}
+
+// once per frame, on the game's thread
 static void try_instant_fire() {
-    if (!g_instant_fire || !g_ctrl || !key_down(VK_LBUTTON)) return;
-    uintptr_t emitter = g_last_emitter;
+    static double last = 0;
     double t = now_s();
-    if (!emitter || t < g_next_shot) return;
-    uint8_t *fn = (uint8_t *)GetModuleHandleA(nullptr) + RVA_EMITTER_FIRE;
-    uintptr_t owner = 0;
-    // only if the code is what we expect and the emitter still names the player as its shooter
-    if (memcmp(fn, EMITTER_FIRE_BYTES, sizeof(EMITTER_FIRE_BYTES)) != 0) return;
-    if (!rd(emitter + 0x1A0 + 0xC0, owner) || owner + 0x100 < g_player_chr || owner > g_player_chr + 0x100) { g_last_emitter = 0; return; }
-    g_next_shot = t + FIRE_INTERVAL;
-    InterlockedIncrement(&g_instant_shots);
-    g_in_instant_fire = true;
-    ((void (*)(uintptr_t, int))fn)(emitter, 0);
-    g_in_instant_fire = false;
+    float dt = last > 0 && t - last < 0.1 ? (float)(t - last) : 0.0f;
+    last = t;
+    if (!g_instant_fire || !g_ctrl) { g_pierce_charge = 0; g_prev_rmb = false; return; }
+
+    bool lmb = key_down(VK_LBUTTON) != 0, rmb = key_down(VK_RBUTTON) != 0;
+    if (g_pierce_ready < 100.0f) g_pierce_ready = g_pierce_ready + PIERCE_RECHARGE_RATE * dt > 100.0f ? 100.0f : g_pierce_ready + PIERCE_RECHARGE_RATE * dt;
+    if (rmb && g_pierce_ready >= 100.0f) {
+        g_pierce_charge = g_pierce_charge + PIERCE_CHARGE_RATE * dt > 100.0f ? 100.0f : g_pierce_charge + PIERCE_CHARGE_RATE * dt;
+    } else if (g_prev_rmb && g_pierce_charge >= 100.0f) {
+        if (shoot(BEHAVIOR_PIERCER)) {
+            InterlockedIncrement(&g_pierce_shots);
+            g_last_pierce_time = t;
+            g_pierce_ready = 0;
+            g_next_shot = t + FIRE_INTERVAL;
+        }
+        g_pierce_charge = 0;
+    } else {
+        g_pierce_charge = 0;   // released early: the charge is lost
+    }
+    g_prev_rmb = rmb;
+
+    if (lmb && g_pierce_charge <= 0 && t >= g_next_shot) {
+        g_next_shot = t + FIRE_INTERVAL;
+        if (shoot(BEHAVIOR_REVOLVER)) {
+            InterlockedIncrement(&g_instant_shots);
+            g_last_shot_time = t;
+        }
+    }
 }
 
 // ---- HUD, drawn into the game's back buffer just before it is presented. Only solid rectangles,
@@ -785,6 +882,19 @@ static void draw_hud(IDXGISwapChain *sc) {
                                  {cx - 6 * u + v, cy - v, cx - 2 * u - v, cy + v}, {cx + 2 * u + v, cy - v, cx + 6 * u - v, cy + v},
                                  {cx - v, cy - v, cx + v, cy + v}};
             fill(ctx1, rtv, 1.0f, 1.0f, 1.0f, core, 5);
+            // Piercer: a bar under the crosshair. It fills while charging; while the shot recharges,
+            // a dim bar shows the progress.
+            float charge = g_pierce_charge, ready = g_pierce_ready;
+            LONG half = 12 * u, by = cy + 10 * u;
+            if (charge > 0 || ready < 100.0f) {
+                D3D11_RECT track = {cx - half, by, cx + half, by + 2 * u};
+                fill(ctx1, rtv, 0.05f, 0.05f, 0.05f, &track, 1);
+                float part = (charge > 0 ? charge : ready) / 100.0f;
+                D3D11_RECT bar = {cx - half, by, cx - half + (LONG)(2 * half * part), by + 2 * u};
+                if (charge >= 100.0f) fill(ctx1, rtv, 1.0f, 1.0f, 1.0f, &bar, 1);
+                else if (charge > 0) fill(ctx1, rtv, 0.3f, 0.7f, 1.0f, &bar, 1);
+                else fill(ctx1, rtv, 0.25f, 0.28f, 0.33f, &bar, 1);
+            }
             // stamina: three bars, bottom left, filled in proportion
             LONG bw = 40 * u, bh = 5 * u, gap = 3 * u, x0 = 30 * u, y0 = h - 40 * u;
             D3D11_RECT bg[3], fg[3];
@@ -809,9 +919,53 @@ static void draw_hud(IDXGISwapChain *sc) {
     if (dev) dev->Release();
 }
 
+// The full HUD and viewmodel (hud.cpp), drawn from art in ultrasouls_assets.bin next to the exe.
+// Returns false if that cannot be used, and the plain rectangles above are drawn instead.
+static volatile float g_hud_health = 100.0f;      // the player's health as a percentage, for the HUD
+static volatile int g_hud_status = 0;             // 0 not tried, 1 working, 2 unavailable (see hud_error)
+static volatile bool g_viewmodel = true;
+
+static bool draw_full_hud(IDXGISwapChain *sc) {
+    if (g_hud_status == 2) return false;
+    ID3D11Device *dev = nullptr;
+    ID3D11DeviceContext *ctx = nullptr;
+    ID3D11Texture2D *back = nullptr;
+    bool ok = false;
+    if (SUCCEEDED(sc->GetDevice(__uuidof(ID3D11Device), (void **)&dev)) && dev) {
+        dev->GetImmediateContext(&ctx);
+        sc->GetBuffer(0, __uuidof(ID3D11Texture2D), (void **)&back);
+        if (ctx && back) {
+            static wchar_t pack[MAX_PATH];
+            if (!pack[0]) {
+                GetModuleFileNameW(nullptr, pack, MAX_PATH);
+                wchar_t *slash = wcsrchr(pack, L'\\');
+                wcscpy(slash ? slash + 1 : pack, L"ultrasouls_assets.bin");
+            }
+            ok = hud_init(dev, pack);
+            g_hud_status = ok ? 1 : 2;
+            if (ok) {
+                HudState st;
+                st.health = g_hud_health;
+                st.stamina = g_boost;
+                st.pierce_charge = g_pierce_charge;
+                st.pierce_ready = g_pierce_ready;
+                st.time = now_s();
+                st.last_shot = g_last_shot_time;
+                st.last_pierce = g_last_pierce_time;
+                st.show_viewmodel = g_viewmodel;
+                hud_draw(dev, ctx, back, st);
+            }
+        }
+    }
+    if (back) back->Release();
+    if (ctx) ctx->Release();
+    if (dev) dev->Release();
+    return ok;
+}
+
 static HRESULT WINAPI my_present(IDXGISwapChain *sc, UINT sync, UINT flags) {
     InterlockedIncrement(&g_presents);
-    if (g_ctrl) draw_hud(sc);
+    if (g_ctrl && !draw_full_hud(sc)) draw_hud(sc);
     return g_orig_present(sc, sync, flags);
 }
 
@@ -1020,7 +1174,7 @@ static DWORD WINAPI mod_thread(LPVOID) {
     char *slash = strrchr(path, '\\');
     strcpy(slash ? slash + 1 : path, "ultrasouls.log");
     g_log = fopen(path, "w");
-    logf("ultrasouls v0.27 loaded\n");
+    logf("ultrasouls v0.30 loaded\n");
     // Patching the code at startup made the game exit before showing a window (v0.7), so the hook
     // goes in later, once a character is loaded.
     bool hooked = false, hook_tried = false;
@@ -1035,9 +1189,9 @@ static DWORD WINAPI mod_thread(LPVOID) {
 
     float speed = 1.5f;
     bool speed_on = true, speed_ok = false, speed_checked = false;
-    bool k6 = false, k7 = false, k8 = false, kj = false, kk = false, k3 = false, k4 = false, k5 = false, k1 = false, k2 = false, k9 = false, k10 = false, k11 = false;
+    bool k6 = false, k7 = false, k8 = false, kj = false, kk = false, k3 = false, k4 = false, k5 = false, k1 = false, k2 = false, k9 = false, k10 = false, k11 = false, kins = false, khome = false;
     double mouse_log = 0, fp_t0 = 0;
-    int bullets_logged = 0;
+    int bullets_logged = 0, hud_status_logged = 0;
     LONG shots_seen = 0;
     bool shot_pending = false;
     double shot_seen_t = 0, ammo_t = 0;
@@ -1072,7 +1226,15 @@ static DWORD WINAPI mod_thread(LPVOID) {
         rd(map + OFF_MAP_POS, pos);
         g_player_pos = pos;
         g_player_chr = player;
-        g_block_lmb = g_instant_fire && g_ctrl && g_last_emitter != 0;
+        {
+            int hp = 0, hp_max = 0;
+            if (rd(player + OFF_HP, hp) && rd(player + OFF_HP + 4, hp_max) && hp_max > 0) g_hud_health = 100.0f * (float)hp / (float)hp_max;
+        }
+        if (g_hud_status != hud_status_logged) {
+            hud_status_logged = g_hud_status;
+            logf("full HUD: %s%s\n", hud_status_logged == 1 ? "working" : "unavailable, using plain bars: ", hud_status_logged == 1 ? "" : hud_error());
+        }
+        g_block_lmb = g_instant_fire && g_ctrl;
 
         if (!hook_tried && speed_checked) {
             hook_tried = true;
@@ -1085,6 +1247,11 @@ static DWORD WINAPI mod_thread(LPVOID) {
             g_orig_bullet_init = (BulletInitFn)install_hook(RVA_BULLET_INIT, BULLET_PROLOGUE, sizeof(BULLET_PROLOGUE), (void *)hook_bullet_init);
             logf("projectile hook: %s\n", g_orig_bullet_init ? "installed" : "NOT installed (code mismatch)");
             logf("HUD (Present) hook: %s\n", hook_present() ? "installed" : "NOT installed");
+            {
+                int handle = 0;
+                rd(player + 8, handle);
+                logf("player handle field reads %08X (expected 10044000)\n", handle);
+            }
             logf("camera hook: %s\n", g_orig_cam ? "installed" : "NOT installed (code mismatch); F5 disabled");
             logf("raw input watch: %s; DirectInput devices created: %ld, mouse device %s\n", watch_raw_input() ? "installed" : "no window found",
                  (long)g_dev_n, g_mouse_dev ? "found" : "not seen");
@@ -1140,17 +1307,25 @@ static DWORD WINAPI mod_thread(LPVOID) {
             else { shot_pending = true; shot_seen_t = t; }
         }
         if (t - ammo_t > 0.25) { ammo_t = t; ammo_keep_full(); }
+        if (pressed(VK_HOME, khome)) {
+            g_viewmodel = !g_viewmodel;
+            logf("viewmodel %s\n", g_viewmodel ? "on" : "off");
+        }
+        if (pressed(VK_INSERT, kins)) {
+            g_item_style = !g_item_style;
+            logf("shot request style: %s\n", g_item_style ? "item" : "weapon");
+        }
         if (pressed(VK_F11, k11)) {
             g_instant_fire = !g_instant_fire;
-            logf("instant fire %s (last emitter %p)\n", g_instant_fire ? "on" : "off", (void *)g_last_emitter);
+            logf("revolver %s\n", g_instant_fire ? "on" : "off");
         }
         if (pressed(VK_F9, k9)) { g_sens = g_sens * 0.8f; logf("mouse sensitivity %.5f\n", g_sens); }
         if (pressed(VK_F10, k10)) { g_sens = g_sens * 1.25f; logf("mouse sensitivity %.5f\n", g_sens); }
         if (g_first_person && t - mouse_log > 5.0) {
             mouse_log = t;
-            logf("mouse: DirectInput mouse reads %ld (state calls %ld, data calls %ld), raw input %ld, cursor moves %ld; yaw %.2f pitch %.2f; keys hidden from game %ld; projectiles %ld, player shots %ld, re-aimed %ld, instant shots %ld; frames %ld, HUD draws %ld; steps %ld (second kind %ld)\n",
+            logf("mouse: DirectInput mouse reads %ld (state calls %ld, data calls %ld), raw input %ld, cursor moves %ld; yaw %.2f pitch %.2f; keys hidden from game %ld; projectiles %ld, player shots %ld, re-aimed %ld, revolver shots %ld, charged %ld, refused %ld; frames %ld, HUD draws %ld; steps %ld (second kind %ld)\n",
                  (long)g_di_events, (long)g_di_state_calls, (long)g_di_data_calls, (long)g_raw_events, (long)g_cur_events, g_yaw, g_pitch,
-                 (long)g_keys_blocked, (long)g_bullets, (long)g_player_shots, (long)g_bullets_aimed, (long)g_instant_shots, (long)g_presents, (long)g_hud_draws, (long)g_steps, (long)g_steps_alt);
+                 (long)g_keys_blocked, (long)g_bullets, (long)g_player_shots, (long)g_bullets_aimed, (long)g_instant_shots, (long)g_pierce_shots, (long)g_shoot_fails, (long)g_presents, (long)g_hud_draws, (long)g_steps, (long)g_steps_alt);
         }
         if (pressed(VK_F1, k1)) { g_fov_scale = g_fov_scale - 0.1f; logf("fov scale %.1f\n", g_fov_scale); }
         if (pressed(VK_F2, k2)) { g_fov_scale = g_fov_scale + 0.1f; logf("fov scale %.1f\n", g_fov_scale); }

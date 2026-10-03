@@ -1,6 +1,6 @@
 """Minimal reader/patcher for Dark Souls Remastered GameParam (DCX -> BND3 -> PARAM + PARAMDEF).
 
-Edits are done in place on the decompressed binder, so file layout never changes.
+Field edits are done in place on the decompressed binder. Adding rows rebuilds the binder.
 """
 import struct
 import zlib
@@ -191,14 +191,74 @@ class GameParam:
         for e in defs.entries:
             d = ParamDef(defs.data(e))
             self.defs[d.param_type] = d
+        self._parse_params()
+
+    def __getitem__(self, stem):
+        return self.params[stem]
+
+    def _parse_params(self):
         self.params = {}
         for e, stem in zip(self.bnd.entries, self.bnd.stems()):
             ptype = _cstr(self.bnd.buf, e["offset"] + 0x0C, "ascii")
             if ptype in self.defs:
                 self.params[stem] = Param(self.bnd.buf, e["offset"], e["size"], self.defs[ptype])
 
-    def __getitem__(self, stem):
-        return self.params[stem]
+    def add_rows(self, stem, rows):
+        """Append rows to a param. `rows` is a list of (new_id, source_id, name); each new row starts as a
+        copy of the source row. This changes the file's size, so the whole binder is rebuilt and every
+        Param object obtained before the call is stale: fetch them again with self[stem]."""
+        p = self.params[stem]
+        b = self.bnd.buf
+        base, size = p.base, p.size
+        old = bytes(b[base:base + size])
+        strings_off, data_start = struct.unpack_from("<IH", old, 0)
+        n = struct.unpack_from("<H", old, 0x0A)[0]
+        rs = p.detected_row_size
+        assert data_start == 0x30 + 12 * n and strings_off == data_start + n * rs, "unexpected PARAM layout"
+        k = len(rows)
+        for new_id, src, _ in rows:
+            assert new_id not in p.rows, f"{stem} row {new_id} already exists"
+            assert src in p.rows, f"{stem} source row {src} missing"
+        new_data_start = 0x30 + 12 * (n + k)
+        new_strings_off = new_data_start + (n + k) * rs
+        shift_data = 12 * k
+        shift_names = 12 * k + k * rs
+        strings = bytearray(old[strings_off:])
+        table = bytearray()
+        for i in range(n):
+            rid, doff, noff = struct.unpack_from("<III", old, 0x30 + i * 12)
+            table += struct.pack("<III", rid, doff + shift_data, noff + shift_names if noff else 0)
+        data = bytearray(old[data_start:strings_off])
+        for j, (new_id, src, name) in enumerate(rows):
+            src_off = p.rows[src] - base
+            data += old[src_off:src_off + rs]
+            name_off = new_strings_off + len(strings)
+            strings += name.encode("shift_jis") + b"\0"
+            table += struct.pack("<III", new_id, new_data_start + (n + j) * rs, name_off)
+        head = bytearray(old[:0x30])
+        struct.pack_into("<IH", head, 0, new_strings_off, new_data_start)
+        struct.pack_into("<H", head, 0x0A, n + k)
+        self._replace_file(base, bytes(head + table + data + strings))
+        self._parse_params()
+
+    def _replace_file(self, old_offset, new_bytes):
+        """Rebuild the binder with one file's contents replaced; files stay 16-byte aligned."""
+        bnd = self.bnd
+        assert bnd.fmt == 0x2E, "binder layout not handled"
+        b = bnd.buf
+        order = sorted(range(len(bnd.entries)), key=lambda i: bnd.entries[i]["offset"])
+        out = bytearray(b[:bnd.entries[order[0]]["offset"]])
+        for i in order:
+            e = bnd.entries[i]
+            blob = new_bytes if e["offset"] == old_offset else bytes(b[e["offset"]:e["offset"] + e["size"]])
+            while len(out) % 16:
+                out.append(0)
+            hdr = 0x20 + i * 24   # flags, size, offset, id, name offset, uncompressed size
+            struct.pack_into("<I", out, hdr + 4, len(blob))
+            struct.pack_into("<I", out, hdr + 8, len(out))
+            struct.pack_into("<I", out, hdr + 20, len(blob))
+            out += blob
+        self.bnd = Bnd3(bytes(out))
 
     def save(self, path):
         open(path, "wb").write(dcx_compress(self.dcx, bytes(self.bnd.buf)))

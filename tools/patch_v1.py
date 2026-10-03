@@ -4,6 +4,7 @@
   2. Blood healing: every melee weapon heals the attacker on hit.
   3. Arrows and bolts fly fast and flat, like hitscan shots.
   4. Merchants sell arrows and bolts for 1 soul.
+  5. New rows for V1's Piercer revolver: a normal shot and a charged, piercing shot.
 
 Always patches from backup/GameParam.parambnd.dcx.current, so re-running is safe.
 Pass --install to copy the result into the game folder.
@@ -27,6 +28,12 @@ SHOT_SPEED = 120.0
 SHOT_RANGE = 100.0
 SHOT_RADIUS = 0.1
 SHOT_BULLETS = list(range(500, 509)) + list(range(600, 605))
+REVOLVER_ID = 9000100       # the DLL fires behaviour 9000100 (primary) and 9000110 (charged); keep in step with mod.cpp
+PIERCER_ID = 9000110
+REVOLVER_DAMAGE = 150       # flat attack value per shot (a throwing knife is 100); a tuning choice, not from ULTRAKILL
+PIERCER_DAMAGE = 450        # charged shot: 3x, and it passes through enemies
+BEAM_SPEED = 300.0          # m/s, as close to hitscan as a projectile gets
+BEAM_RANGE = 150.0
 
 g = GameParam(SRC, DEFS)
 
@@ -78,12 +85,35 @@ for r in shop.order:
         shop.set(r, "value", 1)
         n_shop += 1
 
+# 5. V1's Piercer revolver, as new rows the DLL fires through the game's own shoot call.
+#    BehaviorParam_PC row -> Bullet row -> AtkParam_Pc row, all sharing one id per shot type.
+#    Damage is flat, from a copy of the throwing knife's attack row.
+g.add_rows("AtkParam_Pc", [(REVOLVER_ID, 1050, "revolver"), (PIERCER_ID, 1050, "piercer")])
+g.add_rows("Bullet", [(REVOLVER_ID, 603, "revolver"), (PIERCER_ID, 603, "piercer")])
+g.add_rows("BehaviorParam_PC", [(REVOLVER_ID, 101103300, "revolver"), (PIERCER_ID, 101103300, "piercer")])
+atk, bul, beh = g["AtkParam_Pc"], g["Bullet"], g["BehaviorParam_PC"]
+for rid, damage, sfx, sfx_hit, pierce, radius in ((REVOLVER_ID, REVOLVER_DAMAGE, 20131, 20230, 0, 0.15),
+                                                  (PIERCER_ID, PIERCER_DAMAGE, 20133, 20236, 1, 0.3)):
+    # The attack row stays exactly as the throwing knife's apart from the damage: the game's own
+    # flat-damage rows all keep their "Correction" at 100, and zeroing it made the shots do nothing.
+    atk.set(rid, "atkPhys", damage)
+    for k, v in (("atkId_Bullet", rid), ("sfxId_Bullet", sfx), ("sfxId_Hit", sfx_hit), ("sfxId_Flick", -1),
+                 ("initVellocity", BEAM_SPEED), ("maxVellocity", BEAM_SPEED), ("minVellocity", BEAM_SPEED),
+                 ("accelInRange", 0.0), ("accelOutRange", 0.0), ("gravityInRange", 0.0), ("gravityOutRange", 0.0),
+                 ("dist", BEAM_RANGE), ("life", BEAM_RANGE / BEAM_SPEED), ("hitRadius", radius), ("isPenetrate", pierce)):
+        bul.set(rid, k, v)
+    beh.set(rid, "refId", rid)
+    beh.set(rid, "variationId", 0)
+    beh.set(rid, "behaviorJudgeId", 0)
+
 os.makedirs(os.path.dirname(OUT), exist_ok=True)
 g.save(OUT)
 
 # verify by re-reading what we wrote
 chk = GameParam(OUT, DEFS)
 assert len(chk.bnd.buf) == len(g.bnd.buf)
+assert chk["Bullet"].get(REVOLVER_ID, "atkId_Bullet") == REVOLVER_ID and chk["Bullet"].get(PIERCER_ID, "isPenetrate") == 1
+assert chk["BehaviorParam_PC"].get(PIERCER_ID, "refId") == PIERCER_ID and chk["AtkParam_Pc"].get(REVOLVER_ID, "atkPhys") == REVOLVER_DAMAGE
 assert all(chk["BehaviorParam_PC"].get(r, "stamina") == 0 for r in chk["BehaviorParam_PC"].order)
 assert chk["SpEffectParam"].get(HEAL_SPEFFECT, "changeHpPoint") == -HEAL_PER_HIT
 assert chk["Bullet"].get(600, "initVellocity") == SHOT_SPEED

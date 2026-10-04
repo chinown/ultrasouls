@@ -12,6 +12,13 @@ struct HudState {
     double last_shot = -100.0;     // time of the last normal shot
     double last_pierce = -100.0;   // time of the last charged shot
     bool show_viewmodel = true;
+    int variation = 0;             // revolver variation: 0 Piercer, 1 Marksman
+    float coin_charge = 400.0f;    // 0..400, four coins of 100
+    // coins in flight, already projected: x, y in -1..1 from the screen centre (y up), size as a fraction
+    // of the screen height, phase of the spin in radians
+    enum { MAX_COINS = 8 };
+    int coin_count = 0;
+    struct CoinDot { float x, y, size, phase; bool flash; } coins[MAX_COINS];
 };
 
 // Loads the pack and creates GPU resources. Safe to call repeatedly; returns false if it cannot draw.

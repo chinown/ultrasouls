@@ -102,6 +102,15 @@ int main(int argc, char **argv) {
     s.stamina = 250;
     s.pierce_ready = 40;
     shots.push_back({"just_fired", s, {0.55f, 0.52f, 0.47f, 1}});
+    s = HudState();
+    s.time = 40.0;
+    s.variation = 1;
+    s.coin_charge = 230;
+    s.coin_count = 3;
+    s.coins[0] = {0.0f, 0.3f, 0.08f, 0.0f, false};      // facing the camera
+    s.coins[1] = {0.35f, 0.5f, 0.04f, 1.2f, false};     // mid-spin, further away
+    s.coins[2] = {-0.3f, 0.1f, 0.06f, 0.4f, true};      // in its flash
+    shots.push_back({"marksman_coins", s, {0.20f, 0.22f, 0.25f, 1}});
 
     for (Shot &shot : shots) {
         ctx->ClearRenderTargetView(rtv, shot.bg);

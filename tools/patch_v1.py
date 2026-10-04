@@ -32,6 +32,12 @@ REVOLVER_ID = 9000100       # the DLL fires behaviour 9000100 (primary) and 9000
 PIERCER_ID = 9000110
 REVOLVER_DAMAGE = 150       # flat attack value per shot (a throwing knife is 100); a tuning choice, not from ULTRAKILL
 PIERCER_DAMAGE = 450        # charged shot: 3x, and it passes through enemies
+COIN_ID = 9000120           # a shot ricocheted off a coin: 9000120 is power 2 (one coin), up to 9000123 for power 5
+COIN_POWERS = (2, 3, 4, 5)  # Coin.power starts at 2 and gains 1 per extra coin in the chain; a plain shot is 1
+COIN_ID = 9000120           # a shot ricocheted off a coin: 9000120 is power 2 (one coin), up to 9000123 for power 5
+COIN_POWERS = (2, 3, 4, 5)  # Coin.power starts at 2 and gains 1 per extra coin in the chain; a plain shot is 1
+COIN_ID = 9000120           # a shot ricocheted off a coin: 9000120 is power 2 (one coin), up to 9000123 for power 5
+COIN_POWERS = (2, 3, 4, 5)  # Coin.power starts at 2 and gains 1 per extra coin in the chain; a plain shot is 1
 BEAM_SPEED = 300.0          # m/s, as close to hitscan as a projectile gets
 BEAM_RANGE = 150.0
 
@@ -88,12 +94,15 @@ for r in shop.order:
 # 5. V1's Piercer revolver, as new rows the DLL fires through the game's own shoot call.
 #    BehaviorParam_PC row -> Bullet row -> AtkParam_Pc row, all sharing one id per shot type.
 #    Damage is flat, from a copy of the throwing knife's attack row.
-g.add_rows("AtkParam_Pc", [(REVOLVER_ID, 1050, "revolver"), (PIERCER_ID, 1050, "piercer")])
-g.add_rows("Bullet", [(REVOLVER_ID, 603, "revolver"), (PIERCER_ID, 603, "piercer")])
-g.add_rows("BehaviorParam_PC", [(REVOLVER_ID, 101103300, "revolver"), (PIERCER_ID, 101103300, "piercer")])
+coin_rows = [(COIN_ID + i, power) for i, power in enumerate(COIN_POWERS)]
+g.add_rows("AtkParam_Pc", [(REVOLVER_ID, 1050, "revolver"), (PIERCER_ID, 1050, "piercer")] + [(rid, 1050, "coin") for rid, _ in coin_rows])
+g.add_rows("Bullet", [(REVOLVER_ID, 603, "revolver"), (PIERCER_ID, 603, "piercer")] + [(rid, 603, "coin") for rid, _ in coin_rows])
+g.add_rows("BehaviorParam_PC", [(REVOLVER_ID, 101103300, "revolver"), (PIERCER_ID, 101103300, "piercer")]
+           + [(rid, 101103300, "coin") for rid, _ in coin_rows])
 atk, bul, beh = g["AtkParam_Pc"], g["Bullet"], g["BehaviorParam_PC"]
-for rid, damage, sfx, sfx_hit, pierce, radius in ((REVOLVER_ID, REVOLVER_DAMAGE, 20131, 20230, 0, 0.15),
-                                                  (PIERCER_ID, PIERCER_DAMAGE, 20133, 20236, 1, 0.3)):
+shots = [(REVOLVER_ID, REVOLVER_DAMAGE, 20131, 20230, 0, 0.15), (PIERCER_ID, PIERCER_DAMAGE, 20133, 20236, 1, 0.3)]
+shots += [(rid, REVOLVER_DAMAGE * power, 20133, 20236, 0, 0.3) for rid, power in coin_rows]
+for rid, damage, sfx, sfx_hit, pierce, radius in shots:
     # The attack row stays exactly as the throwing knife's apart from the damage: the game's own
     # flat-damage rows all keep their "Correction" at 100, and zeroing it made the shots do nothing.
     atk.set(rid, "atkPhys", damage)
@@ -114,6 +123,9 @@ chk = GameParam(OUT, DEFS)
 assert len(chk.bnd.buf) == len(g.bnd.buf)
 assert chk["Bullet"].get(REVOLVER_ID, "atkId_Bullet") == REVOLVER_ID and chk["Bullet"].get(PIERCER_ID, "isPenetrate") == 1
 assert chk["BehaviorParam_PC"].get(PIERCER_ID, "refId") == PIERCER_ID and chk["AtkParam_Pc"].get(REVOLVER_ID, "atkPhys") == REVOLVER_DAMAGE
+assert chk["AtkParam_Pc"].get(COIN_ID + 1, "atkPhys") == REVOLVER_DAMAGE * 3 and chk["Bullet"].get(COIN_ID + 3, "atkId_Bullet") == COIN_ID + 3
+assert chk["AtkParam_Pc"].get(COIN_ID + 1, "atkPhys") == REVOLVER_DAMAGE * 3 and chk["Bullet"].get(COIN_ID + 3, "atkId_Bullet") == COIN_ID + 3
+assert chk["AtkParam_Pc"].get(COIN_ID + 1, "atkPhys") == REVOLVER_DAMAGE * 3 and chk["Bullet"].get(COIN_ID + 3, "atkId_Bullet") == COIN_ID + 3
 assert all(chk["BehaviorParam_PC"].get(r, "stamina") == 0 for r in chk["BehaviorParam_PC"].order)
 assert chk["SpEffectParam"].get(HEAL_SPEFFECT, "changeHpPoint") == -HEAL_PER_HIT
 assert chk["Bullet"].get(600, "initVellocity") == SHOT_SPEED

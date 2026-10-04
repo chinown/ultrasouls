@@ -258,6 +258,7 @@ static double now_s() {
 typedef void (*StepFn)(void *self, void *step_info, void *gravity);
 static StepFn g_orig_step = nullptr;
 static volatile uintptr_t g_player_pos = 0;
+static volatile uintptr_t g_player_chr = 0;        // the player character object (WorldChr + 0x68)
 static volatile bool g_vjump = false;       // velocity jump in progress
 static volatile bool g_vel_ok = true;       // the velocity field was confirmed against measured speed in v0.6
 static volatile bool g_ctrl = false;        // first-person movement controller active (set by the camera hook)
@@ -304,6 +305,75 @@ static float g_boost = 300.0f, g_dash_left = 0, g_dash_x = 0, g_dash_z = 0, g_sl
 static bool g_sliding = false, g_slamming = false, g_prev_shift = false, g_prev_ctrl = false;
 static volatile LONG g_dashes = 0, g_slides = 0, g_slams = 0;
 
+// NewMovement.WallJump / Cling / FixedUpdate / TryStartSlam and GroundCheck (decompiled C#):
+static const float V1_WALL_JUMP_SPEED = 2000.0f * 150.0f * V1_STEP / 100.0f * UK_UNIT;   // 24 u/s -> 12 m/s, both up and away from the wall
+static const float V1_WALL_JUMP_COOLDOWN = 0.1f;
+static const int V1_WALL_JUMPS = 3;                                                     // until the next landing
+static const float V1_SLAM_JUMP_WINDOW = 0.1f + 0.306f;                                 // superJumpChance, then extraJumpChance
+static const float V1_SLAM_MIN_AIR = 0.1f;                                              // fallTime > 0.5, which grows by 5 per second
+static const float V1_FALL_SPEED_MAX = 100.0f * UK_UNIT;                                // 50 m/s
+static const float V1_PRESLIDE_UNIT = 24.0f * UK_UNIT;                                  // speed / 24 u/s is the slide's multiplier
+static const float V1_PRESLIDE_DELAY = 0.2f;
+static const float WALL_GRACE = 0.1f;        // ours: how long a wall contact stays usable (V1's wall check is a wider trigger volume)
+
+static float g_slam_force = 0, g_slam_window = 0, g_slam_time = 0, g_air_time = 0;
+static float g_wall_nx = 0, g_wall_nz = 0, g_wall_dist = 0, g_wall_age = 1e9f, g_wall_cd = 0, g_cling_fade = 0;
+static float g_preslide = 0, g_preslide_delay = 0;
+static int g_wall_jumps = 0;
+static volatile LONG g_wall_jump_count = 0, g_slam_jump_count = 0, g_clings = 0;
+static volatile int g_seen_manifold = 0;
+static volatile float g_slide_mult0 = 1.0f;     // the multiplier the current slide started with (for the log)
+
+// hkpCharacterProxy keeps the contact points its last integrate found in m_manifold, an hkArray at +0x20.
+// Each hkpRootCdPoint is 0x40 bytes: the contact position, then the surface normal with the distance in w.
+// A wall is a contact whose normal is close to horizontal. Returns the nearest one.
+static const uintptr_t OFF_PROXY_MANIFOLD = 0x20;
+static volatile float g_dbg_integrated = 0;     // how far the last integrate moved the player vertically
+static volatile bool g_integrated_seen = false;   // set by the re-check hook during the current Step
+static volatile LONG g_pull_fixes = 0;
+// Position of the Havok character itself, via the phantom's transform.
+static bool proxy_pos(uintptr_t proxy, float *out) {
+    uintptr_t phantom = *(uintptr_t *)(proxy + 0x80);
+    uintptr_t body = phantom ? *(uintptr_t *)(phantom + 0x30) : 0;
+    if (!body) return false;
+    memcpy(out, (const void *)(body + 0x30), 12);
+    return true;
+}
+static const float RESCUE_DROP = 30.0f;          // metres below the last place stood on
+static float g_safe_pos[3], g_ground_time = 0;
+static bool g_have_safe = false;
+static volatile LONG g_rescues = 0;
+enum { MAX_WALLS = 6 };
+static float g_walls[MAX_WALLS][2];          // horizontal normals of every wall touched in the last step
+static int g_wall_count = 0;
+static bool wall_contact(uintptr_t proxy, float &nx, float &nz, float &dist) {
+    const float *pts = *(const float **)(proxy + OFF_PROXY_MANIFOLD);
+    int n = *(const int *)(proxy + OFF_PROXY_MANIFOLD + 8);
+    g_seen_manifold = n;
+    g_wall_count = 0;
+    if (!pts || n <= 0 || n > 64) return false;
+    bool found = false;
+    float best = 1e9f;
+    for (int i = 0; i < n; i++) {
+        const float *nrm = pts + i * 16 + 4;
+        if (fabsf(nrm[1]) > 0.35f) continue;             // floors, ceilings and slopes one can stand on
+        float h = sqrtf(nrm[0] * nrm[0] + nrm[2] * nrm[2]);
+        if (h < 0.5f || h > 1.5f) continue;
+        if (g_wall_count < MAX_WALLS) {
+            g_walls[g_wall_count][0] = nrm[0] / h;
+            g_walls[g_wall_count][1] = nrm[2] / h;
+            g_wall_count++;
+        }
+        if (nrm[3] > best) continue;
+        best = nrm[3];
+        nx = nrm[0] / h;
+        nz = nrm[2] / h;
+        dist = nrm[3];
+        found = true;
+    }
+    return found;
+}
+
 static int key_down(int vk) {
     DWORD pid = 0;
     GetWindowThreadProcessId(GetForegroundWindow(), &pid);
@@ -332,7 +402,56 @@ static void try_instant_fire();
 // The game steps a character through one of two functions with the same arguments, chosen by a flag
 // on the character (ChrPosData+0x6D). Hooking only the first meant the controller did not run on
 // frames that used the second, which showed up as input lag (a jump waited for the next 'full' step).
+// ---- other characters. Step runs for every active character, so the Havok character objects seen here
+// are the list of who is around. [HavokChara+0x250] points 0x4F8 into the owning ChrIns (measured on the
+// player's own objects). ChrIns+0xD8 is the team: 4 on the hollow player; Dark Souls' own values are
+// 6 enemy, 7 boss, 8 friendly NPC, 9 NPC turned hostile.
+struct Tracked { uintptr_t havok; double seen; };
+enum { MAX_TRACKED = 96 };
+static Tracked g_tracked[MAX_TRACKED];
+static const uintptr_t OFF_HAVOK_OWNER = 0x250, OWNER_DELTA = 0x4F8, OFF_CHR_TEAM = 0xD8, OFF_CHR_HP = 0x3E8;
+static const uintptr_t RVA_VT_ENEMY = 0x1322E68;
+static const float TARGET_HEIGHT = 1.2f;         // ours: aim point above an enemy's feet (V1 aims at the weak point)
+static void track_character(uintptr_t havok) {
+    double t = now_s();
+    int spare = -1;
+    for (int i = 0; i < MAX_TRACKED; i++) {
+        if (g_tracked[i].havok == havok) { g_tracked[i].seen = t; return; }
+        if (spare < 0 && (!g_tracked[i].havok || t - g_tracked[i].seen > 1.0)) spare = i;
+    }
+    if (spare >= 0) g_tracked[spare] = {havok, t};
+}
+struct Target { float p[3], dist; uintptr_t chr; int team, hp; };
+// Living hostile characters within `max_dist` of `from`, nearest first. `all` lists every character instead.
+static int find_targets(const float *from, Target *out, int max_n, float max_dist, bool all = false) {
+    uintptr_t exe = (uintptr_t)GetModuleHandleA(nullptr);
+    double t = now_s();
+    int n = 0;
+    for (int i = 0; i < MAX_TRACKED; i++) {
+        uintptr_t havok = g_tracked[i].havok, owner = 0, vt = 0;
+        if (!havok || t - g_tracked[i].seen > 0.25 || havok == g_player_pos) continue;
+        Target c{};
+        if (!safe_read(havok + OFF_HAVOK_OWNER, &owner, 8) || owner < 0x10000) continue;
+        c.chr = owner - OWNER_DELTA;
+        if (!safe_read(c.chr, &vt, 8) || !safe_read(c.chr + OFF_CHR_TEAM, &c.team, 4) || !safe_read(c.chr + OFF_CHR_HP, &c.hp, 4)) continue;
+        if (!safe_read(havok + 0x10, c.p, 12)) continue;
+        if (!all && (vt != exe + RVA_VT_ENEMY || !(c.team == 6 || c.team == 7 || c.team == 9) || c.hp <= 0)) continue;
+        c.p[1] += TARGET_HEIGHT;
+        float dx = c.p[0] - from[0], dy = c.p[1] - from[1], dz = c.p[2] - from[2];
+        c.dist = sqrtf(dx * dx + dy * dy + dz * dz);
+        if (c.dist > max_dist) continue;
+        int k;                                   // keep the nearest max_n, sorted
+        if (n < max_n) k = n++;
+        else if (c.dist < out[max_n - 1].dist) k = max_n - 1;
+        else continue;
+        out[k] = c;
+        for (; k > 0 && out[k].dist < out[k - 1].dist; k--) { Target tmp = out[k]; out[k] = out[k - 1]; out[k - 1] = tmp; }
+    }
+    return n;
+}
+
 static void step_common(void *self, void *step_info, void *gravity, StepFn orig) {
+    track_character((uintptr_t)self);
     uintptr_t proxy = 0;
     bool rising = false, ctrl_air = false, have_y0 = false;
     float ctrl_dt = 0, ctrl_vy = 0, y0 = 0;
@@ -353,9 +472,14 @@ static void step_common(void *self, void *step_info, void *gravity, StepFn orig)
                 // character sliding on after the keys were released. The game's own air timer smooths that.
                 bool flag = *(uint8_t *)((uintptr_t)self + OFF_POS_GROUNDED) != 0;
                 float air_time = *(float *)((uintptr_t)self + OFF_POS_AIR_TIME);
+                if (g_wall_cd > 0) g_wall_cd -= dt;
+                g_wall_age += dt;
+                if (g_slam_window > 0 && (g_slam_window -= dt) <= 0) g_slam_force = 0;
+                float speed_before = sqrtf(g_vx * g_vx + g_vy * g_vy + g_vz * g_vz);
                 if (g_jump_req && !g_air) {
                     // NewMovement.Jump: a slide-jump is lower and keeps the slide speed; a dash-jump is lower
                     // still and keeps the dash speed only if a stamina bar can be paid, else drops to run speed.
+                    // Just after a slam lands, the jump is 3x plus what the slam built up, instead of 2.6x.
                     if (g_sliding) {
                         g_vy = V1_SLIDE_JUMP_SPEED;
                     } else if (g_dash_left > 0) {
@@ -366,19 +490,38 @@ static void step_common(void *self, void *step_info, void *gravity, StepFn orig)
                             g_vx = g_dash_x * V1_RUN_SPEED;
                             g_vz = g_dash_z * V1_RUN_SPEED;
                         }
+                    } else if (g_slam_window > 0) {
+                        g_vy = V1_JUMP_SPEED / 2.6f * (g_slam_force < 5.5f ? 3.0f + (g_slam_force - 1.0f) : 12.5f);
+                        InterlockedIncrement(&g_slam_jump_count);
                     } else {
                         g_vy = V1_JUMP_SPEED;
                     }
+                    g_slam_window = 0;
+                    g_wall_cd = 0.2f;                   // jumpCooldown after a ground jump
                     g_dash_left = 0;
                     g_sliding = false;
                     g_air = true;
                     g_air_steps = 0;
+                    g_air_time = 0;
+                } else if (g_jump_req && g_air && g_wall_age < WALL_GRACE && g_wall_jumps < V1_WALL_JUMPS && g_wall_cd <= 0) {
+                    // NewMovement.WallJump: all speed is dropped, then the same push up and away from the wall.
+                    // It also ends a dash, and (unlike V1's 'slam storage') a slam.
+                    g_wall_jumps++;
+                    g_wall_cd = V1_WALL_JUMP_COOLDOWN;
+                    g_vx = g_wall_nx * V1_WALL_JUMP_SPEED;
+                    g_vz = g_wall_nz * V1_WALL_JUMP_SPEED;
+                    g_vy = V1_WALL_JUMP_SPEED;
+                    g_dash_left = 0;
+                    g_slamming = false;
+                    InterlockedIncrement(&g_wall_jump_count);
                 } else if (!g_air && !flag && air_time >= 0.15f) {
                     g_air = true;                       // walked off a ledge
                     g_air_steps = 0;
+                    g_air_time = 0;
                     g_vy = vel[1] < 0 ? vel[1] : 0;
                 }
                 g_jump_req = false;
+                g_air_time = g_air ? g_air_time + dt : 0;
 
                 float f = (float)(key_down('W') - key_down('S')), s = (float)(key_down('D') - key_down('A'));
                 float wx = g_view_fwd[0] * f + g_view_right[0] * s, wz = g_view_fwd[1] * f + g_view_right[1] * s;
@@ -394,21 +537,29 @@ static void step_common(void *self, void *step_info, void *gravity, StepFn orig)
 
                 // stamina: 3 bars of 100, refilling at 70/s except while sliding
 
-                if (shift_edge && g_boost >= 100.0f && !g_slamming) {
+                if (shift_edge && g_boost >= 100.0f) {
+                    // TryDash: also ends a slide or a slam
                     g_boost -= 100.0f;
                     g_dash_left = V1_DASH_TIME;
                     g_dash_x = dir_x;
                     g_dash_z = dir_z;
                     g_sliding = false;
+                    g_slamming = false;
                     InterlockedIncrement(&g_dashes);
                 }
-                if (ctrl_edge && g_air && !g_slamming) {
+                if (ctrl_edge && g_air && !g_slamming && g_air_time >= V1_SLAM_MIN_AIR) {
                     g_slamming = true;          // ground slam: straight down, no horizontal speed
+                    g_slam_force = 1.0f;        // slamForce: 1, +5 per second of falling
+                    g_slam_time = 0;
                     g_dash_left = 0;
                     InterlockedIncrement(&g_slams);
                 }
-                if (ctrl && !g_air && !g_sliding && g_dash_left <= 0) {
+                // A slide starts on the key press (holding the key through a landing does not start one)
+                // and may start during a dash, which it replaces.
+                if (ctrl_edge && !g_air && !g_sliding) {
                     g_sliding = true;
+                    g_slide_mult0 = g_preslide > 3.0f ? 3.0f : g_preslide > 1.0f ? g_preslide : 1.0f;
+                    g_dash_left = 0;
                     g_slide_x = dir_x;
                     g_slide_z = dir_z;
                     InterlockedIncrement(&g_slides);
@@ -416,10 +567,41 @@ static void step_common(void *self, void *step_info, void *gravity, StepFn orig)
                 if (g_sliding && (!ctrl || g_air)) g_sliding = false;
                 if (!g_air) g_slamming = false;
 
+                // FixedUpdate: the multiplier a slide would start with. A slam hands over its force; a fast
+                // fall its speed; otherwise the current speed is sampled every 0.2 s (so a slide pressed
+                // during or right after a dash is faster).
+                if (!g_sliding) {
+                    if (g_slamming) {
+                        g_preslide_delay = V1_PRESLIDE_DELAY;
+                        g_preslide = g_slam_force;
+                    } else if (g_dash_left <= 0 && g_air && g_air_time >= 0.2f && speed_before / V1_PRESLIDE_UNIT > g_preslide) {
+                        g_preslide = speed_before / V1_PRESLIDE_UNIT;
+                        g_preslide_delay = V1_PRESLIDE_DELAY;
+                    } else if ((g_preslide_delay -= dt) <= 0) {
+                        g_preslide_delay = V1_PRESLIDE_DELAY;
+                        g_preslide = speed_before / V1_PRESLIDE_UNIT;
+                    }
+                }
+
+                bool on_wall = g_air && g_wall_age < 0.05f;
                 if (g_slamming) {
                     g_vx = g_vz = 0;
                     g_vy = -V1_SLAM_SPEED;
                     vel[1] = g_vy;
+                    g_slam_force += 5.0f * dt;
+                    g_slam_time += dt;
+                } else if (g_sliding) {
+                    // V1 slide: fixed direction at slide speed, A/D nudge it sideways. The multiplier it
+                    // started with (up to 3) wears off on the ground.
+                    float mult = 1.0f;
+                    if (g_preslide > 1.0f) {
+                        if (g_preslide > 3.0f) g_preslide = 3.0f;
+                        mult = g_preslide;
+                        g_preslide -= dt * g_preslide;
+                        g_preslide_delay = 0;
+                    }
+                    g_vx = g_slide_x * V1_SLIDE_SPEED * mult + g_view_right[0] * s * V1_SLIDE_STEER;
+                    g_vz = g_slide_z * V1_SLIDE_SPEED * mult + g_view_right[1] * s * V1_SLIDE_STEER;
                 } else if (g_dash_left > 0) {
                     // V1 dash: 3x run speed for 0.2 s, flat (gravity off). Afterwards on the ground it drops
                     // back to run speed; in the air the momentum is kept.
@@ -434,15 +616,19 @@ static void step_common(void *self, void *step_info, void *gravity, StepFn orig)
                         g_vy = 0;
                         vel[1] = 0;
                     }
-                } else if (g_sliding) {
-                    // V1 slide: fixed direction at slide speed, A/D nudge it sideways
-                    g_vx = g_slide_x * V1_SLIDE_SPEED + g_view_right[0] * s * V1_SLIDE_STEER;
-                    g_vz = g_slide_z * V1_SLIDE_SPEED + g_view_right[1] * s * V1_SLIDE_STEER;
                 } else if (!g_air) {
                     // V1 on the ground: velocity = Lerp(velocity, input * 16.5, 0.25) every 8 ms physics step
                     float k = 1.0f - powf(0.75f, dt / V1_STEP);
                     g_vx += (wx * V1_RUN_SPEED - g_vx) * k;
                     g_vz += (wz * V1_RUN_SPEED - g_vz) * k;
+                } else if (on_wall && g_vy < -1.0f * UK_UNIT && wl > 0.01f && -(wx * g_wall_nx + wz * g_wall_nz) > 0.5f * wl) {
+                    // Cling: falling against a wall with the keys held towards it. The fall becomes a slow
+                    // slide down that speeds up over time (2 u/s per point of clingFade, which grows by 4 per second).
+                    g_vx = g_vz = 0;
+                    g_vy = -2.0f * g_cling_fade * UK_UNIT;
+                    g_cling_fade = g_cling_fade + 4.0f * dt > 50.0f ? 50.0f : g_cling_fade + 4.0f * dt;
+                    vel[1] = g_vy;
+                    InterlockedIncrement(&g_clings);
                 } else {
                     // V1 in the air: each view axis accelerates only until its speed reaches run speed;
                     // momentum above that, and momentum with no key held, is left alone.
@@ -455,8 +641,22 @@ static void step_common(void *self, void *step_info, void *gravity, StepFn orig)
                         g_vx += dx * add;
                         g_vz += dz * add;
                     }
-                    g_vy -= V1_GRAVITY * dt;
+                    // falling beside a wall is 40% slower to speed up
+                    g_vy -= V1_GRAVITY * dt * (on_wall && g_vy < 0 ? 0.6f : 1.0f);
+                    if (g_vy < -V1_FALL_SPEED_MAX) g_vy = -V1_FALL_SPEED_MAX;
                     vel[1] = g_vy;
+                }
+                // Speed into a wall is dropped, as a rigid body's would be. Left in, the character was
+                // pressed into walls that lean or have ledges, which then blocked a jump as a ceiling would
+                // (v0.35 test: jumping while walking into Firelink's ruin walls went nowhere).
+                if (g_wall_age < 0.05f) {
+                    for (int i = 0; i < g_wall_count; i++) {
+                        float d = g_vx * g_walls[i][0] + g_vz * g_walls[i][1];
+                        if (d < 0) {
+                            g_vx -= d * g_walls[i][0];
+                            g_vz -= d * g_walls[i][1];
+                        }
+                    }
                 }
                 vel[0] = g_vx;
                 vel[2] = g_vz;
@@ -487,8 +687,64 @@ static void step_common(void *self, void *step_info, void *gravity, StepFn orig)
             }
         }
     }
+    g_integrated_seen = false;
     orig(self, step_info, gravity);
     if (!proxy) return;
+    // Moves the Havok character the way Step does (lock, set position, unlock).
+    auto set_proxy_pos = [&](const float *xyz) {
+        uintptr_t exe = (uintptr_t)GetModuleHandleA(nullptr);
+        uintptr_t phys = *(uintptr_t *)(exe + RVA_PHYS_WORLD);
+        void *lock = phys ? *(void **)(phys + 0x28) : nullptr;
+        uintptr_t phantom = *(uintptr_t *)(proxy + 0x80);
+        uintptr_t body = phantom ? *(uintptr_t *)(phantom + 0x30) : 0;
+        if (!lock || !body) return;
+        const float *p = (const float *)(body + 0x30);
+        alignas(16) float v[4] = {xyz[0], xyz[1], xyz[2], p[3]};
+        ((void (*)(void *))(exe + RVA_PHYS_LOCK))(lock);
+        ((void (*)(uintptr_t, float *))(exe + RVA_PROXY_SET_POS))(proxy, v);
+        ((void (*)(void *))(exe + RVA_PHYS_UNLOCK))(lock);
+    };
+    auto set_proxy_y = [&](float y) {
+        float p[3];
+        if (!proxy_pos(proxy, p)) return;
+        p[1] = y;
+        set_proxy_pos(p);
+    };
+    // V1's jumps reach places the map was never built for: over Firelink's ruin wall there is no floor at
+    // all. Where the map has a kill plane below, the fall still kills (tested: the rescue came too late
+    // there); where it has none the fall would never end, so the player is put back where they last
+    // stood once they are far below it. Falls onto real ground do no damage (tested up to 11.6 m).
+    if (g_ctrl) {
+        float p[3];
+        if (proxy_pos(proxy, p)) {
+            float dt = *(float *)((uintptr_t)step_info + 8);
+            g_ground_time = g_air ? 0 : g_ground_time + dt;
+            if (g_ground_time > 0.5f) {
+                memcpy(g_safe_pos, p, sizeof(g_safe_pos));
+                g_have_safe = true;
+            } else if (g_air && g_have_safe && p[1] < g_safe_pos[1] - RESCUE_DROP) {
+                set_proxy_pos(g_safe_pos);
+                g_vx = g_vy = g_vz = 0;
+                g_air = false;
+                g_slamming = false;
+                g_slam_force = 0;
+                g_dash_left = 0;
+                g_ground_time = 0;
+                InterlockedIncrement(&g_rescues);
+                return;
+            }
+        }
+    } else {
+        g_have_safe = false;
+    }
+    float snap = *(float *)((uintptr_t)self + OFF_POS_SNAP_A) + *(float *)((uintptr_t)self + OFF_POS_SNAP_B);
+    g_seen_snap = snap;
+    g_seen_grounded = *(uint8_t *)((uintptr_t)self + OFF_POS_GROUNDED);
+    // After integrating, the game moves the character vertically by the two snap offsets to keep it
+    // glued to the ground. On takeoff, put that back so the character leaves the ground.
+    // v0.7 showed this offset is applied every frame, airborne or not, so undoing it every frame added
+    // 0.31 m per frame. One lift is enough: it breaks ground contact, then the velocity does the rest.
+    bool takeoff = rising && snap < 0 && g_seen_grounded && !*(uint8_t *)((uintptr_t)self + OFF_POS_NO_ADJUST);
     // v0.14 waited for the game's grounded flag to land, and it never came back while we drove the
     // fall: the character stayed 'airborne' for 20 s, sliding. Instead, compare how far the physics
     // actually moved us with how far we asked. Blocked going down = landed; going up = ceiling.
@@ -499,34 +755,75 @@ static void step_common(void *self, void *step_info, void *gravity, StepFn orig)
         if (ctrl_vy < -0.5f && got > want * 0.3f) {
             g_air = false;
             g_vy = 0;
+            g_wall_jumps = 0;
+            g_cling_fade = 0;
+            if (g_slamming) {
+                // GroundCheck: a slam's landing opens the window for the higher jump. A slam that lands
+                // on its first step was pressed right above the ground, where V1 starts a slide instead.
+                if (g_slam_time <= ctrl_dt * 1.5f && key_down(VK_CONTROL)) {
+                    g_sliding = true;
+                    g_slide_x = g_view_fwd[0];
+                    g_slide_z = g_view_fwd[1];
+                    g_preslide = 0;
+                    g_slide_mult0 = 1.0f;
+                    g_slam_force = 0;
+                    InterlockedIncrement(&g_slides);
+                } else {
+                    g_slam_window = V1_SLAM_JUMP_WINDOW;
+                }
+                g_slamming = false;
+            }
             InterlockedIncrement(&g_landings);
-        } else if (ctrl_vy > 0.5f && g_air_steps > 3 && got < want * 0.3f) {
-            g_vy = 0;
+        } else if (ctrl_vy > 0.5f && g_air_steps > 3 && (g_integrated_seen ? g_dbg_integrated : got) < want * 0.3f) {
+            g_vy = 0;                           // a ceiling: integrate itself could not rise
             InterlockedIncrement(&g_bonks);
+        }
+        // In some places the game's ground check then pulls the character down by more than its usual
+        // offset (v0.35 test, at the foot of Firelink's ruin wall: integrate rose 0.22 m a step, the
+        // character ended 0.09 m lower, and a jump went nowhere). In the air only integrate's own
+        // movement counts, so a character left lower than that is put back.
+        if (g_air && !takeoff && g_integrated_seen && y1 < y0 + g_dbg_integrated - 0.005f) {
+            set_proxy_y(y0 + g_dbg_integrated);
+            InterlockedIncrement(&g_pull_fixes);
         }
     }
     if (g_air && g_air_steps > 2000) g_air = false;   // safety net: never stay airborne for ever
-    // After integrating, the game moves the character vertically by these two offsets to keep it
-    // glued to the ground. On takeoff, put that back so the character leaves the ground.
-    float snap = *(float *)((uintptr_t)self + OFF_POS_SNAP_A) + *(float *)((uintptr_t)self + OFF_POS_SNAP_B);
-    g_seen_snap = snap;
-    g_seen_grounded = *(uint8_t *)((uintptr_t)self + OFF_POS_GROUNDED);
-    // v0.7 showed this offset is applied every frame, airborne or not, so undoing it every frame added
-    // 0.31 m per frame. One lift is enough: it breaks ground contact, then the velocity does the rest.
-    if (rising && snap < 0 && g_seen_grounded && !*(uint8_t *)((uintptr_t)self + OFF_POS_NO_ADJUST)) {
-        uintptr_t exe = (uintptr_t)GetModuleHandleA(nullptr);
-        uintptr_t phys = *(uintptr_t *)(exe + RVA_PHYS_WORLD);
-        void *lock = phys ? *(void **)(phys + 0x28) : nullptr;
-        uintptr_t phantom = *(uintptr_t *)(proxy + 0x80);
-        uintptr_t body = phantom ? *(uintptr_t *)(phantom + 0x30) : 0;
-        if (lock && body) {
-            const float *p = (const float *)(body + 0x30);
-            alignas(16) float v[4] = {p[0], p[1] - snap, p[2], p[3]};
-            ((void (*)(void *))(exe + RVA_PHYS_LOCK))(lock);
-            ((void (*)(uintptr_t, float *))(exe + RVA_PROXY_SET_POS))(proxy, v);
-            ((void (*)(void *))(exe + RVA_PHYS_UNLOCK))(lock);
+    if (g_ctrl) {
+        float nx, nz, dist;
+        if (wall_contact(proxy, nx, nz, dist)) {
+            g_wall_nx = nx;
+            g_wall_nz = nz;
+            g_wall_dist = dist;
+            g_wall_age = 0;
         }
     }
+    if (takeoff) {
+        uintptr_t phantom = *(uintptr_t *)(proxy + 0x80);
+        uintptr_t body = phantom ? *(uintptr_t *)(phantom + 0x30) : 0;
+        if (body) set_proxy_y(*(const float *)(body + 0x34) - snap);
+    }
+}
+
+// After integrating, Step re-checks the move (exe+2BC870): it sweeps a shape from the old position to the
+// new one and, if the sweep reports a hit, cuts the move back to the hit (a guard against passing through
+// thin walls). The hook only observes: 'to - from' is exactly how far integrate moved the character,
+// which nothing else in Step exposes. (v0.35 briefly skipped the re-check in the air; that was not what
+// blocked jumps beside walls, and without it nothing stops a fast character tunnelling.)
+typedef void *(*SweepFn)(void *self, float *out, float *from, float *to);
+static SweepFn g_orig_sweep = nullptr;
+static const uintptr_t RVA_STEP_SWEEP = 0x2BC870;
+static const uint8_t SWEEP_PROLOGUE[8] = {0x4C, 0x8B, 0xDC, 0x49, 0x89, 0x5B, 0x18, 0x57};
+static volatile LONG g_sweep_cuts = 0;
+static void *hook_sweep(void *self, float *out, float *from, float *to) {
+    bool player = (uintptr_t)self == g_player_pos;
+    float to_y = to[1];
+    if (player) {
+        g_dbg_integrated = to[1] - from[1];
+        g_integrated_seen = true;
+    }
+    void *r = g_orig_sweep(self, out, from, to);
+    if (player && g_ctrl && g_air && fabsf(out[1] - to_y) > 0.001f) InterlockedIncrement(&g_sweep_cuts);
+    return r;
 }
 
 static void hook_step(void *self, void *step_info, void *gravity) { step_common(self, step_info, gravity, g_orig_step); }
@@ -546,6 +843,7 @@ static const float EYE_FORWARD = 0.2f;   // keeps the view out of the character'
 static volatile float g_cam_seen[16];    // the game's own matrix, before we move it
 static volatile float g_lens_seen[4];
 static volatile float g_fov_scale = 1.6f;
+static const float BASE_FOV = 0.7505f;           // the follow camera's vertical field of view, radians (read from the log)
 static volatile LONG g_cam_calls = 0;
 static float g_yaw = 0, g_pitch = 0;            // our view direction, radians; yaw 0 looks along +Z
 static bool g_cursor_centred = false;
@@ -553,7 +851,29 @@ static float g_eye_drop = 0;                    // how far the view is currently
 static const float SLIDE_EYE_DROP = 0.6f;       // V1's view drops while sliding; 0.6 m is a guess, not from its code
 static volatile float g_sens = 0.0008f;          // radians per mouse count
 
+// Hiding the player's own body in first person. The game already has a way to make a character
+// invisible: "camouflage", which the Hidden Body spell uses. Each frame its special-effect code calls
+// exe+80C400 on the character's modifier list (chr + 0x388) with a distance range and two opacities
+// (the spell passes 1.0 near, 0.0 far). Calling the same function with both opacities 0 hides the body
+// at any distance. It has to be called every frame; a frame without the call lets the body return.
+// (v0.33 tried the character's "first-person view" flag instead: that only brought up the game's own
+// aiming reticle and left the body drawn.)
+static const uintptr_t RVA_SET_CAMOUFLAGE = 0x80C400;
+static const uint8_t SET_CAMOUFLAGE_BYTES[8] = {0x48, 0x8B, 0xC4, 0x57, 0x48, 0x83, 0xEC, 0x70};
+static const uintptr_t OFF_CHR_MODIFIERS = 0x388;
+typedef void (*CamouflageFn)(void *modifiers, uint32_t priority, float end_dist, float begin_dist, float far_alpha, float near_alpha, uint8_t flag);
+static volatile bool g_hide_body = true;         // PageDown
+static volatile LONG g_body_hides = 0;
+
 static uint64_t hook_cam(void *self, float dt, void *a3, void *a4, uint64_t a5, uint64_t a6) {
+    if (a3 && (uintptr_t)a3 == g_player_chr && g_ctrl && g_hide_body) {
+        uint8_t *fn = (uint8_t *)GetModuleHandleA(nullptr) + RVA_SET_CAMOUFLAGE;
+        if (memcmp(fn, SET_CAMOUFLAGE_BYTES, sizeof(SET_CAMOUFLAGE_BYTES)) == 0) {
+            // priority 0: a later call in the same frame only replaces these values if its number is lower
+            ((CamouflageFn)fn)((uint8_t *)a3 + OFF_CHR_MODIFIERS, 0, 0.0f, 0.0f, 0.0f, 0.0f, 0);
+            InterlockedIncrement(&g_body_hides);
+        }
+    }
     uint64_t r = g_orig_cam(self, dt, a3, a4, a5, a6);
     float *m = (float *)((uintptr_t)self + 0x10);
     for (int i = 0; i < 16; i++) g_cam_seen[i] = m[i];
@@ -637,7 +957,7 @@ static uint64_t hook_cam(void *self, float dt, void *a3, void *a4, uint64_t a5, 
     m[0] = cy;       m[1] = 0;   m[2] = -sy;
     m[4] = -sp * sy; m[5] = cp;  m[6] = -sp * cy;
     m[8] = sy * cp;  m[9] = sp;  m[10] = cy * cp;
-    if (lens[0] > 0.2f && lens[0] < 2.5f) lens[0] *= g_fov_scale;
+    lens[0] = BASE_FOV * g_fov_scale;
     const float *p = (const float *)(pos + OFF_POS_X);
     m[12] = p[0] + sy * EYE_FORWARD;
     float drop_target = g_sliding ? SLIDE_EYE_DROP : 0.0f, k = dt > 0 && dt < 0.1f ? 1.0f - expf(-dt / 0.06f) : 1.0f;
@@ -665,13 +985,23 @@ static volatile LONG g_bullets = 0, g_bullets_aimed = 0, g_player_shots = 0;
 static uint8_t g_bullet_params[BULLET_LOG][BULLET_PARAM_BYTES];
 static uint8_t g_bullet_a4[BULLET_LOG][0x40];
 static uintptr_t g_bullet_emitter[BULLET_LOG];
-static volatile uintptr_t g_player_chr = 0;
 // the object that fired the player's last shot (params live at +0x1A0 inside it), for the instant-fire test
 static volatile uintptr_t g_last_emitter = 0;
 static volatile bool g_in_instant_fire = false;
 static volatile LONG g_real_shots = 0;
 static volatile int g_ammo_id = 0;
 
+// A shot that does not leave from the eye (a coin's ricochet): where it starts and where it goes.
+// BulletMan::Shoot only queues the projectile; the game sets it up (this hook) later in the frame, so
+// v0.36 found its override already cleared and the ricochet left from the eye like a plain shot (the
+// log showed every ricochet accepted with no projectile set up during the call). Ricochets are the only
+// shots that use the coin bullet rows, so each one takes the oldest waiting override.
+struct ShotOverride { float start[3], dir[3]; };
+enum { MAX_OVERRIDES = 8 };
+static ShotOverride g_overrides[MAX_OVERRIDES];
+static int g_override_head = 0, g_override_count = 0;
+static volatile LONG g_override_inits = 0;       // ricochet projectiles set up with their own start and direction
+static const int BULLET_COIN_FIRST = 9000120, BULLET_COIN_LAST = 9000123;
 static uint64_t hook_bullet_init(void *bullet, uint8_t *params, float *aim, void *a4, uint64_t a5, uint64_t a6) {
     InterlockedIncrement(&g_bullets);
     uintptr_t pos = g_player_pos;
@@ -691,9 +1021,23 @@ static uint64_t hook_bullet_init(void *bullet, uint8_t *params, float *aim, void
     }
     if (mine && g_ctrl && pos) {
         const float *p = (const float *)(pos + OFF_POS_X);
-        float sy = sinf(g_yaw), cy = cosf(g_yaw), sp = sinf(g_pitch), cp = cosf(g_pitch);
+        float yaw = g_yaw, pitch = g_pitch;
+        int bullet_id = *(int *)(params + 0x04);
+        const ShotOverride *ov = nullptr;
+        if (bullet_id >= BULLET_COIN_FIRST && bullet_id <= BULLET_COIN_LAST && g_override_count > 0) {
+            ov = &g_overrides[g_override_head];
+            g_override_head = (g_override_head + 1) % MAX_OVERRIDES;
+            g_override_count--;
+            yaw = atan2f(ov->dir[0], ov->dir[2]);
+            pitch = asinf(ov->dir[1] > 1 ? 1 : ov->dir[1] < -1 ? -1 : ov->dir[1]);
+        }
+        float sy = sinf(yaw), cy = cosf(yaw), sp = sinf(pitch), cp = cosf(pitch);
         float right[3] = {cy, 0, -sy}, up[3] = {-sp * sy, cp, -sp * cy}, fwd[3] = {sy * cp, sp, cy * cp};
         float start[3] = {p[0] + fwd[0] * 0.6f, p[1] + g_eye_height - g_eye_drop + fwd[1] * 0.6f, p[2] + fwd[2] * 0.6f};
+        if (ov) {
+            memcpy(start, ov->start, sizeof(start));
+            InterlockedIncrement(&g_override_inits);
+        }
         float range = *(float *)(params + 0xD4);
         if (!(range > 1.0f && range < 1000.0f)) range = 100.0f;
         float *m = (float *)(params + 0xE0), *target = (float *)(params + 0xB0);
@@ -756,7 +1100,7 @@ static const double FIRE_INTERVAL = 0.5;
 static const float PIERCE_CHARGE_RATE = 175.0f, PIERCE_RECHARGE_RATE = 40.0f;
 
 static volatile bool g_instant_fire = true;      // F11: off hands both mouse buttons back to the game
-static volatile bool g_item_style = true;        // Insert: which kind of request the shots use
+static volatile bool g_item_style = true;        // item-style requests are the ones that deal damage; weapon-style is the fallback
 static const int GOODS_THROWING_KNIFE = 290;
 static volatile LONG g_instant_shots = 0, g_pierce_shots = 0, g_shoot_fails = 0;
 static double g_next_shot = 0;
@@ -765,14 +1109,22 @@ static volatile float g_pierce_ready = 100.0f;    // 0..100, recharging after a 
 static bool g_prev_rmb = false;
 static volatile double g_last_shot_time = -100.0, g_last_pierce_time = -100.0;
 
-static bool send_shot(int behavior, bool item_style) {
+// `from` and `dir` (unit length) send the shot from somewhere other than the eye, e.g. a coin.
+static bool send_shot(int behavior, bool item_style, const float *from = nullptr, const float *dir = nullptr) {
     uintptr_t exe = (uintptr_t)GetModuleHandleA(nullptr), pos = g_player_pos;
     uintptr_t man = *(uintptr_t *)(exe + RVA_BULLET_MAN);
     if (!man || !pos || memcmp((void *)(exe + RVA_BULLET_SHOOT), BULLET_SHOOT_BYTES, sizeof(BULLET_SHOOT_BYTES)) != 0) return false;
     const float *p = (const float *)(pos + OFF_POS_X);
-    float sy = sinf(g_yaw), cy = cosf(g_yaw), sp = sinf(g_pitch), cp = cosf(g_pitch);
+    float yaw = g_yaw, pitch = g_pitch;
+    if (from && dir) {
+        yaw = atan2f(dir[0], dir[2]);
+        pitch = asinf(dir[1] > 1 ? 1 : dir[1] < -1 ? -1 : dir[1]);
+    }
+    float sy = sinf(yaw), cy = cosf(yaw), sp = sinf(pitch), cp = cosf(pitch);
     float right[3] = {cy, 0, -sy}, up[3] = {-sp * sy, cp, -sp * cy}, fwd[3] = {sy * cp, sp, cy * cp};
     float eye[3] = {p[0], p[1] + g_eye_height - g_eye_drop, p[2]};
+    if (from && dir)
+        for (int i = 0; i < 3; i++) eye[i] = from[i] - fwd[i] * 0.6f;
     float flat_fwd[3] = {sy, 0, cy}, flat_up[3] = {0, 1, 0};
     ShootRequest r{};
     r.shooter = PLAYER_HANDLE;
@@ -802,14 +1154,161 @@ static bool send_shot(int behavior, bool item_style) {
         r.root[i * 4 + 3] = p[i];
     }
     int id = ((int (*)(uintptr_t, ShootRequest *))(exe + RVA_BULLET_SHOOT))(man, &r);
+    if (id != -1 && from && dir && g_override_count < MAX_OVERRIDES) {
+        ShotOverride &ov = g_overrides[(g_override_head + g_override_count++) % MAX_OVERRIDES];
+        memcpy(ov.start, from, sizeof(ov.start));
+        memcpy(ov.dir, dir, sizeof(ov.dir));
+    }
     return id != -1;
 }
 
-static bool shoot(int behavior) {
-    bool ok = send_shot(behavior, g_item_style);
-    if (!ok && g_item_style) ok = send_shot(behavior, false);   // refused: fall back to the weapon-style request
+static bool shoot(int behavior, const float *from = nullptr, const float *dir = nullptr) {
+    bool ok = send_shot(behavior, g_item_style, from, dir);
+    if (!ok && g_item_style) ok = send_shot(behavior, false, from, dir);   // refused: fall back to the weapon-style request
     if (!ok) InterlockedIncrement(&g_shoot_fails);
     return ok;
+}
+
+// ---- the Marksman variation and its coins (Revolver.ThrowCoin, Coin, WeaponCharges in ULTRAKILL's code).
+// A coin leaves from 0.5 u under the eye at forward * 20 + up * 15 u/s plus the player's own velocity and
+// falls under gravity. From 0.1 s old it can be shot: 0.1 s later the shot goes on to another coin
+// (adding 1 to its power) or to the nearest enemy, with the coin's power (2) as damage against a plain
+// shot's 1. A coin shot in its flash (0.35 to 0.417 s old) or after 1 s goes to two targets. Coins last
+// 5 s; four charges, one refilled every 4 s (25 of 400 per second).
+struct Coin { bool alive, shot; float p[3], v[3], thrown_y; double born, reflect_at; int power, hit_times; };
+enum { MAX_COINS = 8 };
+static Coin g_coins[MAX_COINS];
+static volatile int g_variation = 0;             // 0 Piercer, 1 Marksman
+static volatile float g_coin_charge = 400.0f;
+static volatile LONG g_coins_thrown = 0, g_coins_hit = 0, g_coin_chains = 0, g_coin_shots = 0, g_coin_misses = 0;
+static const int BEHAVIOR_COIN = 9000120;        // + (power - 2), up to power 5
+static const float COIN_FORWARD = 20.0f * UK_UNIT, COIN_UP = 15.0f * UK_UNIT, COIN_DROP = 0.5f * UK_UNIT, COIN_GRAVITY = 40.0f * UK_UNIT;
+static const float COIN_LIFE = 5.0f, COIN_ARMED = 0.1f, COIN_REFLECT_DELAY = 0.1f, COIN_REFILL = 25.0f;
+static const float COIN_HIT_RADIUS = 0.5f;       // ours: how close the line of fire must pass (V1's coin has a generous collider)
+static const float COIN_RANGE = 150.0f;
+static const float COIN_MAX_DROP = 15.0f;        // ours
+static bool g_prev_variation_key = false;
+
+static void view_axes(float *right, float *up, float *fwd) {
+    float sy = sinf(g_yaw), cy = cosf(g_yaw), sp = sinf(g_pitch), cp = cosf(g_pitch);
+    right[0] = cy; right[1] = 0; right[2] = -sy;
+    up[0] = -sp * sy; up[1] = cp; up[2] = -sp * cy;
+    fwd[0] = sy * cp; fwd[1] = sp; fwd[2] = cy * cp;
+}
+static bool eye_pos(float *eye) {
+    uintptr_t pos = g_player_pos;
+    if (!pos) return false;
+    const float *p = (const float *)(pos + OFF_POS_X);
+    eye[0] = p[0]; eye[1] = p[1] + g_eye_height - g_eye_drop; eye[2] = p[2];
+    return true;
+}
+static void throw_coin() {
+    float right[3], up[3], fwd[3], eye[3];
+    if (!eye_pos(eye)) return;
+    view_axes(right, up, fwd);
+    for (Coin &c : g_coins) {
+        if (c.alive) continue;
+        c = Coin{};
+        c.alive = true;
+        c.born = now_s();
+        c.power = 2;
+        float pv[3] = {g_vx, g_air ? g_vy : 0.0f, g_vz};
+        for (int i = 0; i < 3; i++) {
+            c.p[i] = eye[i] - up[i] * COIN_DROP;
+            if (i == 1) c.thrown_y = c.p[1];
+            c.v[i] = fwd[i] * COIN_FORWARD + (i == 1 ? COIN_UP : 0.0f) + pv[i];
+        }
+        InterlockedIncrement(&g_coins_thrown);
+        return;
+    }
+}
+// The coin the line of fire from the eye passes closest to, if any is within reach.
+static Coin *coin_on_line() {
+    float right[3], up[3], fwd[3], eye[3];
+    if (!eye_pos(eye)) return nullptr;
+    view_axes(right, up, fwd);
+    double t = now_s();
+    Coin *best = nullptr;
+    float best_along = COIN_RANGE;
+    for (Coin &c : g_coins) {
+        if (!c.alive || c.shot || t - c.born < COIN_ARMED) continue;
+        float d[3] = {c.p[0] - eye[0], c.p[1] - eye[1], c.p[2] - eye[2]};
+        float along = d[0] * fwd[0] + d[1] * fwd[1] + d[2] * fwd[2];
+        if (along <= 0 || along >= best_along) continue;
+        float off2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2] - along * along;
+        if (off2 > COIN_HIT_RADIUS * COIN_HIT_RADIUS) continue;
+        best = &c;
+        best_along = along;
+    }
+    return best;
+}
+static void hit_coin(Coin &c, double t) {
+    float age = (float)(t - c.born);
+    c.shot = true;
+    c.reflect_at = t + COIN_REFLECT_DELAY;
+    c.hit_times = (age >= 0.35f && age < 0.417f) || age >= 1.0f ? 2 : 1;
+    c.v[0] = c.v[1] = c.v[2] = 0;                // it hangs where it was hit until the shot leaves it
+    InterlockedIncrement(&g_coins_hit);
+}
+static uintptr_t g_watch_chr = 0;                // debug: the last ricochet's target, to log its health a second later
+static int g_watch_hp = 0;
+static double g_watch_at = 0;
+static void reflect_coin(Coin &c, double t) {
+    c.alive = false;
+    Coin *next = nullptr;
+    float best = COIN_RANGE * COIN_RANGE;
+    for (Coin &o : g_coins) {
+        if (!o.alive || o.shot || t - o.born < COIN_ARMED) continue;
+        float dx = o.p[0] - c.p[0], dy = o.p[1] - c.p[1], dz = o.p[2] - c.p[2], d2 = dx * dx + dy * dy + dz * dz;
+        if (d2 < best) { best = d2; next = &o; }
+    }
+    if (next) {
+        hit_coin(*next, t);
+        logf("coin shot: power %d passed on to another coin\n", c.power);
+        next->power = c.power + 1;
+        if (c.hit_times > next->hit_times) next->hit_times = c.hit_times;
+        InterlockedIncrement(&g_coin_chains);
+        return;
+    }
+    Target targets[2];
+    int n = find_targets(c.p, targets, c.hit_times > 1 ? 2 : 1, COIN_RANGE);
+    logf("coin shot: power %d, x%d, %d target(s) in range\n", c.power, c.hit_times, n);
+    if (!n) { InterlockedIncrement(&g_coin_misses); return; }
+    int power = c.power > 5 ? 5 : c.power;
+    for (int i = 0; i < c.hit_times; i++) {
+        const Target &tg = targets[i < n ? i : n - 1];   // one enemy and a split: both shots go to it
+        if (tg.dist < 0.01f) continue;
+        float dir[3] = {(tg.p[0] - c.p[0]) / tg.dist, (tg.p[1] - c.p[1]) / tg.dist, (tg.p[2] - c.p[2]) / tg.dist};
+        bool ok = shoot(BEHAVIOR_COIN + power - 2, c.p, dir);
+        if (ok) InterlockedIncrement(&g_coin_shots);
+        logf("  ricochet from (%.1f %.1f %.1f) to chr %p team %d hp %d at (%.1f %.1f %.1f), %.1f m: %s\n", c.p[0], c.p[1], c.p[2],
+             (void *)tg.chr, tg.team, tg.hp, tg.p[0], tg.p[1], tg.p[2], tg.dist, ok ? "accepted" : "REFUSED");
+        g_watch_chr = tg.chr;
+        g_watch_hp = tg.hp;
+        g_watch_at = t + 1.0;
+    }
+}
+static void update_coins(double t, float dt) {
+    if (g_watch_chr && t >= g_watch_at) {
+        int hp = -1;
+        safe_read(g_watch_chr + OFF_CHR_HP, &hp, 4);
+        logf("  one second after the ricochet: target hp %d -> %d (ricochet projectiles set up so far %ld, of %ld sent)\n", g_watch_hp, hp,
+             (long)g_override_inits, (long)g_coin_shots);
+        g_watch_chr = 0;
+    }
+    if (g_coin_charge < 400.0f) g_coin_charge = g_coin_charge + COIN_REFILL * dt > 400.0f ? 400.0f : g_coin_charge + COIN_REFILL * dt;
+    for (Coin &c : g_coins) {
+        if (!c.alive) continue;
+        if (c.shot) {
+            if (t >= c.reflect_at) reflect_coin(c, t);
+            continue;
+        }
+        // V1's coins are removed once they come to rest. These pass through the floor, so one that has
+        // dropped well below where it was thrown is taken as landed.
+        if (t - c.born > COIN_LIFE || c.p[1] < c.thrown_y - COIN_MAX_DROP) { c.alive = false; continue; }
+        c.v[1] -= COIN_GRAVITY * dt;
+        for (int i = 0; i < 3; i++) c.p[i] += c.v[i] * dt;
+    }
 }
 
 // once per frame, on the game's thread
@@ -818,11 +1317,29 @@ static void try_instant_fire() {
     double t = now_s();
     float dt = last > 0 && t - last < 0.1 ? (float)(t - last) : 0.0f;
     last = t;
+    update_coins(t, dt);
     if (!g_instant_fire || !g_ctrl) { g_pierce_charge = 0; g_prev_rmb = false; return; }
-
     bool lmb = key_down(VK_LBUTTON) != 0, rmb = key_down(VK_RBUTTON) != 0;
+    // E, or the revolver's own slot key 1, changes variation
+    bool variation_key = key_down('E') || key_down('1');
+    if (variation_key && !g_prev_variation_key) {
+        g_variation = g_variation == 0 ? 1 : 0;
+        g_pierce_charge = 0;
+        Target all[16];
+        float eye[3];
+        int n = eye_pos(eye) ? find_targets(eye, all, 16, 500.0f, true) : 0;
+        logf("revolver variation %d (%s); %d other characters active:\n", (int)g_variation, g_variation ? "Marksman" : "Piercer", n);
+        for (int i = 0; i < n; i++) logf("  chr %p team %d hp %d, %.1f m away\n", (void *)all[i].chr, all[i].team, all[i].hp, all[i].dist);
+    }
+    g_prev_variation_key = variation_key;
     if (g_pierce_ready < 100.0f) g_pierce_ready = g_pierce_ready + PIERCE_RECHARGE_RATE * dt > 100.0f ? 100.0f : g_pierce_ready + PIERCE_RECHARGE_RATE * dt;
-    if (rmb && g_pierce_ready >= 100.0f) {
+    if (g_variation == 1) {
+        if (rmb && !g_prev_rmb && g_coin_charge >= 100.0f) {
+            g_coin_charge -= 100.0f;
+            throw_coin();
+        }
+        g_pierce_charge = 0;
+    } else if (rmb && g_pierce_ready >= 100.0f) {
         g_pierce_charge = g_pierce_charge + PIERCE_CHARGE_RATE * dt > 100.0f ? 100.0f : g_pierce_charge + PIERCE_CHARGE_RATE * dt;
     } else if (g_prev_rmb && g_pierce_charge >= 100.0f) {
         if (shoot(BEHAVIOR_PIERCER)) {
@@ -839,7 +1356,10 @@ static void try_instant_fire() {
 
     if (lmb && g_pierce_charge <= 0 && t >= g_next_shot) {
         g_next_shot = t + FIRE_INTERVAL;
-        if (shoot(BEHAVIOR_REVOLVER)) {
+        if (Coin *c = coin_on_line()) {
+            hit_coin(*c, t);                     // the shot stops at the coin
+            g_last_shot_time = t;
+        } else if (shoot(BEHAVIOR_REVOLVER)) {
             InterlockedIncrement(&g_instant_shots);
             g_last_shot_time = t;
         }
@@ -924,6 +1444,10 @@ static void draw_hud(IDXGISwapChain *sc) {
 static volatile float g_hud_health = 100.0f;      // the player's health as a percentage, for the HUD
 static volatile int g_hud_status = 0;             // 0 not tried, 1 working, 2 unavailable (see hud_error)
 static volatile bool g_viewmodel = true;
+static volatile bool g_hide_game_hud = true;      // Delete: hide Dark Souls' own HUD while in first person
+static const uintptr_t RVA_GAME_DATA_MAN = 0x1C8A530;   // GameDataMan*; the accessor at exe+755D40 returns [it + 0x58]
+static const uintptr_t OFF_GDM_OPTIONS = 0x58;          // -> PcOptionData
+static const uintptr_t OFF_OPT_HUD = 0x11;              // the options menu's "HUD" entry: 1 shown, 0 hidden
 
 static bool draw_full_hud(IDXGISwapChain *sc) {
     if (g_hud_status == 2) return false;
@@ -953,6 +1477,29 @@ static bool draw_full_hud(IDXGISwapChain *sc) {
                 st.last_shot = g_last_shot_time;
                 st.last_pierce = g_last_pierce_time;
                 st.show_viewmodel = g_viewmodel;
+                st.variation = g_variation;
+                st.coin_charge = g_coin_charge;
+                D3D11_TEXTURE2D_DESC bd;
+                back->GetDesc(&bd);
+                float right[3], up[3], fwd[3], eye[3];
+                if (eye_pos(eye) && bd.Height) {
+                    view_axes(right, up, fwd);
+                    float tan_y = tanf(BASE_FOV * g_fov_scale * 0.5f), tan_x = tan_y * (float)bd.Width / (float)bd.Height;
+                    for (const Coin &c : g_coins) {
+                        if (!c.alive || st.coin_count >= HudState::MAX_COINS) continue;
+                        float d[3] = {c.p[0] - eye[0], c.p[1] - eye[1], c.p[2] - eye[2]};
+                        float vx = d[0] * right[0] + d[1] * right[1] + d[2] * right[2], vy = d[0] * up[0] + d[1] * up[1] + d[2] * up[2],
+                              vz = d[0] * fwd[0] + d[1] * fwd[1] + d[2] * fwd[2];
+                        if (vz < 0.2f) continue;
+                        float age = (float)(st.time - c.born);
+                        HudState::CoinDot &dot = st.coins[st.coin_count++];
+                        dot.x = vx / (vz * tan_x);
+                        dot.y = vy / (vz * tan_y);
+                        dot.size = 0.3f / (vz * tan_y * 2.0f);          // a coin drawn 0.3 m across
+                        dot.phase = age * 25.0f;
+                        dot.flash = c.shot || (age >= 0.35f && age < 0.417f);
+                    }
+                }
                 hud_draw(dev, ctx, back, st);
             }
         }
@@ -1174,7 +1721,7 @@ static DWORD WINAPI mod_thread(LPVOID) {
     char *slash = strrchr(path, '\\');
     strcpy(slash ? slash + 1 : path, "ultrasouls.log");
     g_log = fopen(path, "w");
-    logf("ultrasouls v0.30 loaded\n");
+    logf("ultrasouls v0.37 loaded\n");
     // Patching the code at startup made the game exit before showing a window (v0.7), so the hook
     // goes in later, once a character is loaded.
     bool hooked = false, hook_tried = false;
@@ -1189,7 +1736,9 @@ static DWORD WINAPI mod_thread(LPVOID) {
 
     float speed = 1.5f;
     bool speed_on = true, speed_ok = false, speed_checked = false;
-    bool k6 = false, k7 = false, k8 = false, kj = false, kk = false, k3 = false, k4 = false, k5 = false, k1 = false, k2 = false, k9 = false, k10 = false, k11 = false, kins = false, khome = false;
+    bool k6 = false, k7 = false, k8 = false, kj = false, kk = false, k3 = false, k4 = false, k5 = false, k1 = false, k2 = false, k9 = false, k10 = false, k11 = false, kins = false, kdel = false, kpgdn = false;
+    bool game_hud_hidden = false;
+    double game_hud_t = 0;
     double mouse_log = 0, fp_t0 = 0;
     int bullets_logged = 0, hud_status_logged = 0;
     LONG shots_seen = 0;
@@ -1236,12 +1785,36 @@ static DWORD WINAPI mod_thread(LPVOID) {
         }
         g_block_lmb = g_instant_fire && g_ctrl;
 
+        // Dark Souls' own HUD is governed by the "HUD" entry in its options: the player gauge reads
+        // that byte every frame (exe+679AF6) and shows or hides itself accordingly. In first person it
+        // is held off; leaving first person turns it back on.
+        if (t - game_hud_t > 0.1) {
+            game_hud_t = t;
+            bool want_hidden = g_ctrl && g_hide_game_hud;
+            uintptr_t gdm = 0, opts = 0;
+            uint8_t cur = 0;
+            if ((want_hidden || game_hud_hidden) && rd((uintptr_t)GetModuleHandleA(nullptr) + RVA_GAME_DATA_MAN, gdm) && gdm &&
+                rd(gdm + OFF_GDM_OPTIONS, opts) && opts && rd(opts + OFF_OPT_HUD, cur)) {
+                if (want_hidden) {
+                    if (cur != 0) wr(opts + OFF_OPT_HUD, (uint8_t)0);
+                    if (!game_hud_hidden) logf("game HUD hidden (option was %d)\n", cur);
+                    game_hud_hidden = true;
+                } else {
+                    wr(opts + OFF_OPT_HUD, (uint8_t)1);
+                    game_hud_hidden = false;
+                    logf("game HUD shown again\n");
+                }
+            }
+        }
+
         if (!hook_tried && speed_checked) {
             hook_tried = true;
             logf("installing physics step hook...\n");
             g_orig_step = (StepFn)install_hook(RVA_STEP, STEP_PROLOGUE, sizeof(STEP_PROLOGUE), (void *)hook_step);
             g_orig_step_alt = (StepFn)install_hook(RVA_STEP_ALT, STEP_ALT_PROLOGUE, sizeof(STEP_ALT_PROLOGUE), (void *)hook_step_alt);
             logf("second physics step hook: %s\n", g_orig_step_alt ? "installed" : "NOT installed (code mismatch)");
+            g_orig_sweep = (SweepFn)install_hook(RVA_STEP_SWEEP, SWEEP_PROLOGUE, sizeof(SWEEP_PROLOGUE), (void *)hook_sweep);
+            logf("move re-check hook: %s\n", g_orig_sweep ? "installed" : "NOT installed (code mismatch)");
             hooked = g_orig_step != nullptr;
             g_orig_cam = (CamFn)install_hook(RVA_CAM_UPDATE, CAM_PROLOGUE, sizeof(CAM_PROLOGUE), (void *)hook_cam);
             g_orig_bullet_init = (BulletInitFn)install_hook(RVA_BULLET_INIT, BULLET_PROLOGUE, sizeof(BULLET_PROLOGUE), (void *)hook_bullet_init);
@@ -1307,13 +1880,17 @@ static DWORD WINAPI mod_thread(LPVOID) {
             else { shot_pending = true; shot_seen_t = t; }
         }
         if (t - ammo_t > 0.25) { ammo_t = t; ammo_keep_full(); }
-        if (pressed(VK_HOME, khome)) {
-            g_viewmodel = !g_viewmodel;
-            logf("viewmodel %s\n", g_viewmodel ? "on" : "off");
+        if (pressed(VK_NEXT, kpgdn)) {
+            g_hide_body = !g_hide_body;
+            logf("hide the player's body in first person: %s (calls so far %ld)\n", g_hide_body ? "yes" : "no", (long)g_body_hides);
+        }
+        if (pressed(VK_DELETE, kdel)) {
+            g_hide_game_hud = !g_hide_game_hud;
+            logf("hide the game's HUD in first person: %s\n", g_hide_game_hud ? "yes" : "no");
         }
         if (pressed(VK_INSERT, kins)) {
-            g_item_style = !g_item_style;
-            logf("shot request style: %s\n", g_item_style ? "item" : "weapon");
+            g_viewmodel = !g_viewmodel;
+            logf("viewmodel %s\n", g_viewmodel ? "on" : "off");
         }
         if (pressed(VK_F11, k11)) {
             g_instant_fire = !g_instant_fire;
@@ -1377,10 +1954,20 @@ static DWORD WINAPI mod_thread(LPVOID) {
             if (g_air && !fp_air) { fp_y0 = fp_peak = y; fp_t0 = t; fp_x0 = x; fp_z0 = z; }
             if (g_air && y > fp_peak) fp_peak = y;
             if (!g_air && fp_air)
-                logf("first-person air: peak +%.2f m, %.2fs, travelled %.2f m (landings %ld, ceiling hits %ld; dashes %ld, slides %ld, slams %ld)\n", fp_peak - fp_y0, t - fp_t0,
+                logf("first-person air: peak +%.2f m, %.2fs, travelled %.2f m (landings %ld, ceiling hits %ld; dashes %ld, slides %ld, slams %ld, wall jumps %ld, slam jumps %ld, cling steps %ld, moves cut by the re-check %ld, pull-downs undone %ld, rescues %ld; "
+                     "last wall normal (%.2f, %.2f) dist %.3f age %.2fs, contacts %d; slide multiplier %.2f)\n", fp_peak - fp_y0, t - fp_t0,
                      sqrtf((x - fp_x0) * (x - fp_x0) + (z - fp_z0) * (z - fp_z0)), (long)g_landings, (long)g_bonks,
-                     (long)g_dashes, (long)g_slides, (long)g_slams);
+                     (long)g_dashes, (long)g_slides, (long)g_slams, (long)g_wall_jump_count, (long)g_slam_jump_count, (long)g_clings, (long)g_sweep_cuts, (long)g_pull_fixes, (long)g_rescues,
+                     g_wall_nx, g_wall_nz, g_wall_dist, g_wall_age, (int)g_seen_manifold, g_preslide);
             fp_air = g_air;
+            static bool fp_slide = false;
+            static float sl_x0 = 0, sl_z0 = 0;
+            static double sl_t0 = 0;
+            if (g_sliding && !fp_slide) { sl_x0 = x; sl_z0 = z; sl_t0 = t; }
+            if (!g_sliding && fp_slide)
+                logf("first-person slide: %.2f m in %.2fs, started at x%.2f speed\n",
+                     sqrtf((x - sl_x0) * (x - sl_x0) + (z - sl_z0) * (z - sl_z0)), t - sl_t0, g_slide_mult0);
+            fp_slide = g_sliding;
         }
         if (want_j && (!hooked || !g_vel_ok)) {
             logf("J ignored: %s\n", !hooked ? "hook not installed" : "velocity field not confirmed yet (run for a second first)");

@@ -590,6 +590,7 @@ struct Anim {
 } anim;
 
 const Color PANEL = {0, 0, 0, 0.4902f}, PANEL2 = {0, 0, 0, 0.502f}, TRACK = {0, 0, 0, 0.6863f};
+const Color MARKSMAN_GREEN = {0.2667f, 1, 0.2706f, 1};   // the green ULTRAKILL's HUD uses; the variation colour itself is a user setting
 const Color PIERCER_BLUE = {0, 0.8759f, 1, 1}, FIST_BLUE = {0.251f, 0.9059f, 1, 1};
 
 void build_hud(const HudState &st, float screen_w, float screen_h) {
@@ -661,9 +662,11 @@ void build_hud(const HudState &st, float screen_w, float screen_h) {
         Box icon = child(child(gun, rt(0, 0, 1, 1, 0, 0, -10, -10)), FILL);
         int rev = g.sprite("SingleRevolver");
         float s = rev >= 0 ? fminf(icon.w() / g.textures[g.sprites[rev].tex].w, icon.h() / g.textures[g.sprites[rev].tex].h) : 0;
-        image_simple(sf, icon, rev, PIERCER_BLUE, true);
+        // ULTRAKILL tints the icon with the variation's colour: blue, green, red
+        const Color tint = st.variation == 1 ? MARKSMAN_GREEN : PIERCER_BLUE;
+        image_simple(sf, icon, rev, tint, true);
         // the glow sprite is the same drawing with a soft margin, so it is drawn at the icon's scale
-        image_simple(sf, icon, g.sprite("SingleRevolverGlow"), {0, 0.8759f, 1, 0.749f}, false, s);
+        image_simple(sf, icon, g.sprite("SingleRevolverGlow"), {tint.r, tint.g, tint.b, 0.749f}, false, s);
     }
 
     // ---- crosshair: the screen-space canvas (reference 1280x720, "expand")
@@ -699,8 +702,27 @@ void build_hud(const HudState &st, float screen_w, float screen_h) {
             image_radial(sc, arc, ring, col, 0.15f * part, false);
         }
     }
+    // coins in flight: a gold ring that narrows and widens as the coin spins, white during the split window
+    for (int i = 0; i < st.coin_count && i < HudState::MAX_COINS; i++) {
+        const HudState::CoinDot &c = st.coins[i];
+        float d = c.size * screen_h / sc.px_per_unit;
+        float squash = fmaxf(fabsf(cosf(c.phase)), 0.18f);
+        Box coin = child(screen, rt(0.5f, 0.5f, 0.5f, 0.5f, c.x * screen_w * 0.5f / sc.px_per_unit, c.y * screen_h * 0.5f / sc.px_per_unit, d, d, 0.5f,
+                                    0.5f, squash, 1));
+        Color col = c.flash ? Color{1, 1, 1, 1} : Color{1, 0.82f, 0.18f, 1};
+        image_radial(sc, coin, g.sprite("circlethick"), col, 1.0f, true);
+        image_sliced(sc, child(coin, rt(0.5f, 0.5f, 0.5f, 0.5f, 0, 0, d * 0.45f, d * 0.45f)), g.sprite("meter"), col, 1.0f);
+    }
+    // the Marksman's coins, on the same wide ring: four quarters, one per coin
+    if (st.variation == 1 && st.coin_charge < 400.0f) {
+        Box big = child(child(dot, rt(0.5f, 0.5f, 0.5f, 0.5f, 0.0001f, 0, 100, 100, 0.5f, 0.5f, 0.8195f, 0.8195f)),
+                        rt(0.5f, 0.5f, 0.5f, 0.5f, 0, 0, 55, 55, 0.5f, 0.5f, 1, 1, 180.0f));
+        float whole = floorf(st.coin_charge / 100.0f) / 4.0f;
+        image_radial(sc, big, g.sprite("circle"), {0.35f, 0.4f, 0.45f, 0.8f}, st.coin_charge / 400.0f, true);
+        if (whole > 0) image_radial(sc, big, g.sprite("circle"), MARKSMAN_GREEN, whole, true);
+    }
     // the Piercer's charge, on the wider ring ULTRAKILL uses for power-ups
-    if (st.pierce_charge > 0 || st.pierce_ready < 100.0f) {
+    if (st.variation == 0 && (st.pierce_charge > 0 || st.pierce_ready < 100.0f)) {
         Box big = child(child(dot, rt(0.5f, 0.5f, 0.5f, 0.5f, 0.0001f, 0, 100, 100, 0.5f, 0.5f, 0.8195f, 0.8195f)),
                         rt(0.5f, 0.5f, 0.5f, 0.5f, 0, 0, 55, 55, 0.5f, 0.5f, 1, 1, 180.0f));
         if (st.pierce_charge > 0)

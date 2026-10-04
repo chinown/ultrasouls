@@ -653,7 +653,8 @@ void build_hud(const HudState &st, float screen_w, float screen_h) {
         image_sliced(sf, fist, g.sprite("Round_FillLarge"), PANEL2);
         Box icon = child(fist, rt(0.5f, 0.5f, 0.5f, 0.5f, 0, 0, 36, 36));
         image_simple(sf, icon, g.sprite("FistIcon"), {0, 0, 0, 1});
-        image_simple(sf, icon, g.sprite("FistIcon"), FIST_BLUE);
+        // the fist dims while there is not enough punch stamina for a punch
+        image_simple(sf, icon, g.sprite("FistIcon"), st.punch_stamina >= 1.0f ? FIST_BLUE : Color{FIST_BLUE.r * 0.35f, FIST_BLUE.g * 0.35f, FIST_BLUE.b * 0.35f, 1});
     }
 
     Box gun = child(canvas, rt(0, 0, 0, 0, -79, 187, 200, 100, 0, 0, 4, 4));

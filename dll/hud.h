@@ -12,6 +12,7 @@ struct HudState {
     double last_shot = -100.0;     // time of the last normal shot
     double last_pierce = -100.0;   // time of the last charged shot
     bool show_viewmodel = true;
+    float punch_stamina = 2.0f;    // 0..2; a punch needs 1
     int variation = 0;             // revolver variation: 0 Piercer, 1 Marksman
     float coin_charge = 400.0f;    // 0..400, four coins of 100
     // coins in flight, already projected: x, y in -1..1 from the screen centre (y up), size as a fraction

@@ -34,10 +34,10 @@ REVOLVER_DAMAGE = 150       # flat attack value per shot (a throwing knife is 10
 PIERCER_DAMAGE = 450        # charged shot: 3x, and it passes through enemies
 COIN_ID = 9000120           # a shot ricocheted off a coin: 9000120 is power 2 (one coin), up to 9000123 for power 5
 COIN_POWERS = (2, 3, 4, 5)  # Coin.power starts at 2 and gains 1 per extra coin in the chain; a plain shot is 1
-COIN_ID = 9000120           # a shot ricocheted off a coin: 9000120 is power 2 (one coin), up to 9000123 for power 5
-COIN_POWERS = (2, 3, 4, 5)  # Coin.power starts at 2 and gains 1 per extra coin in the chain; a plain shot is 1
-COIN_ID = 9000120           # a shot ricocheted off a coin: 9000120 is power 2 (one coin), up to 9000123 for power 5
-COIN_POWERS = (2, 3, 4, 5)  # Coin.power starts at 2 and gains 1 per extra coin in the chain; a plain shot is 1
+PUNCH_ID = 9000130          # the Feedbacker's punch: an unseen, very short projectile from the eye
+PUNCH_DAMAGE = REVOLVER_DAMAGE   # Punch: damage 1, the same as a plain revolver shot
+PUNCH_REACH = 2.0           # 4 units
+PUNCH_RADIUS = 0.5          # the 1-unit sphere ULTRAKILL sweeps when the straight line misses
 BEAM_SPEED = 300.0          # m/s, as close to hitscan as a projectile gets
 BEAM_RANGE = 150.0
 
@@ -95,10 +95,12 @@ for r in shop.order:
 #    BehaviorParam_PC row -> Bullet row -> AtkParam_Pc row, all sharing one id per shot type.
 #    Damage is flat, from a copy of the throwing knife's attack row.
 coin_rows = [(COIN_ID + i, power) for i, power in enumerate(COIN_POWERS)]
-g.add_rows("AtkParam_Pc", [(REVOLVER_ID, 1050, "revolver"), (PIERCER_ID, 1050, "piercer")] + [(rid, 1050, "coin") for rid, _ in coin_rows])
-g.add_rows("Bullet", [(REVOLVER_ID, 603, "revolver"), (PIERCER_ID, 603, "piercer")] + [(rid, 603, "coin") for rid, _ in coin_rows])
+g.add_rows("AtkParam_Pc", [(REVOLVER_ID, 1050, "revolver"), (PIERCER_ID, 1050, "piercer")] + [(rid, 1050, "coin") for rid, _ in coin_rows]
+           + [(PUNCH_ID, 1050, "punch")])
+g.add_rows("Bullet", [(REVOLVER_ID, 603, "revolver"), (PIERCER_ID, 603, "piercer")] + [(rid, 603, "coin") for rid, _ in coin_rows]
+           + [(PUNCH_ID, 603, "punch")])
 g.add_rows("BehaviorParam_PC", [(REVOLVER_ID, 101103300, "revolver"), (PIERCER_ID, 101103300, "piercer")]
-           + [(rid, 101103300, "coin") for rid, _ in coin_rows])
+           + [(rid, 101103300, "coin") for rid, _ in coin_rows] + [(PUNCH_ID, 101103300, "punch")])
 atk, bul, beh = g["AtkParam_Pc"], g["Bullet"], g["BehaviorParam_PC"]
 shots = [(REVOLVER_ID, REVOLVER_DAMAGE, 20131, 20230, 0, 0.15), (PIERCER_ID, PIERCER_DAMAGE, 20133, 20236, 1, 0.3)]
 shots += [(rid, REVOLVER_DAMAGE * power, 20133, 20236, 0, 0.3) for rid, power in coin_rows]
@@ -115,6 +117,17 @@ for rid, damage, sfx, sfx_hit, pierce, radius in shots:
     beh.set(rid, "variationId", 0)
     beh.set(rid, "behaviorJudgeId", 0)
 
+# the punch: the same kind of row, but it only travels the punch's reach, is wider, and has no visible trail
+atk.set(PUNCH_ID, "atkPhys", PUNCH_DAMAGE)
+for k, v in (("atkId_Bullet", PUNCH_ID), ("sfxId_Bullet", -1), ("sfxId_Hit", 20230), ("sfxId_Flick", -1),
+             ("initVellocity", BEAM_SPEED), ("maxVellocity", BEAM_SPEED), ("minVellocity", BEAM_SPEED),
+             ("accelInRange", 0.0), ("accelOutRange", 0.0), ("gravityInRange", 0.0), ("gravityOutRange", 0.0),
+             ("dist", PUNCH_REACH), ("life", PUNCH_REACH / BEAM_SPEED), ("hitRadius", PUNCH_RADIUS), ("isPenetrate", 0)):
+    bul.set(PUNCH_ID, k, v)
+beh.set(PUNCH_ID, "refId", PUNCH_ID)
+beh.set(PUNCH_ID, "variationId", 0)
+beh.set(PUNCH_ID, "behaviorJudgeId", 0)
+
 os.makedirs(os.path.dirname(OUT), exist_ok=True)
 g.save(OUT)
 
@@ -126,6 +139,7 @@ assert chk["BehaviorParam_PC"].get(PIERCER_ID, "refId") == PIERCER_ID and chk["A
 assert chk["AtkParam_Pc"].get(COIN_ID + 1, "atkPhys") == REVOLVER_DAMAGE * 3 and chk["Bullet"].get(COIN_ID + 3, "atkId_Bullet") == COIN_ID + 3
 assert chk["AtkParam_Pc"].get(COIN_ID + 1, "atkPhys") == REVOLVER_DAMAGE * 3 and chk["Bullet"].get(COIN_ID + 3, "atkId_Bullet") == COIN_ID + 3
 assert chk["AtkParam_Pc"].get(COIN_ID + 1, "atkPhys") == REVOLVER_DAMAGE * 3 and chk["Bullet"].get(COIN_ID + 3, "atkId_Bullet") == COIN_ID + 3
+assert chk["Bullet"].get(PUNCH_ID, "dist") == PUNCH_REACH and chk["AtkParam_Pc"].get(PUNCH_ID, "atkPhys") == PUNCH_DAMAGE
 assert all(chk["BehaviorParam_PC"].get(r, "stamina") == 0 for r in chk["BehaviorParam_PC"].order)
 assert chk["SpEffectParam"].get(HEAL_SPEFFECT, "changeHpPoint") == -HEAL_PER_HIT
 assert chk["Bullet"].get(600, "initVellocity") == SHOT_SPEED

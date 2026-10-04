@@ -10,8 +10,12 @@ No game files are included, from either game. You need your own copy of Dark Sou
 - **DLL (`dll/mod.cpp`, `dll/hud.cpp`)**: a `dinput8.dll` proxy. Stamina is locked at max and animations run faster. F5 switches to first person, which replaces Dark Souls' controls with V1's.
   - **Movement**: mouse look, run, jump, dash, slide and ground slam, driven through the game's own physics step so walls, floors and ceilings collide. The numbers come from ULTRAKILL's code and Player prefab (run 16.5 u/s, jump 28.08 u/s, gravity 40 u/s², dash 49.5 u/s for 0.2 s, slide 24 u/s, slam 100 u/s, 3 stamina bars at 70/s), converted at 1 unit = 0.5 m so V1's 3.5-unit capsule matches the character's height.
   - **Movement techs**, each from ULTRAKILL's `NewMovement` code: wall jump (up to 3 before landing, 24 u/s up and away from the wall), wall cling (holding towards a wall turns the fall into a slow slide down), slam jump (a jump within 0.4 s of a slam landing is higher the longer the slam fell), slide boost (a slide started within 0.2 s of a slam landing, or during a dash, starts up to 3x faster and wears off), slide-jump and dash-jump. A dash cancels a slam. Falls do no damage, but the map's kill planes still kill, and a fall with no floor under it puts the player back where they last stood after 30 m. Not done yet: slide-timed speed jumps (SSJ), slam storage, sliding in the air.
+  - **Feedbacker punch** (F), without the parry yet: the damage of one revolver shot within 4 u of the eye, with ULTRAKILL's punch stamina (two charges, one per punch, refilling at 1.25 per second) and cooldown. It is an unseen short projectile fired through the same path as the revolver. The fist icon dims when there is no charge. Not seen in game when written.
+  - **No fall damage** in first person: while the mod controls the time in the air, the game's "on the ground" flag is held set, so the game never registers a fall. Kill planes still kill. Not seen in game when written.
+  - **Camera tilt**, from ULTRAKILL's `CameraController`: the view rolls 1 degree towards the side being strafed to, 5 degrees while dashing or sliding, eased in and out the way the original does it. A dash or slide straight ahead narrows the field of view by 5%, one straight back widens it by 10%.
   - **Piercer revolver**: fired through the game's own projectile entry point, so nothing needs to be equipped. Left mouse fires every 0.5 s; holding right mouse charges for 0.57 s and releasing fires a shot that passes through enemies, then recharges for 2.5 s. Those timings are ULTRAKILL's. The damage (150 and 450 attack) is a tuning choice.
-  - **Marksman revolver** (E or 1 switches variation): right mouse tosses a coin (four charges, one back every 4 s) with ULTRAKILL's throw (forward 20 u/s, up 15 u/s, plus the player's velocity). Shooting a coin sends the shot on 0.1 s later, to another coin (adding to its power) or to the nearest hostile character, at 2x a plain shot's damage plus 1x per extra coin; a coin shot during its flash or after 1 s splits to two targets. Tested in-game: the switch, the toss, hitting a coin, the HUD. The ricochet itself is not confirmed yet: until v0.37 it left from the player's eye instead of the coin (the game sets a projectile up after the shoot call returns), and the fix has not been seen hitting an enemy. The log records each ricochet and its target's health a second later. Simplified for now: coins do not collide with the world, they are drawn as flat gold rings rather than ULTRAKILL's coin model, the ricochet does not check line of sight, and it aims at the body rather than a weak point.
+  - **Marksman revolver** (E or 1 switches variation): right mouse tosses a coin (four charges, one back every 4 s) with ULTRAKILL's throw (forward 20 u/s, up 15 u/s, plus the player's velocity). Shooting a coin sends the shot on 0.1 s later, to another coin (adding to its power) or to the nearest hostile character, at 2x a plain shot's damage plus 1x per extra coin; a coin shot during its flash or after 1 s splits to two targets. Tested in-game: the switch, the toss, hitting a coin, the HUD, ricochets killing enemies, and the line-of-sight check. A coin only goes for enemies it can see (the game's own ray cast decides), idle ones included; with none in sight the shot leaves in a random direction, as in ULTRAKILL. Simplified for now: coins do not collide with the world (one that drops 15 m below where it was thrown is removed), they are drawn as flat gold rings rather than ULTRAKILL's coin model, and the ricochet aims at the body rather than a weak point.
+  - **Sounds**: jump, wall jump, dash, dash-jump, landing (light and heavy), slide stop, out-of-stamina, both revolvers' shots, the charged shot with its rising charge and refill ticking, weapon switch, coin toss, coin flash and coin hit. The clips are decoded from your own ULTRAKILL install by `tools/uk_sounds.py`; the volumes and pitches are the ones ULTRAKILL's code sets. Mixed in software and fed to the Windows audio engine (WASAPI, shared mode). Each of ULTRAKILL's audio sources is a channel that plays one sound at a time, so a new shot cuts the last shot's tail. Footsteps follow ULTRAKILL's timer (faster with speed, four clips, never the same twice running), and the slide and the wall cling have their scraping loops. Not done yet: the falling wind, the revolver's enemy hit sound, surface-specific footsteps. Without the sound pack the mod is silent.
   - **HUD and viewmodel**: ULTRAKILL's weapon panel, health and stamina bars, crosshair and rings, rebuilt from the layout stored in the game's own HUD objects, plus the Piercer's model held in V1's arm. Checked with the offline test program below; newly added and still being tested in-game. The revolver is drawn in its idle pose with a procedural recoil; its real animations are not played yet. If the asset pack is missing, plain bars are drawn instead.
 
 First person (F5 toggles it; third person plays as normal Dark Souls):
@@ -26,17 +30,23 @@ First person (F5 toggles it; third person plays as normal Dark Souls):
 | Shift | Dash |
 | Ctrl | Slide on the ground (press, then hold), slam in the air |
 | Space in the air, by a wall | Wall jump |
+| F | Punch (Feedbacker) |
 | F1 / F2 | Field of view |
 | F3 / F4 | Eye height |
 | F9 / F10 | Mouse sensitivity |
 | F11 | Revolver on/off (off gives the mouse buttons back to the game) |
+| - / = | Sound effects volume down / up (starts at 20%) |
+| F12 | Save the last 30 s of the mod's sound output, and the list of sounds started, next to the exe |
 | Insert | Viewmodel on/off |
 | Delete | Hide Dark Souls' own HUD in first person, on/off |
 | Page Down | Hide the player's body in first person, on/off |
+| Page Up | Camera tilt on/off |
 
-Space, Shift, Ctrl and both mouse buttons are hidden from the game while first person is on, so its own binds on them do nothing.
+Space, Shift, Ctrl, F and both mouse buttons are hidden from the game while first person is on, so its own binds on them do nothing.
 
 Always: F6 / F7 / F8 animation speed down / up / toggle.
+
+Mouse sensitivity, field of view, eye height, sound volume and the camera tilt switch are written to `ultrasouls.ini` next to the exe whenever a key changes them, and read back at the next start.
 
 Dark Souls' own HUD is switched off while first person is on, through the game's "HUD" option, and switched back on when you leave it. The player's body is hidden in first person through the game's own camouflage mechanism (the one the Hidden Body spell uses), called every frame with zero opacity; whether enemies react to the player any differently because of it has not been checked. Interaction prompts ("Rest at bonfire") still show with the HUD hidden.
 
@@ -50,6 +60,9 @@ Mod:
 
 - `dll/mod.cpp` is the DLL: input, hooks, movement, shooting.
 - `dll/hud.cpp`, `dll/hud.h` draw the HUD and viewmodel with Direct3D 11 from the asset pack.
+- `dll/sound.cpp`, `dll/sound.h` mix and play the sound effects from the sound pack.
+- `dll/sound_test.cpp` plays a scripted sequence through the same mixer into a WAV file, to measure levels and breaks without the game.
+- `dll/sound_rt_test.cpp` runs the real output path outside the game at an inaudible volume and reports how much audio the device took and any dropouts.
 - `dll/hud_test.cpp` draws the same HUD onto an off-screen target and writes BMP files, to check it without starting the game.
 - `tools/patch_v1.py` applies the param changes. It patches from `backup/GameParam.parambnd.dcx.current`, a copy of your own unmodified file, plus `backup/paramdef.paramdefbnd.dcx` from the game's `paramdef` folder.
 - `tools/dsparam.py` reads and patches `GameParam.parambnd.dcx` (DCX, BND3, PARAM, PARAMDEF) with no dependencies, and can add rows.
@@ -59,6 +72,7 @@ ULTRAKILL assets (`pip install UnityPy`; everything they produce stays under `bu
 
 - `tools/uk_bundles.py` indexes which bundle holds which internal asset file.
 - `tools/uk_hud_dump.py` dumps the HUD's layout (rectangles, colours, sprites, text) from the Player object.
+- `tools/uk_sounds.py` finds the clips named by the player's, revolvers' and coin's sound fields (`refs`) and writes `ultrasouls_sounds.bin` (`pack`).
 - `tools/uk_assets.py` extracts the HUD sprites and font, bakes the revolver's skinned meshes in their saved pose, and writes `ultrasouls_assets.bin`.
 
 Reverse-engineering helpers:
@@ -93,12 +107,13 @@ python tools/uk_assets.py hud
 
 ```bash
 python tools/uk_assets.py pack --install
+python tools/uk_sounds.py pack --install
 ```
 
 DLL:
 
 ```bash
-g++ -O2 -shared -static -o build/dinput8.dll dll/mod.cpp dll/hud.cpp dll/dinput8.def -lpsapi -ld3d11 -ldxgi
+g++ -O2 -shared -static -o build/dinput8.dll dll/mod.cpp dll/hud.cpp dll/sound.cpp dll/dinput8.def -lpsapi -ld3d11 -ldxgi -lole32
 ```
 
 Copy `build/dinput8.dll` next to `DarkSoulsRemastered.exe`. Delete it and `ultrasouls_assets.bin` to uninstall.

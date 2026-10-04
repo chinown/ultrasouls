@@ -13,6 +13,7 @@
 #include <dxgi.h>
 
 #include "hud.h"
+#include "sound.h"
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
@@ -83,7 +84,7 @@ static const GUID GUID_SYS_KEYBOARD = {0x6F1D2B61, 0xD5A0, 0x11CF, {0xBF, 0xC7, 
 // bindings), so they are cleared from the keyboard state before it reaches the game. Our own controls
 // read the keys through GetAsyncKeyState, which this does not touch.
 static volatile bool g_block_keys = false, g_block_lmb = false;
-static const uint8_t BLOCKED_KEYS[] = {0x39, 0x2A, 0x36, 0x1D, 0x9D};   // DIK_SPACE, L/R SHIFT, L/R CONTROL
+static const uint8_t BLOCKED_KEYS[] = {0x39, 0x2A, 0x36, 0x1D, 0x9D, 0x21};   // DIK_SPACE, L/R SHIFT, L/R CONTROL, F
 
 // Devices of different kinds may have different vtables, so the originals are kept per vtable.
 struct DevVtable {
@@ -406,8 +407,12 @@ static void try_instant_fire();
 // are the list of who is around. [HavokChara+0x250] points 0x4F8 into the owning ChrIns (measured on the
 // player's own objects). ChrIns+0xD8 is the team: 4 on the hollow player; Dark Souls' own values are
 // 6 enemy, 7 boss, 8 friendly NPC, 9 NPC turned hostile.
+// An enemy that is idle or has not noticed the player is stepped rarely or not at all after it loads, so
+// an entry is kept for as long as its objects still point at each other (ChrIns -> ChrCtrl at +0x68 ->
+// HavokChara at +0x28), not for how recently it was stepped. v0.37 only counted characters stepped in the
+// last 0.25 s, and coins ignored enemies that were standing near but not fighting.
 struct Tracked { uintptr_t havok; double seen; };
-enum { MAX_TRACKED = 96 };
+enum { MAX_TRACKED = 256 };
 static Tracked g_tracked[MAX_TRACKED];
 static const uintptr_t OFF_HAVOK_OWNER = 0x250, OWNER_DELTA = 0x4F8, OFF_CHR_TEAM = 0xD8, OFF_CHR_HP = 0x3E8;
 static const uintptr_t RVA_VT_ENEMY = 0x1322E68;
@@ -417,22 +422,25 @@ static void track_character(uintptr_t havok) {
     int spare = -1;
     for (int i = 0; i < MAX_TRACKED; i++) {
         if (g_tracked[i].havok == havok) { g_tracked[i].seen = t; return; }
-        if (spare < 0 && (!g_tracked[i].havok || t - g_tracked[i].seen > 1.0)) spare = i;
+        if (spare < 0 || (g_tracked[spare].havok && (!g_tracked[i].havok || g_tracked[i].seen < g_tracked[spare].seen))) spare = i;
     }
-    if (spare >= 0) g_tracked[spare] = {havok, t};
+    g_tracked[spare] = {havok, t};               // an empty slot, or else the one stepped longest ago
 }
 struct Target { float p[3], dist; uintptr_t chr; int team, hp; };
 // Living hostile characters within `max_dist` of `from`, nearest first. `all` lists every character instead.
 static int find_targets(const float *from, Target *out, int max_n, float max_dist, bool all = false) {
     uintptr_t exe = (uintptr_t)GetModuleHandleA(nullptr);
-    double t = now_s();
     int n = 0;
     for (int i = 0; i < MAX_TRACKED; i++) {
-        uintptr_t havok = g_tracked[i].havok, owner = 0, vt = 0;
-        if (!havok || t - g_tracked[i].seen > 0.25 || havok == g_player_pos) continue;
+        uintptr_t havok = g_tracked[i].havok, owner = 0, vt = 0, ctrl = 0, back = 0;
+        if (!havok || havok == g_player_pos) continue;
         Target c{};
-        if (!safe_read(havok + OFF_HAVOK_OWNER, &owner, 8) || owner < 0x10000) continue;
+        if (!safe_read(havok + OFF_HAVOK_OWNER, &owner, 8) || owner < 0x10000) { g_tracked[i].havok = 0; continue; }
         c.chr = owner - OWNER_DELTA;
+        if (!safe_read(c.chr + 0x68, &ctrl, 8) || ctrl < 0x10000 || !safe_read(ctrl + 0x28, &back, 8) || back != havok) {
+            g_tracked[i].havok = 0;              // the character is gone
+            continue;
+        }
         if (!safe_read(c.chr, &vt, 8) || !safe_read(c.chr + OFF_CHR_TEAM, &c.team, 4) || !safe_read(c.chr + OFF_CHR_HP, &c.hp, 4)) continue;
         if (!safe_read(havok + 0x10, c.p, 12)) continue;
         if (!all && (vt != exe + RVA_VT_ENEMY || !(c.team == 6 || c.team == 7 || c.team == 9) || c.hp <= 0)) continue;
@@ -449,6 +457,38 @@ static int find_targets(const float *from, Target *out, int max_n, float max_dis
     }
     return n;
 }
+
+// ULTRAKILL's AudioSources, each of which plays one clip at a time: the player's (jump, dash), the ground
+// check's (landing), the revolver's (shots) and the revolver's screen (refill ticking, ready beep).
+// v0.42 let every sound overlap, so the two-second bass tails of the shots piled up on each other.
+enum { CH_FREE = 0, CH_PLAYER = 1, CH_GROUND = 2, CH_GUN = 3, CH_SCREEN = 4, CH_FEET = 5 };
+static bool g_air_jumped = false;                // the current time in the air began with a jump
+
+// Footsteps (PlayerFootsteps): a timer starts at 1 and runs down at 3 per second at 15 u/s or more,
+// proportionally slower below that; each time it empties a step plays (one of four clips, never the same
+// twice running, volume 0.25, pitch 0.9 to 1.1). The slide and the wall cling each have a looping scrape.
+static float frand(float lo, float hi);
+static float g_footstep_timer = 1.0f;
+static int g_last_footstep = -1;
+static void footstep_update(float speed_ms, float dt) {
+    float u = speed_ms / UK_UNIT;
+    g_footstep_timer -= (u > 15.0f ? 15.0f : u) / 15.0f * dt * 3.0f;
+    if (g_footstep_timer > 0) return;
+    g_footstep_timer = 1.0f;
+    int n = rand() % 4;
+    if (n == g_last_footstep) n = (n + 1) % 4;
+    g_last_footstep = n;
+    static const char *const names[4] = {"footstep_1", "footstep_2", "footstep_3", "footstep_4"};
+    sound_play(names[n], 0.25f, frand(0.9f, 1.1f), false, CH_FEET);
+}
+static void scrape_loops(bool sliding, bool clinging) {
+    static int slide_voice = 0, cling_voice = 0;
+    if (sliding && !slide_voice) slide_voice = sound_play("slide_loop", 1.0f, 1.0f, true);
+    if (!sliding && slide_voice) { sound_stop(slide_voice); slide_voice = 0; }
+    if (clinging && !cling_voice) cling_voice = sound_play("wall_scrape", 0.7f, 1.0f, true);
+    if (!clinging && cling_voice) { sound_stop(cling_voice); cling_voice = 0; }
+}
+static float frand(float lo, float hi) { return lo + (hi - lo) * (float)rand() / (float)RAND_MAX; }
 
 static void step_common(void *self, void *step_info, void *gravity, StepFn orig) {
     track_character((uintptr_t)self);
@@ -480,15 +520,21 @@ static void step_common(void *self, void *step_info, void *gravity, StepFn orig)
                     // NewMovement.Jump: a slide-jump is lower and keeps the slide speed; a dash-jump is lower
                     // still and keeps the dash speed only if a stamina bar can be paid, else drops to run speed.
                     // Just after a slam lands, the jump is 3x plus what the slam built up, instead of 2.6x.
+                    // the jump sound is higher and louder for a slam jump (pitch 2, volume 0.85)
+                    g_air_jumped = true;
+                    bool slam_jump = !g_sliding && g_dash_left <= 0 && g_slam_window > 0;
+                    sound_play("jump", slam_jump ? 0.85f : 0.75f, slam_jump ? 2.0f : 1.0f, false, CH_PLAYER);
                     if (g_sliding) {
                         g_vy = V1_SLIDE_JUMP_SPEED;
                     } else if (g_dash_left > 0) {
                         g_vy = V1_DASH_JUMP_SPEED;
                         if (g_boost >= 100.0f) {
                             g_boost -= 100.0f;
+                            sound_play("dash_jump", 1.0f, 1.5f);
                         } else {
                             g_vx = g_dash_x * V1_RUN_SPEED;
                             g_vz = g_dash_z * V1_RUN_SPEED;
+                            sound_play("stamina_fail", 0.6f, 0.5f);
                         }
                     } else if (g_slam_window > 0) {
                         g_vy = V1_JUMP_SPEED / 2.6f * (g_slam_force < 5.5f ? 3.0f + (g_slam_force - 1.0f) : 12.5f);
@@ -514,8 +560,11 @@ static void step_common(void *self, void *step_info, void *gravity, StepFn orig)
                     g_dash_left = 0;
                     g_slamming = false;
                     InterlockedIncrement(&g_wall_jump_count);
+                    sound_play("jump", 0.75f, 1.0f + 0.25f * g_wall_jumps, false, CH_PLAYER);       // each wall jump sounds higher
+                    if (g_wall_jumps == V1_WALL_JUMPS) sound_play("wall_jump_final", 0.75f, 1.0f, false, CH_GROUND);
                 } else if (!g_air && !flag && air_time >= 0.15f) {
                     g_air = true;                       // walked off a ledge
+                    g_air_jumped = false;
                     g_air_steps = 0;
                     g_air_time = 0;
                     g_vy = vel[1] < 0 ? vel[1] : 0;
@@ -537,8 +586,11 @@ static void step_common(void *self, void *step_info, void *gravity, StepFn orig)
 
                 // stamina: 3 bars of 100, refilling at 70/s except while sliding
 
+                bool was_sliding = g_sliding;
+                if (shift_edge && g_boost < 100.0f) sound_play("stamina_fail", 0.6f, 0.5f);
                 if (shift_edge && g_boost >= 100.0f) {
                     // TryDash: also ends a slide or a slam
+                    sound_play("dash", 1.0f, 1.0f, false, CH_PLAYER);
                     g_boost -= 100.0f;
                     g_dash_left = V1_DASH_TIME;
                     g_dash_x = dir_x;
@@ -565,6 +617,7 @@ static void step_common(void *self, void *step_info, void *gravity, StepFn orig)
                     InterlockedIncrement(&g_slides);
                 }
                 if (g_sliding && (!ctrl || g_air)) g_sliding = false;
+                if (was_sliding && !g_sliding) sound_play("slide_stop", 0.5f, 1.5f);
                 if (!g_air) g_slamming = false;
 
                 // FixedUpdate: the multiplier a slide would start with. A slam hands over its force; a fast
@@ -583,7 +636,7 @@ static void step_common(void *self, void *step_info, void *gravity, StepFn orig)
                     }
                 }
 
-                bool on_wall = g_air && g_wall_age < 0.05f;
+                bool on_wall = g_air && g_wall_age < 0.05f, clinging = false;
                 if (g_slamming) {
                     g_vx = g_vz = 0;
                     g_vy = -V1_SLAM_SPEED;
@@ -621,6 +674,7 @@ static void step_common(void *self, void *step_info, void *gravity, StepFn orig)
                     float k = 1.0f - powf(0.75f, dt / V1_STEP);
                     g_vx += (wx * V1_RUN_SPEED - g_vx) * k;
                     g_vz += (wz * V1_RUN_SPEED - g_vz) * k;
+                    footstep_update(sqrtf(g_vx * g_vx + g_vz * g_vz), dt);
                 } else if (on_wall && g_vy < -1.0f * UK_UNIT && wl > 0.01f && -(wx * g_wall_nx + wz * g_wall_nz) > 0.5f * wl) {
                     // Cling: falling against a wall with the keys held towards it. The fall becomes a slow
                     // slide down that speeds up over time (2 u/s per point of clingFade, which grows by 4 per second).
@@ -628,6 +682,7 @@ static void step_common(void *self, void *step_info, void *gravity, StepFn orig)
                     g_vy = -2.0f * g_cling_fade * UK_UNIT;
                     g_cling_fade = g_cling_fade + 4.0f * dt > 50.0f ? 50.0f : g_cling_fade + 4.0f * dt;
                     vel[1] = g_vy;
+                    clinging = true;
                     InterlockedIncrement(&g_clings);
                 } else {
                     // V1 in the air: each view axis accelerates only until its speed reaches run speed;
@@ -660,6 +715,7 @@ static void step_common(void *self, void *step_info, void *gravity, StepFn orig)
                 }
                 vel[0] = g_vx;
                 vel[2] = g_vz;
+                scrape_loops(g_sliding, clinging);
                 rising = g_air && g_vy > 0;
                 if (g_air) {
                     ctrl_air = true;
@@ -674,6 +730,7 @@ static void step_common(void *self, void *step_info, void *gravity, StepFn orig)
                 g_vz = vel[2];
                 g_air = false;
                 g_vy = 0;
+                scrape_loops(false, false);
             }
             if (!g_ctrl && g_vjump && g_vel_ok) {
                 float e = (float)(now_s() - g_vjump_t0);
@@ -753,6 +810,13 @@ static void step_common(void *self, void *step_info, void *gravity, StepFn orig)
         float want = ctrl_vy * ctrl_dt, got = y1 - y0;
         g_air_steps++;
         if (ctrl_vy < -0.5f && got > want * 0.3f) {
+            // CheckLanding: under 50 u/s the landing is louder the faster the fall; at 50 u/s or more it is the heavy impact
+            // (which needs a jump or 0.2 s in the air, so walking down steps makes no sound)
+            float fall_u = -ctrl_vy / UK_UNIT;
+            if (g_air_jumped || g_air_time >= 0.2f) {
+                if (fall_u < 50.0f) sound_play("landing", 0.5f + fall_u * 0.01f, frand(0.9f, 1.1f), false, CH_GROUND);
+                else sound_play("landing_heavy", 0.9f, 1.0f);
+            }
             g_air = false;
             g_vy = 0;
             g_wall_jumps = 0;
@@ -797,6 +861,13 @@ static void step_common(void *self, void *step_info, void *gravity, StepFn orig)
             g_wall_age = 0;
         }
     }
+    // V1 takes no fall damage. The game treats a character as falling when this flag is clear
+    // (exe+386850 tests it, with the air timer the step wrapper at exe+2BC4D0 only runs while it is
+    // clear), and a fall is what leads to landing damage and to dying in mid-air on a long drop. Step
+    // has just written the flag from its ground check; while the controller owns the time in the air it
+    // is put back to 'on the ground', so the game never sees a fall. The map's kill planes are separate
+    // and still kill.
+    if (g_ctrl && g_air) *(uint8_t *)((uintptr_t)self + OFF_POS_GROUNDED) = 1;
     if (takeoff) {
         uintptr_t phantom = *(uintptr_t *)(proxy + 0x80);
         uintptr_t body = phantom ? *(uintptr_t *)(phantom + 0x30) : 0;
@@ -849,7 +920,69 @@ static float g_yaw = 0, g_pitch = 0;            // our view direction, radians; 
 static bool g_cursor_centred = false;
 static float g_eye_drop = 0;                    // how far the view is currently lowered (slide)
 static const float SLIDE_EYE_DROP = 0.6f;       // V1's view drops while sliding; 0.6 m is a guess, not from its code
-static volatile float g_sens = 0.0008f;          // radians per mouse count
+static volatile float g_sens = 0.00041f;         // radians per mouse count (the value Davi settled on; was 0.0008)
+static volatile float g_volume = 0.2f;           // sound effects volume, 0..1
+
+// ---- camera tilt, as CameraController.Update does it. The view rolls towards the side being strafed
+// to: 1 degree, or 5 while dashing or sliding. Every frame the roll is first eased towards level
+// (a smooth damp over 0.5 s), then moved towards its target at 25 x (the remaining angle + 0.01)
+// degrees per second, or 100 x while dashing or sliding. A dash or slide straight ahead also narrows
+// the field of view by a twentieth, one straight back widens it by a tenth, and it returns at
+// 300 degrees per second of ULTRAKILL's 105-degree default.
+static volatile bool g_camera_tilt = true;       // Page Up
+static float g_tilt_deg = 0, g_tilt_vel = 0;     // positive leans the view to the right
+static float g_fov_kick = 1.0f;
+static float move_towards(float a, float b, float max_step) {
+    float d = b - a;
+    return fabsf(d) <= max_step ? b : a + (d > 0 ? max_step : -max_step);
+}
+// the usual critically damped spring (Unity's SmoothDamp) towards `target`
+static float smooth_damp(float current, float target, float &velocity, float smooth_time, float dt) {
+    float omega = 2.0f / smooth_time, x = omega * dt;
+    float e = 1.0f / (1.0f + x + 0.48f * x * x + 0.235f * x * x * x);
+    float change = current - target, temp = (velocity + omega * change) * dt;
+    velocity = (velocity - omega * temp) * e;
+    float out = target + (change + temp) * e;
+    if ((target - current > 0.0f) == (out > target)) {
+        out = target;
+        velocity = 0.0f;
+    }
+    return out;
+}
+
+// ---- the settings the keys change (sensitivity, field of view, eye height, sound volume) are kept in
+// ultrasouls.ini next to the exe, so they are still there the next time the game starts.
+static void settings_path(wchar_t *path) {
+    GetModuleFileNameW(nullptr, path, MAX_PATH);
+    wchar_t *slash = wcsrchr(path, L'\\');
+    wcscpy(slash ? slash + 1 : path, L"ultrasouls.ini");
+}
+static void save_settings() {
+    wchar_t path[MAX_PATH];
+    settings_path(path);
+    FILE *f = _wfopen(path, L"w");
+    if (!f) return;
+    fprintf(f, "sensitivity=%.6f\nfov_scale=%.2f\neye_height=%.2f\nvolume=%.2f\ncamera_tilt=%d\n", (float)g_sens, (float)g_fov_scale, (float)g_eye_height,
+            (float)g_volume, g_camera_tilt ? 1 : 0);
+    fclose(f);
+}
+static bool load_settings() {
+    wchar_t path[MAX_PATH];
+    settings_path(path);
+    FILE *f = _wfopen(path, L"r");
+    if (!f) return false;
+    char key[32];
+    float v;
+    while (fscanf(f, " %31[^=]=%f", key, &v) == 2) {
+        if (!strcmp(key, "sensitivity") && v > 0.00002f && v < 0.02f) g_sens = v;
+        else if (!strcmp(key, "fov_scale") && v > 0.5f && v < 3.0f) g_fov_scale = v;
+        else if (!strcmp(key, "eye_height") && v > 0.5f && v < 3.0f) g_eye_height = v;
+        else if (!strcmp(key, "volume") && v >= 0.0f && v <= 1.0f) g_volume = v;
+        else if (!strcmp(key, "camera_tilt")) g_camera_tilt = v != 0.0f;
+    }
+    fclose(f);
+    return true;
+}
 
 // Hiding the player's own body in first person. The game already has a way to make a character
 // invisible: "camouflage", which the Hidden Body spell uses. Each frame its special-effect code calls
@@ -957,7 +1090,33 @@ static uint64_t hook_cam(void *self, float dt, void *a3, void *a4, uint64_t a5, 
     m[0] = cy;       m[1] = 0;   m[2] = -sy;
     m[4] = -sp * sy; m[5] = cp;  m[6] = -sp * cy;
     m[8] = sy * cp;  m[9] = sp;  m[10] = cy * cp;
-    lens[0] = BASE_FOV * g_fov_scale;
+    {
+        float fdt = dt > 0 && dt < 0.1f ? dt : 0.0f;
+        float strafe = (float)(key_down('D') - key_down('A'));
+        bool boost = g_dash_left > 0 || g_sliding;
+        if (fdt > 0) {
+            g_tilt_deg = smooth_damp(g_tilt_deg, 0.0f, g_tilt_vel, 0.5f, fdt);
+            float target = g_camera_tilt ? strafe * (boost ? 5.0f : 1.0f) : 0.0f;
+            float rate = (g_camera_tilt && boost ? 100.0f : 25.0f) * (fabsf(g_tilt_deg - target) + 0.01f);
+            g_tilt_deg = move_towards(g_tilt_deg, target, fdt * rate);
+        }
+        // roll about the view direction: the up row leans towards the right row
+        float roll = g_tilt_deg * 3.14159265f / 180.0f, cr = cosf(roll), sr = sinf(roll);
+        for (int i = 0; i < 3; i++) {
+            float right = m[i], up = m[4 + i];
+            m[i] = right * cr - up * sr;
+            m[4 + i] = up * cr + right * sr;
+        }
+        if (boost) {
+            float dx = g_sliding ? g_slide_x : g_dash_x, dz = g_sliding ? g_slide_z : g_dash_z;
+            float along = dx * sy + dz * cy;             // 1 straight ahead, -1 straight back
+            if (along > 0.999f) g_fov_kick = 0.95f;
+            else if (along < -0.999f) g_fov_kick = 1.10f;
+        } else {
+            g_fov_kick = move_towards(g_fov_kick, 1.0f, fdt * 300.0f / 105.0f);
+        }
+    }
+    lens[0] = BASE_FOV * g_fov_scale * g_fov_kick;
     const float *p = (const float *)(pos + OFF_POS_X);
     m[12] = p[0] + sy * EYE_FORWARD;
     float drop_target = g_sliding ? SLIDE_EYE_DROP : 0.0f, k = dt > 0 && dt < 0.1f ? 1.0f - expf(-dt / 0.06f) : 1.0f;
@@ -1175,7 +1334,7 @@ static bool shoot(int behavior, const float *from = nullptr, const float *dir = 
 // (adding 1 to its power) or to the nearest enemy, with the coin's power (2) as damage against a plain
 // shot's 1. A coin shot in its flash (0.35 to 0.417 s old) or after 1 s goes to two targets. Coins last
 // 5 s; four charges, one refilled every 4 s (25 of 400 per second).
-struct Coin { bool alive, shot; float p[3], v[3], thrown_y; double born, reflect_at; int power, hit_times; };
+struct Coin { bool alive, shot, flashed; float p[3], v[3], thrown_y; double born, reflect_at; int power, hit_times; };
 enum { MAX_COINS = 8 };
 static Coin g_coins[MAX_COINS];
 static volatile int g_variation = 0;             // 0 Piercer, 1 Marksman
@@ -1194,6 +1353,12 @@ static void view_axes(float *right, float *up, float *fwd) {
     right[0] = cy; right[1] = 0; right[2] = -sy;
     up[0] = -sp * sy; up[1] = cp; up[2] = -sp * cy;
     fwd[0] = sy * cp; fwd[1] = sp; fwd[2] = cy * cp;
+    float roll = g_tilt_deg * 3.14159265f / 180.0f, cr = cosf(roll), sr = sinf(roll);
+    for (int i = 0; i < 3; i++) {
+        float r0 = right[i], u0 = up[i];
+        right[i] = r0 * cr - u0 * sr;
+        up[i] = u0 * cr + r0 * sr;
+    }
 }
 static bool eye_pos(float *eye) {
     uintptr_t pos = g_player_pos;
@@ -1219,6 +1384,7 @@ static void throw_coin() {
             c.v[i] = fwd[i] * COIN_FORWARD + (i == 1 ? COIN_UP : 0.0f) + pv[i];
         }
         InterlockedIncrement(&g_coins_thrown);
+        sound_play("coin_toss", 1.0f, 1.0f);
         return;
     }
 }
@@ -1249,12 +1415,38 @@ static void hit_coin(Coin &c, double t) {
     c.hit_times = (age >= 0.35f && age < 0.417f) || age >= 1.0f ? 2 : 1;
     c.v[0] = c.v[1] = c.v[2] = 0;                // it hangs where it was hit until the shot leaves it
     InterlockedIncrement(&g_coins_hit);
+    sound_play("coin_hit", 0.35f, 0.65f);
 }
+// ---- line of sight, through the game's own ray cast: bool hit(world wrapper, filter, from, to - from)
+// at exe+2B03E0. The game calls it exactly like this for its own sight checks, e.g. at exe+37B3AA with
+// the wrapper [[exe+1C74870]+0x28] and filter 0x26, which is what is passed here.
+// (v0.39 called exe+2A8ED0 instead, which turned out to cast inside a phantom, not the world, and
+// crashed the game on the first coin shot.)
+// Returns 1 if something is in the way, 0 if not, -1 if the cast is unavailable.
+static const uintptr_t RVA_RAYCAST = 0x2B03E0;
+static const uint8_t RAYCAST_BYTES[8] = {0x40, 0x53, 0x55, 0x56, 0x57, 0x41, 0x56, 0x48};
+static const int RAYCAST_FILTER = 0x26;
+static int ray_blocked(const float *a, const float *b) {
+    uintptr_t exe = (uintptr_t)GetModuleHandleA(nullptr);
+    if (memcmp((void *)(exe + RVA_RAYCAST), RAYCAST_BYTES, sizeof(RAYCAST_BYTES)) != 0) return -1;
+    uintptr_t phys = *(uintptr_t *)(exe + RVA_PHYS_WORLD);
+    uintptr_t wrapper = phys ? *(uintptr_t *)(phys + 0x28) : 0;
+    if (!wrapper) return -1;
+    float d[3] = {b[0] - a[0], b[1] - a[1], b[2] - a[2]};
+    float len = sqrtf(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+    if (len < 1.0f) return 0;
+    float keep = (len - 0.5f) / len;             // stop half a metre short, so the target itself is never what is hit
+    alignas(16) float from[4] = {a[0], a[1], a[2], 1.0f}, delta[4] = {d[0] * keep, d[1] * keep, d[2] * keep, 0.0f};
+    bool hit = ((bool (*)(uintptr_t, int, float *, float *))(exe + RVA_RAYCAST))(wrapper, RAYCAST_FILTER, from, delta);
+    return hit ? 1 : 0;
+}
+
 static uintptr_t g_watch_chr = 0;                // debug: the last ricochet's target, to log its health a second later
 static int g_watch_hp = 0;
 static double g_watch_at = 0;
 static void reflect_coin(Coin &c, double t) {
     c.alive = false;
+    sound_play("coin_hit", 0.35f, 0.65f);        // the reflected beam has the same ricochet sound
     Coin *next = nullptr;
     float best = COIN_RANGE * COIN_RANGE;
     for (Coin &o : g_coins) {
@@ -1270,11 +1462,31 @@ static void reflect_coin(Coin &c, double t) {
         InterlockedIncrement(&g_coin_chains);
         return;
     }
-    Target targets[2];
-    int n = find_targets(c.p, targets, c.hit_times > 1 ? 2 : 1, COIN_RANGE);
-    logf("coin shot: power %d, x%d, %d target(s) in range\n", c.power, c.hit_times, n);
-    if (!n) { InterlockedIncrement(&g_coin_misses); return; }
+    // V1's coin only goes for what it can see: the nearest enemies are tried in turn and those with
+    // something between the coin and them are passed over (v0.38 shot at the nearest one through walls).
+    Target cand[12], targets[2];
+    int in_range = find_targets(c.p, cand, 12, COIN_RANGE), n = 0, want = c.hit_times > 1 ? 2 : 1;
+    for (int i = 0; i < in_range && n < want; i++) {
+        if (ray_blocked(c.p, cand[i].p) == 1) {
+            logf("  not in sight: chr %p at %.1f m\n", (void *)cand[i].chr, cand[i].dist);
+            continue;
+        }
+        targets[n++] = cand[i];
+    }
+    logf("coin shot: power %d, x%d, %d in range, %d in sight\n", c.power, c.hit_times, in_range, n);
     int power = c.power > 5 ? 5 : c.power;
+    if (!n) {
+        // Coin.ReflectRevolver with nothing to aim at: the shot leaves in a random direction
+        float d[3], len;
+        do {
+            for (float &v : d) v = (float)rand() / RAND_MAX * 2.0f - 1.0f;
+            len = sqrtf(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+        } while (len < 0.1f || len > 1.0f);
+        for (float &v : d) v /= len;
+        shoot(BEHAVIOR_COIN + power - 2, c.p, d);
+        InterlockedIncrement(&g_coin_misses);
+        return;
+    }
     for (int i = 0; i < c.hit_times; i++) {
         const Target &tg = targets[i < n ? i : n - 1];   // one enemy and a split: both shots go to it
         if (tg.dist < 0.01f) continue;
@@ -1306,8 +1518,54 @@ static void update_coins(double t, float dt) {
         // V1's coins are removed once they come to rest. These pass through the floor, so one that has
         // dropped well below where it was thrown is taken as landed.
         if (t - c.born > COIN_LIFE || c.p[1] < c.thrown_y - COIN_MAX_DROP) { c.alive = false; continue; }
+        if (!c.flashed && t - c.born >= 0.35) {
+            c.flashed = true;
+            sound_play("coin_flash", 0.5f, 1.25f);
+        }
         c.v[1] -= COIN_GRAVITY * dt;
         for (int i = 0; i < 3; i++) c.p[i] += c.v[i] * dt;
+    }
+}
+
+// ---- the Feedbacker's punch, without the parry. Punch stamina holds 2 and refills at 1.25 per second;
+// a punch needs and costs 1, and sets a cooldown of 0.5 that runs down at 2 per second. It does the
+// damage of one revolver shot to what is within 4 u of the eye along the view, or within a 1 u sphere
+// swept that far. Here it is an unseen projectile with that reach and radius (row 9000130).
+static const int BEHAVIOR_PUNCH = 9000130;
+static const float PUNCH_REACH = 4.0f * UK_UNIT, PUNCH_RADIUS = 1.0f * UK_UNIT;
+static volatile float g_punch_stamina = 2.0f;
+static float g_fist_cooldown = 0;
+static volatile LONG g_punches = 0, g_punch_hits = 0;
+static bool g_prev_punch_key = false;
+static void update_punch(bool armed, float dt) {
+    g_punch_stamina = g_punch_stamina + 1.25f * dt > 2.0f ? 2.0f : g_punch_stamina + 1.25f * dt;
+    g_fist_cooldown = g_fist_cooldown - 2.0f * dt < 0 ? 0 : g_fist_cooldown - 2.0f * dt;
+    bool key = armed && key_down('F');
+    bool edge = key && !g_prev_punch_key;
+    g_prev_punch_key = key;
+    if (!edge || g_fist_cooldown > 0 || g_punch_stamina < 1.0f) return;
+    g_fist_cooldown = 0.5f;
+    g_punch_stamina -= 1.0f;
+    InterlockedIncrement(&g_punches);
+    sound_play("punch_swing", 0.5f, 1.0f);
+    if (!shoot(BEHAVIOR_PUNCH)) return;
+    // the hit sound, if a living enemy is inside the punch's reach (the game itself applies the damage)
+    float right[3], up[3], fwd[3], eye[3];
+    if (!eye_pos(eye)) return;
+    view_axes(right, up, fwd);
+    Target near_by[6];
+    int n = find_targets(eye, near_by, 6, PUNCH_REACH + 1.5f);
+    for (int i = 0; i < n; i++) {
+        float d[3] = {near_by[i].p[0] - eye[0], near_by[i].p[1] - eye[1], near_by[i].p[2] - eye[2]};
+        float along = d[0] * fwd[0] + d[1] * fwd[1] + d[2] * fwd[2];
+        if (along < 0 || along > PUNCH_REACH + 0.5f) continue;
+        float off2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2] - along * along;
+        float reach = PUNCH_RADIUS + 0.9f;       // the sweep's radius plus about half a body, as the aim point is its middle
+        if (off2 > reach * reach) continue;
+        sound_play("punch_hit", 0.6f, 1.0f);
+        InterlockedIncrement(&g_punch_hits);
+        logf("punch: hit chr %p hp %d at %.1f m\n", (void *)near_by[i].chr, near_by[i].hp, near_by[i].dist);
+        return;
     }
 }
 
@@ -1318,13 +1576,20 @@ static void try_instant_fire() {
     float dt = last > 0 && t - last < 0.1 ? (float)(t - last) : 0.0f;
     last = t;
     update_coins(t, dt);
-    if (!g_instant_fire || !g_ctrl) { g_pierce_charge = 0; g_prev_rmb = false; return; }
-    bool lmb = key_down(VK_LBUTTON) != 0, rmb = key_down(VK_RBUTTON) != 0;
+    if (!g_instant_fire || !g_ctrl) {
+        if (g_pierce_ready < 100.0f) g_pierce_ready = 100.0f;   // nothing refills, or ticks, outside first person
+        g_pierce_charge = 0;
+        g_prev_rmb = false;
+    }
+    bool armed = g_instant_fire && g_ctrl;
+    update_punch(armed, dt);
+    bool lmb = armed && key_down(VK_LBUTTON) != 0, rmb = armed && key_down(VK_RBUTTON) != 0;
     // E, or the revolver's own slot key 1, changes variation
-    bool variation_key = key_down('E') || key_down('1');
+    bool variation_key = armed && (key_down('E') || key_down('1'));
     if (variation_key && !g_prev_variation_key) {
         g_variation = g_variation == 0 ? 1 : 0;
         g_pierce_charge = 0;
+        sound_play("weapon_draw", 0.35f, 3.0f);
         Target all[16];
         float eye[3];
         int n = eye_pos(eye) ? find_targets(eye, all, 16, 500.0f, true) : 0;
@@ -1344,6 +1609,7 @@ static void try_instant_fire() {
     } else if (g_prev_rmb && g_pierce_charge >= 100.0f) {
         if (shoot(BEHAVIOR_PIERCER)) {
             InterlockedIncrement(&g_pierce_shots);
+            sound_play("shot_super", 0.5f, 1.0f);
             g_last_pierce_time = t;
             g_pierce_ready = 0;
             g_next_shot = t + FIRE_INTERVAL;
@@ -1353,13 +1619,38 @@ static void try_instant_fire() {
         g_pierce_charge = 0;   // released early: the charge is lost
     }
     g_prev_rmb = rmb;
+    {
+        // The charge's rising whine (pitch and volume follow the charge), the ticking while the
+        // Piercer's alt fire refills, and the beep when it is ready again.
+        static int charge_voice = 0, refill_voice = 0;
+        static bool was_refilling = false;
+        float charge = g_pierce_charge;
+        if (charge > 0) {
+            if (!charge_voice) charge_voice = sound_play("pierce_charge", 0.25f, 0.01f, true);
+            sound_set(charge_voice, 0.25f + charge * 0.005f, charge * 0.005f);
+        } else if (charge_voice) {
+            sound_stop(charge_voice);
+            charge_voice = 0;
+        }
+        bool refilling = g_variation == 0 && g_pierce_ready < 100.0f;
+        if (refilling && !refill_voice) refill_voice = sound_play("pierce_recharging", 0.25f, 1.0f, true, CH_SCREEN);
+        if (!refilling && refill_voice) {
+            sound_stop(refill_voice);
+            refill_voice = 0;
+        }
+        if (armed && was_refilling && g_pierce_ready >= 100.0f) sound_play("pierce_ready", 0.35f, frand(1.0f, 1.1f), false, CH_SCREEN);
+        was_refilling = g_pierce_ready < 100.0f;
+    }
 
     if (lmb && g_pierce_charge <= 0 && t >= g_next_shot) {
         g_next_shot = t + FIRE_INTERVAL;
+        const char *shot_sound = g_variation == 1 ? "shot_marksman" : "shot_piercer";
         if (Coin *c = coin_on_line()) {
+            sound_play(shot_sound, 0.55f, frand(0.9f, 1.1f), false, CH_GUN);
             hit_coin(*c, t);                     // the shot stops at the coin
             g_last_shot_time = t;
         } else if (shoot(BEHAVIOR_REVOLVER)) {
+            sound_play(shot_sound, 0.55f, frand(0.9f, 1.1f), false, CH_GUN);
             InterlockedIncrement(&g_instant_shots);
             g_last_shot_time = t;
         }
@@ -1479,6 +1770,7 @@ static bool draw_full_hud(IDXGISwapChain *sc) {
                 st.show_viewmodel = g_viewmodel;
                 st.variation = g_variation;
                 st.coin_charge = g_coin_charge;
+                st.punch_stamina = g_punch_stamina;
                 D3D11_TEXTURE2D_DESC bd;
                 back->GetDesc(&bd);
                 float right[3], up[3], fwd[3], eye[3];
@@ -1721,7 +2013,9 @@ static DWORD WINAPI mod_thread(LPVOID) {
     char *slash = strrchr(path, '\\');
     strcpy(slash ? slash + 1 : path, "ultrasouls.log");
     g_log = fopen(path, "w");
-    logf("ultrasouls v0.37 loaded\n");
+    logf("ultrasouls v0.48 loaded\n");
+    logf("settings: %s (sensitivity %.5f, fov scale %.1f, eye height %.2f, volume %.2f)\n", load_settings() ? "read from ultrasouls.ini" : "defaults, no ultrasouls.ini yet",
+         (float)g_sens, (float)g_fov_scale, (float)g_eye_height, (float)g_volume);
     // Patching the code at startup made the game exit before showing a window (v0.7), so the hook
     // goes in later, once a character is loaded.
     bool hooked = false, hook_tried = false;
@@ -1821,6 +2115,15 @@ static DWORD WINAPI mod_thread(LPVOID) {
             logf("projectile hook: %s\n", g_orig_bullet_init ? "installed" : "NOT installed (code mismatch)");
             logf("HUD (Present) hook: %s\n", hook_present() ? "installed" : "NOT installed");
             {
+                static wchar_t pack[MAX_PATH];
+                GetModuleFileNameW(nullptr, pack, MAX_PATH);
+                wchar_t *slash = wcsrchr(pack, L'\\');
+                wcscpy(slash ? slash + 1 : pack, L"ultrasouls_sounds.bin");
+                bool ok = sound_init(pack);
+                sound_master(g_volume);
+                logf("sounds: %s\n", ok ? "ready" : sound_error());
+            }
+            {
                 int handle = 0;
                 rd(player + 8, handle);
                 logf("player handle field reads %08X (expected 10044000)\n", handle);
@@ -1880,6 +2183,14 @@ static DWORD WINAPI mod_thread(LPVOID) {
             else { shot_pending = true; shot_seen_t = t; }
         }
         if (t - ammo_t > 0.25) { ammo_t = t; ammo_keep_full(); }
+        {
+            static bool kpgup = false;
+            if (pressed(VK_PRIOR, kpgup)) {
+                g_camera_tilt = !g_camera_tilt;
+                logf("camera tilt: %s\n", g_camera_tilt ? "on" : "off");
+                save_settings();
+            }
+        }
         if (pressed(VK_NEXT, kpgdn)) {
             g_hide_body = !g_hide_body;
             logf("hide the player's body in first person: %s (calls so far %ld)\n", g_hide_body ? "yes" : "no", (long)g_body_hides);
@@ -1896,24 +2207,56 @@ static DWORD WINAPI mod_thread(LPVOID) {
             g_instant_fire = !g_instant_fire;
             logf("revolver %s\n", g_instant_fire ? "on" : "off");
         }
-        if (pressed(VK_F9, k9)) { g_sens = g_sens * 0.8f; logf("mouse sensitivity %.5f\n", g_sens); }
-        if (pressed(VK_F10, k10)) { g_sens = g_sens * 1.25f; logf("mouse sensitivity %.5f\n", g_sens); }
+        {
+            // - and = : sound effects volume, with a beep to hear the new level
+            static bool kminus = false, kplus = false;
+            bool down = pressed(VK_OEM_MINUS, kminus), up = pressed(VK_OEM_PLUS, kplus);
+            if (down || up) {
+                float volume = g_volume + (up ? 0.05f : -0.05f);
+                g_volume = volume < 0 ? 0 : volume > 1 ? 1 : volume;
+                sound_master(g_volume);
+                sound_play("pierce_ready", 0.35f, 1.0f);
+                logf("sound volume %.2f\n", (float)g_volume);
+                save_settings();
+            }
+            // F12: save the last 30 s of what the mixer sent to the audio device, to study a bad-sounding moment
+            static bool kf12 = false;
+            if (pressed(VK_F12, kf12)) {
+                static wchar_t dump[MAX_PATH];
+                GetModuleFileNameW(nullptr, dump, MAX_PATH);
+                wchar_t *slash = wcsrchr(dump, L'\\');
+                wcscpy(slash ? slash + 1 : dump, L"ultrasouls_sound_dump.wav");
+                bool ok = sound_dump(dump);
+                logf("sound dump: %s\n", ok ? "written (ultrasouls_sound_dump.wav and .txt next to the exe)" : "failed");
+                if (ok) sound_play("pierce_ready", 0.35f, 1.5f);
+            }
+            static int logged_underruns = 0;
+            static double underrun_log_at = 0;
+            int u = sound_underruns();
+            if (u != logged_underruns && now_s() - underrun_log_at > 5.0) {
+                logf("sound: %d dropouts so far\n", u);
+                logged_underruns = u;
+                underrun_log_at = now_s();
+            }
+        }
+        if (pressed(VK_F9, k9)) { g_sens = g_sens * 0.8f; logf("mouse sensitivity %.5f\n", g_sens); save_settings(); }
+        if (pressed(VK_F10, k10)) { g_sens = g_sens * 1.25f; logf("mouse sensitivity %.5f\n", g_sens); save_settings(); }
         if (g_first_person && t - mouse_log > 5.0) {
             mouse_log = t;
             logf("mouse: DirectInput mouse reads %ld (state calls %ld, data calls %ld), raw input %ld, cursor moves %ld; yaw %.2f pitch %.2f; keys hidden from game %ld; projectiles %ld, player shots %ld, re-aimed %ld, revolver shots %ld, charged %ld, refused %ld; frames %ld, HUD draws %ld; steps %ld (second kind %ld)\n",
                  (long)g_di_events, (long)g_di_state_calls, (long)g_di_data_calls, (long)g_raw_events, (long)g_cur_events, g_yaw, g_pitch,
                  (long)g_keys_blocked, (long)g_bullets, (long)g_player_shots, (long)g_bullets_aimed, (long)g_instant_shots, (long)g_pierce_shots, (long)g_shoot_fails, (long)g_presents, (long)g_hud_draws, (long)g_steps, (long)g_steps_alt);
         }
-        if (pressed(VK_F1, k1)) { g_fov_scale = g_fov_scale - 0.1f; logf("fov scale %.1f\n", g_fov_scale); }
-        if (pressed(VK_F2, k2)) { g_fov_scale = g_fov_scale + 0.1f; logf("fov scale %.1f\n", g_fov_scale); }
+        if (pressed(VK_F1, k1)) { g_fov_scale = g_fov_scale - 0.1f; logf("fov scale %.1f\n", g_fov_scale); save_settings(); }
+        if (pressed(VK_F2, k2)) { g_fov_scale = g_fov_scale + 0.1f; logf("fov scale %.1f\n", g_fov_scale); save_settings(); }
         if (t - hook_check > 0.02) {
             hook_check = t;
             if (reapply_hooks())
                 logf("t=%.1f game reverted hooked code; re-applied (physics %d, camera %d reverts so far)\n", t - t_start,
                      g_hook_n > 0 ? g_hooks[0].reverts : 0, g_hook_n > 1 ? g_hooks[1].reverts : 0);
         }
-        if (pressed(VK_F3, k3)) { g_eye_height = g_eye_height - 0.05f; logf("eye height %.2f\n", g_eye_height); }
-        if (pressed(VK_F4, k4)) { g_eye_height = g_eye_height + 0.05f; logf("eye height %.2f\n", g_eye_height); }
+        if (pressed(VK_F3, k3)) { g_eye_height = g_eye_height - 0.05f; logf("eye height %.2f\n", g_eye_height); save_settings(); }
+        if (pressed(VK_F4, k4)) { g_eye_height = g_eye_height + 0.05f; logf("eye height %.2f\n", g_eye_height); save_settings(); }
         if (anim && speed_ok) wr(anim + OFF_ANIM_SPEED, speed_on ? speed : 1.0f);
 
         if (!pos) { air = 0; g_vjump = false; continue; }

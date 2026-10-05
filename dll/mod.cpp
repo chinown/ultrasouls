@@ -84,13 +84,13 @@ static const GUID GUID_SYS_KEYBOARD = {0x6F1D2B61, 0xD5A0, 0x11CF, {0xBF, 0xC7, 
 // bindings), so they are cleared from the keyboard state before it reaches the game. Our own controls
 // read the keys through GetAsyncKeyState, which this does not touch.
 static volatile bool g_block_keys = false, g_block_lmb = false;
-static const uint8_t BLOCKED_KEYS[] = {0x39, 0x2A, 0x36, 0x1D, 0x9D, 0x21, 0x22};   // DIK_SPACE, L/R SHIFT, L/R CONTROL, F, G
+static const uint8_t BLOCKED_KEYS[] = {0x39, 0x2A, 0x36, 0x1D, 0x9D, 0x21, 0x22, 0x2D};   // DIK_SPACE, L/R SHIFT, L/R CONTROL, F, G, X
 
 // The game has a second keyboard reader: a table of 236 virtual keys polled with GetAsyncKeyState
 // (exe+CA06A0), which is what its menus listen to. With only DirectInput filtered, G still opened the
 // gesture menu. Its import slot is pointed at a filter that reports the same keys as up.
 static const uintptr_t RVA_IAT_ASYNC_KEY = 0x2017C14;
-static const int BLOCKED_VKS[] = {VK_SPACE, VK_SHIFT, VK_LSHIFT, VK_RSHIFT, VK_CONTROL, VK_LCONTROL, VK_RCONTROL, 'F', 'G'};
+static const int BLOCKED_VKS[] = {VK_SPACE, VK_SHIFT, VK_LSHIFT, VK_RSHIFT, VK_CONTROL, VK_LCONTROL, VK_RCONTROL, 'F', 'G', 'X'};
 typedef SHORT (WINAPI *AsyncKeyFn)(int);
 static AsyncKeyFn g_orig_async_key = nullptr;
 
@@ -320,6 +320,12 @@ static volatile float g_freeze_request = 0;      // seconds; asked for by a parr
 // Two switches that only exist in ultrasouls.ini: parry_freeze=0 leaves a plain flash in place of the
 // freeze, hud_motion=0 is ULTRAKILL's "reduce HUD motion".
 static volatile bool g_parry_freeze = true, g_hud_motion = true;
+// Which of the revolver's three variations are held in their alternate ("Slab") form: one bit each
+// (1 Piercer, 2 Marksman, 4 Sharpshooter). X swaps the one in the hand; kept in ultrasouls.ini as slab=.
+static volatile int g_slab_mask = 0;
+// The railcannon's zoom: the field of view and the mouse's turn rate are both multiplied by this, which
+// goes to a half while its alt fire is held (CameraController.Zoom(defaultFov / 2), 300 degrees a second).
+static volatile float g_zoom = 1.0f;
 static double now_s() {
     return real_s() - g_frozen_s;
 }
@@ -372,6 +378,7 @@ static const float V1_SLAM_SPEED = 100.0f * UK_UNIT;                            
 static const float V1_BOOST_REGEN = 70.0f;                                              // stamina per second, 300 max, dash costs 100
 
 static float g_boost = 300.0f, g_dash_left = 0, g_dash_x = 0, g_dash_z = 0, g_slide_x = 0, g_slide_z = 0;
+static volatile bool g_fx_dash_pending = false;  // set where the dash starts (the physics step), used once a frame for its streaks
 static bool g_sliding = false, g_slamming = false, g_prev_shift = false, g_prev_ctrl = false;
 static volatile LONG g_dashes = 0, g_slides = 0, g_slams = 0;
 
@@ -677,6 +684,7 @@ static void step_common(void *self, void *step_info, void *gravity, StepFn orig)
                     g_dash_z = dir_z;
                     g_sliding = false;
                     g_slamming = false;
+                    g_fx_dash_pending = true;
                     InterlockedIncrement(&g_dashes);
                 }
                 if (ctrl_edge && g_air && !g_slamming && g_air_time >= V1_SLAM_MIN_AIR) {
@@ -1001,7 +1009,7 @@ static const uint8_t CAM_PROLOGUE[7] = {0x48, 0x8B, 0xC4, 0x55, 0x57, 0x41, 0x54
 typedef uint64_t (*CamFn)(void *self, float dt, void *a3, void *a4, uint64_t a5, uint64_t a6);
 static CamFn g_orig_cam = nullptr;
 static volatile bool g_first_person = false;
-static volatile float g_eye_height = 1.8f;
+static volatile float g_eye_height = 1.65f;       // Davi's setting
 static const float EYE_FORWARD = 0.2f;   // keeps the view out of the character's own head
 static volatile float g_cam_seen[16];    // the game's own matrix, before we move it
 static volatile float g_lens_seen[4];
@@ -1061,8 +1069,8 @@ static void save_settings() {
     settings_path(path);
     FILE *f = _wfopen(path, L"w");
     if (!f) return;
-    fprintf(f, "sensitivity=%.6f\nfov_scale=%.2f\neye_height=%.2f\nvolume=%.2f\ncamera_tilt=%d\nparry_freeze=%d\nhud_motion=%d\n", (float)g_sens,
-            (float)g_fov_scale, (float)g_eye_height, (float)g_volume, g_camera_tilt ? 1 : 0, g_parry_freeze ? 1 : 0, g_hud_motion ? 1 : 0);
+    fprintf(f, "sensitivity=%.6f\nfov_scale=%.2f\neye_height=%.2f\nvolume=%.2f\ncamera_tilt=%d\nparry_freeze=%d\nhud_motion=%d\nslab=%d\n", (float)g_sens,
+            (float)g_fov_scale, (float)g_eye_height, (float)g_volume, g_camera_tilt ? 1 : 0, g_parry_freeze ? 1 : 0, g_hud_motion ? 1 : 0, (int)g_slab_mask & 7);
     fclose(f);
 }
 static bool load_settings() {
@@ -1080,6 +1088,7 @@ static bool load_settings() {
         else if (!strcmp(key, "camera_tilt")) g_camera_tilt = v != 0.0f;
         else if (!strcmp(key, "parry_freeze")) g_parry_freeze = v != 0.0f;
         else if (!strcmp(key, "hud_motion")) g_hud_motion = v != 0.0f;
+        else if (!strcmp(key, "slab")) g_slab_mask = (int)v & 7;
     }
     fclose(f);
     return true;
@@ -1178,8 +1187,8 @@ static uint64_t hook_cam(void *self, float dt, void *a3, void *a4, uint64_t a5, 
 
     // The view direction is ours: the follow camera's own direction drifts when the character moves,
     // because it trails behind and looks at them.
-    g_yaw += (float)mx * g_sens;
-    g_pitch -= (float)my * g_sens;
+    g_yaw += (float)mx * g_sens * g_zoom;
+    g_pitch -= (float)my * g_sens * g_zoom;
     if (g_pitch > 1.5f) g_pitch = 1.5f;
     if (g_pitch < -1.5f) g_pitch = -1.5f;
     float sy = sinf(g_yaw), cy = cosf(g_yaw), sp = sinf(g_pitch), cp = cosf(g_pitch);
@@ -1217,7 +1226,7 @@ static uint64_t hook_cam(void *self, float dt, void *a3, void *a4, uint64_t a5, 
             g_fov_kick = move_towards(g_fov_kick, 1.0f, fdt * 300.0f / 105.0f);
         }
     }
-    lens[0] = BASE_FOV * g_fov_scale * g_fov_kick;
+    lens[0] = BASE_FOV * g_fov_scale * g_fov_kick * g_zoom;
     const float *p = (const float *)(pos + OFF_POS_X);
     m[12] = p[0] + sy * EYE_FORWARD;
     float drop_target = g_sliding ? SLIDE_EYE_DROP : 0.0f, k = dt > 0 && dt < 0.1f ? 1.0f - expf(-dt / 0.06f) : 1.0f;
@@ -1357,6 +1366,17 @@ static const uintptr_t RVA_BULLET_SHOOT = 0x429BA0;
 static const uint8_t BULLET_SHOOT_BYTES[8] = {0x48, 0x8B, 0xC4, 0x57, 0x48, 0x81, 0xEC, 0xA0};
 static const int PLAYER_HANDLE = 0x10044000;      // seen as the shooter in every recorded player shot
 static const int BEHAVIOR_REVOLVER = 9000100, BEHAVIOR_PIERCER = 9000110;
+// The alternate revolvers' plain, charged and Sharpshooter shots, and the two railcannons' beams (tools/patch_v1.py)
+static const int BEHAVIOR_SLAB = 9000160, BEHAVIOR_SLAB_CHARGED = 9000161, BEHAVIOR_SLAB_SHARP = 9000162;
+static const int BEHAVIOR_RAIL = 9000170, BEHAVIOR_RAIL_MALICIOUS = 9000171;
+enum { EXPLODE_PLAIN = 0, EXPLODE_SUPER = 1, EXPLODE_PUMP = 2, EXPLODE_MALICIOUS = 3 };
+static void explode(const float *p, int kind);
+// The alternate revolver (Revolver with altVersion): it is ready again when its Shoot clip's ReadyGun
+// event comes, 1.19 s after the shot, and the clip's Click event at 0.89 s is the hammer coming back.
+// Put away before that Click and drawn again within 2 s, it comes out with the slow PickUpWithReload
+// (ready after 1.15 s) instead of PickUp (0.33 s): WeaponCharges.revaltpickupcharges.
+static const double SLAB_READY = 1.19, SLAB_CLICK = 0.89;
+static double g_slab_slow_until[3] = {0, 0, 0}, g_slab_click_at = -1;
 // Revolver.Update: shootCharge refills at 200/s (0.5 s between shots); the alt fire charges at 175/s
 // while held and fires on release at full charge, then pierceCharge refills at 40/s (2.5 s).
 static const double FIRE_INTERVAL = 0.5;
@@ -1384,15 +1404,18 @@ static void play_revolver(const char *clip) {
     g_rev_clip_start = now_s();
     g_rev_clip = clip;
 }
+static const char *volatile g_arm2_clip = nullptr;          // the Knuckleblaster: Punch, PunchBlast
+// V1 has one left arm: whichever arm starts a clip, the other one's is dropped, so only one is ever in view.
 static void play_arm(const char *clip, double already_in = 0.0) {
     g_arm_clip_start = now_s() - already_in;
     g_arm_clip = clip;
+    g_arm2_clip = nullptr;
 }
-static const char *volatile g_arm2_clip = nullptr;          // the Knuckleblaster: Punch, Hook, PunchBlast
 static volatile double g_arm2_clip_start = -100.0;
 static void play_arm2(const char *clip, double already_in = 0.0) {
     g_arm2_clip_start = now_s() - already_in;
     g_arm2_clip = clip;
+    g_arm_clip = nullptr;
 }
 static void play_revolver_shot() {
     static const char *const shots[3] = {"Shoot", "Shoot2", "Shoot3"};
@@ -1472,19 +1495,143 @@ static bool shoot(int behavior, const float *from = nullptr, const float *dir = 
 // ---- tracers. The shots themselves are the game's projectiles, which are hard to see; each shot also
 // gets a line the mod draws itself, from the muzzle (or the coin) to where the game's own ray cast says the
 // shot's line ends. Lengths are real; the widths, colours and lifetimes are ours.
-struct Tracer { float a[3], b[3]; double born; float life, width, r, g, bl; };
+// shrink: thins to nothing instead of fading. seen: which eighths of the line were in plain sight of
+// the eye when it was made, one bit each, so a ricochet that runs behind a wall is not drawn through it.
+struct Tracer { float a[3], b[3]; double born; float life, width, r, g, bl; bool shrink; uint8_t seen; };
+static int ray_blocked(const float *a, const float *b);
+static bool eye_pos(float *eye);
+// Whether the eye has a clear line to a point (the game's own sight ray; within a metre it always has).
+static bool in_sight(const float *p) {
+    float eye[3];
+    return !eye_pos(eye) || ray_blocked(eye, p) != 1;
+}
 enum { MAX_TRACERS = 24 };
 static Tracer g_tracers[MAX_TRACERS];
 static int g_tracer_next = 0;
 static const float TRACER_WHITE[3] = {1.0f, 0.95f, 0.7f}, TRACER_BLUE[3] = {0.2f, 0.8f, 1.0f}, TRACER_GOLD[3] = {1.0f, 0.8f, 0.2f};
-static void add_tracer(const float *a, const float *b, float life, float width, const float *rgb) {
+// `check`: off for a line known to be in sight from end to end (a shot from the gun to where the view ends).
+static void add_tracer(const float *a, const float *b, float life, float width, const float *rgb, bool shrink = false, bool check = true) {
     Tracer &t = g_tracers[g_tracer_next++ % MAX_TRACERS];
     memcpy(t.a, a, sizeof(t.a));
     memcpy(t.b, b, sizeof(t.b));
+    t.seen = 0xFF;
+    if (check) {
+        t.seen = 0;
+        for (int k = 0; k < 8; k++) {
+            float f = (k + 0.5f) / 8.0f, mid[3] = {a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f, a[2] + (b[2] - a[2]) * f};
+            if (in_sight(mid)) t.seen |= (uint8_t)(1 << k);
+        }
+    }
     t.born = now_s();
     t.life = life;
     t.width = width;
     t.r = rgb[0]; t.g = rgb[1]; t.bl = rgb[2];
+    t.shrink = shrink;
+}
+// The revolver's beam (the "Revolver Beam" prefab): a white line 0.25 u wide whose width runs down at 1.5
+// a second, so it is gone in a sixth of a second.
+static const float BEAM_WHITE[3] = {1.0f, 1.0f, 1.0f};
+static const float BEAM_WIDTH = 0.25f * UK_UNIT, BEAM_LIFE = 0.25f / 1.5f;
+
+// ---- ULTRAKILL's particle effects, each with the numbers its prefab carries (read with tools/uk_dump.py):
+//   LaserHitParticle  where a revolver shot lands: 60 of the "blooddrop" picture thrown out over the half
+//                     of space the surface faces, 1 to 50 u/s, 0.5 s, 0.25 u across, twice gravity
+//   BulletSpark       where a pellet lands: 5 of the "spark" picture in a 45 degree cone, 1 to 10 u/s,
+//                     0.5 s, 0.25 u, gravity
+//   the explosion's sparks: 30 to 50 plain white squares, 200 u/s for 0.175 s, 0.5 to 2 u (drawn smaller)
+//   DodgeParticle     a dash: 20 faint streaks that start 10 u ahead and fly back past the player at 30 to
+//                     50 u/s for 0.5 s (SlideParticle is the same kind, 20 a second at 40 u/s)
+// Gravity is ULTRAKILL's 40 u/s^2.
+struct Particle { bool alive, streak, hidden; float p[3], v[3]; double born; float life, size, gravity; const char *sprite; float r, g, b, a; };   // hidden: behind something, as of its last check
+enum { MAX_PARTICLES = 420 };
+static Particle g_particles[MAX_PARTICLES];
+static int g_particle_next = 0;
+static const float UK_GRAVITY = 40.0f * UK_UNIT;
+static Particle &new_particle(const float *at, const float *vel, float life, float size, float gravity, const char *sprite) {
+    Particle &p = g_particles[g_particle_next++ % MAX_PARTICLES];   // when all are in use the oldest goes
+    p = Particle{};
+    p.alive = true;
+    memcpy(p.p, at, sizeof(p.p));
+    memcpy(p.v, vel, sizeof(p.v));
+    p.born = now_s();
+    p.life = life;
+    p.size = size;
+    p.gravity = gravity;
+    p.sprite = sprite;
+    p.r = p.g = p.b = p.a = 1.0f;
+    return p;
+}
+static void rand_unit(float *d) {
+    float len;
+    do {
+        for (int i = 0; i < 3; i++) d[i] = frand(-1.0f, 1.0f);
+        len = sqrtf(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+    } while (len < 0.1f || len > 1.0f);
+    for (int i = 0; i < 3; i++) d[i] /= len;
+}
+static void fx_beam_hit(const float *at, const float *normal) {
+    if (!in_sight(at)) return;
+    for (int k = 0; k < 60; k++) {
+        float d[3], v[3], speed = frand(1.0f, 50.0f) * UK_UNIT;
+        rand_unit(d);
+        if (d[0] * normal[0] + d[1] * normal[1] + d[2] * normal[2] < 0)
+            for (float &x : d) x = -x;
+        for (int i = 0; i < 3; i++) v[i] = d[i] * speed;
+        new_particle(at, v, 0.5f, 0.25f * UK_UNIT, 2.0f * UK_GRAVITY, "blooddrop");
+    }
+}
+static void fx_pellet_hit(const float *at, const float *normal) {
+    if (!in_sight(at)) return;
+    for (int k = 0; k < 5; k++) {
+        float d[3], v[3], speed = frand(1.0f, 10.0f) * UK_UNIT, len = 0;
+        rand_unit(d);
+        for (int i = 0; i < 3; i++) {                 // within 45 degrees of the surface's own direction
+            d[i] = normal[i] + d[i] * frand(0.0f, 1.0f);
+            len += d[i] * d[i];
+        }
+        len = len > 1e-6f ? sqrtf(len) : 1.0f;
+        for (int i = 0; i < 3; i++) v[i] = d[i] / len * speed;
+        new_particle(at, v, 0.5f, 0.25f * UK_UNIT, UK_GRAVITY, "spark");
+    }
+}
+static void fx_explosion_sparks(const float *at) {
+    if (!in_sight(at)) return;
+    int count = 30 + rand() % 21;
+    for (int k = 0; k < count; k++) {
+        float d[3], v[3];
+        rand_unit(d);
+        for (int i = 0; i < 3; i++) v[i] = d[i] * 200.0f * UK_UNIT;
+        new_particle(at, v, 0.175f, frand(0.5f, 2.0f) * UK_UNIT * 0.4f, 0.0f, nullptr);   // ours: 0.4 of the prefab's size
+    }
+}
+// `dir` is the way the player is going; the streaks come the other way, out of a box `half` across ahead.
+static void fx_wind(const float *middle, const float *dir, int count, float speed_lo, float speed_hi, float half_wide, float half_tall) {
+    float side[3] = {dir[2], 0, -dir[0]};
+    for (int k = 0; k < count; k++) {
+        float at[3], v[3], a = frand(-half_wide, half_wide), b = frand(-half_tall, half_tall), c = frand(-half_wide, half_wide), speed = frand(speed_lo, speed_hi) * UK_UNIT;
+        for (int i = 0; i < 3; i++) {
+            at[i] = middle[i] + dir[i] * (10.0f * UK_UNIT + c) + side[i] * a + (i == 1 ? b : 0.0f);
+            v[i] = -dir[i] * speed;
+        }
+        Particle &p = new_particle(at, v, 0.5f, 0.2f * UK_UNIT, 0.0f, nullptr);
+        p.streak = true;
+        p.r = p.g = p.b = 0.85f;
+        p.a = 0.3f;                                   // the trail's additive grey, a quarter strength
+    }
+}
+static void update_particles(double t, float dt) {
+    for (Particle &p : g_particles) {
+        if (!p.alive) continue;
+        if (t - p.born > p.life) { p.alive = false; continue; }
+        p.v[1] -= p.gravity * dt;
+        for (int i = 0; i < 3; i++) p.p[i] += p.v[i] * dt;
+    }
+    // Sight is checked for 48 particles a frame, in turn, so each one's answer is at most a few frames old.
+    static int cursor = 0;
+    for (int k = 0; k < 48; k++) {
+        Particle &p = g_particles[cursor++ % MAX_PARTICLES];
+        if (p.alive) p.hidden = !in_sight(p.p);
+    }
 }
 
 // ---- the weapon's walking bob (WalkingBob, which sits on ULTRAKILL's "Guns" object): while walking the
@@ -1814,12 +1961,31 @@ static void watch_enemies(double t, float dt) {
 // (adding 1 to its power) or to the nearest enemy, with the coin's power (2) as damage against a plain
 // shot's 1. A coin shot in its flash (0.35 to 0.417 s old) or after 1 s goes to two targets. Coins last
 // 5 s; four charges, one refilled every 4 s (25 of 400 per second).
-struct Coin { bool alive, shot, flashed, charged; float p[3], v[3], thrown_y; double born, reflect_at; int power, hit_times; };
+// hidden: out of the eye's sight this frame. trail: where it was at the last few twenty-fourths of a second
+// (the coin's TrailRenderer keeps half a second of its path).
+enum { COIN_TRAIL = 12 };
+struct Coin {
+    bool alive, shot, flashed, charged, hidden;
+    float p[3], v[3], thrown_y;
+    double born, reflect_at;
+    int power, hit_times;
+    int carry;                                   // the row of the beam that hit it, when the coin passes that beam on (0: its own)
+    float trail[COIN_TRAIL][3];
+    int trail_n;
+    double trail_at;
+};
 enum { MAX_COINS = 8 };
 static Coin g_coins[MAX_COINS];
 static volatile int g_variation = 1;             // the revolver's: 0 Piercer, 1 Marksman, 2 Sharpshooter
-enum { WEAPON_REVOLVER = 0, WEAPON_SHOTGUN = 1 };
+enum { WEAPON_REVOLVER = 0, WEAPON_SHOTGUN = 1, WEAPON_RAILCANNON = 2 };
 static volatile int g_weapon = WEAPON_REVOLVER;
+static volatile int g_shotgun_var = 0;           // 0 Core Eject, 1 Pump Charge
+static volatile int g_rail_var = 0;              // 0 Electric, 1 Malicious
+static bool slab_held() { return g_weapon == WEAPON_REVOLVER && ((g_slab_mask >> g_variation) & 1); }
+static void slab_fired(double t) {
+    g_slab_slow_until[g_variation] = t + 2.0;
+    g_slab_click_at = t + SLAB_CLICK;
+}
 static volatile float g_coin_charge = 400.0f;
 static volatile LONG g_coins_thrown = 0, g_coins_hit = 0, g_coin_chains = 0, g_coin_shots = 0, g_coin_misses = 0;
 static const int BEHAVIOR_COIN = 9000120;        // + (power - 2), up to power 5
@@ -1845,7 +2011,12 @@ static bool eye_pos(float *eye) {
     uintptr_t pos = g_player_pos;
     if (!pos) return false;
     const float *p = (const float *)(pos + OFF_POS_X);
-    eye[0] = p[0]; eye[1] = p[1] + g_eye_height - g_eye_drop; eye[2] = p[2];
+    // The camera sits EYE_FORWARD ahead of the character's middle, level (the camera hook puts it there).
+    // Until v0.64 this left that out, so everything measured or drawn from "the eye" (a tossed coin's
+    // start, tracers, effects) was worked out from a point 0.2 m behind the real view.
+    eye[0] = p[0] + sinf(g_yaw) * EYE_FORWARD;
+    eye[1] = p[1] + g_eye_height - g_eye_drop;
+    eye[2] = p[2] + cosf(g_yaw) * EYE_FORWARD;
     return true;
 }
 static void throw_coin() {
@@ -1965,6 +2136,8 @@ static bool ray_cast(const float *a, const float *b, RayHit &out) {
     return true;
 }
 
+struct Coin;
+static bool coin_hits_core(const Coin &c);
 static uintptr_t g_watch_chr = 0;                // debug: the last ricochet's target, to log its health a second later
 static int g_watch_hp = 0;
 static double g_watch_at = 0;
@@ -1983,11 +2156,13 @@ static void reflect_coin(Coin &c, double t) {
         logf("coin shot: power %d passed on to another coin\n", c.power);
         next->power = c.power + 1;
         next->charged = c.charged;
+        next->carry = c.carry;
         add_tracer(c.p, next->p, 0.3f, 0.05f, TRACER_GOLD);
         if (c.hit_times > next->hit_times) next->hit_times = c.hit_times;
         InterlockedIncrement(&g_coin_chains);
         return;
     }
+    if (coin_hits_core(c)) return;
     // V1's coin only goes for what it can see: the nearest enemies are tried in turn and those with
     // something between the coin and them are passed over (v0.38 shot at the nearest one through walls).
     Target cand[12], targets[2];
@@ -2024,7 +2199,8 @@ static void reflect_coin(Coin &c, double t) {
         if (tg.dist < 0.01f) continue;
         float dir[3] = {(tg.p[0] - c.p[0]) / tg.dist, (tg.p[1] - c.p[1]) / tg.dist, (tg.p[2] - c.p[2]) / tg.dist};
         // a coin hit by the Piercer's charged shot sends that shot on: the piercing row instead of the coin's
-        bool ok = shoot(c.charged ? BEHAVIOR_PIERCER : BEHAVIOR_COIN + power - 2, c.p, dir);
+        bool ok = shoot(c.carry ? c.carry : c.charged ? BEHAVIOR_PIERCER : BEHAVIOR_COIN + power - 2, c.p, dir);
+        if (c.carry == BEHAVIOR_RAIL_MALICIOUS) explode(tg.p, EXPLODE_MALICIOUS);   // the Malicious beam goes off where the coin sends it
         add_tracer(c.p, tg.p, 0.3f, c.charged ? 0.10f : 0.06f, c.charged ? TRACER_BLUE : TRACER_GOLD);
         if (ok) InterlockedIncrement(&g_coin_shots);
         logf("  ricochet from (%.1f %.1f %.1f) to chr %p team %d hp %d at (%.1f %.1f %.1f), %.1f m: %s\n", c.p[0], c.p[1], c.p[2],
@@ -2036,6 +2212,14 @@ static void reflect_coin(Coin &c, double t) {
             // Coin.RicoshotPointsCheck: 50, plus 15 per coin when more than one was chained
             int coins = c.power - 1;
             style_add(50 + (coins > 1 ? coins * 15 : 0), "RICOSHOT", STYLE_CYAN, coins);
+            // Coin.ReflectRevolver: a ricochet that breaks an enemy's attack is an INTERRUPTION, 100 points
+            // and the parry's flash. ULTRAKILL has that for attacks with a breakable weak point; here it
+            // is any enemy caught in the middle of an attack animation.
+            int anim = -1;
+            if (enemy_attacking(tg.chr, anim)) {
+                style_add(100, "INTERRUPTION", STYLE_GREEN);
+                g_freeze_request = 0.25f;
+            }
             note_attack(HIT_COIN);
         }
     }
@@ -2063,7 +2247,19 @@ static void update_coins(double t, float dt) {
             sound_play("coin_flash", 0.5f, 1.25f);
         }
         c.v[1] -= COIN_GRAVITY * dt;
-        for (int i = 0; i < 3; i++) c.p[i] += c.v[i] * dt;
+        float next[3] = {c.p[0] + c.v[0] * dt, c.p[1] + c.v[1] * dt, c.p[2] + c.v[2] * dt};
+        // A coin that meets a floor or wall is spent, as one that comes to rest is in ULTRAKILL. (Until
+        // v0.63 coins passed through the world and could be seen falling on under the floor.)
+        RayHit h;
+        if (t - c.born > 0.05 && ray_cast(c.p, next, h) && h.hit) { c.alive = false; continue; }
+        memcpy(c.p, next, sizeof(next));
+        c.hidden = !in_sight(c.p);
+        if (t >= c.trail_at) {
+            c.trail_at = t + 0.5 / COIN_TRAIL;
+            memmove(c.trail[1], c.trail[0], sizeof(float) * 3 * (COIN_TRAIL - 1));
+            memcpy(c.trail[0], c.p, sizeof(c.p));
+            if (c.trail_n < COIN_TRAIL) c.trail_n++;
+        }
     }
 }
 
@@ -2080,6 +2276,10 @@ static const float PUNCH_REACH = 4.0f * UK_UNIT, PUNCH_RADIUS = 1.0f * UK_UNIT;
 static const double BLAST_CHECK_AT = 0.42;       // the "BlastCheck" event of the arm's Punch clip
 static volatile float g_punch_stamina = 2.0f;
 static volatile int g_last_arm = 0;              // 0 Feedbacker, 1 Knuckleblaster: which one the fist icon shows
+// When the arm in use can punch again: its clip's ReadyToPunch event (Jab 0.33 s, the Knuckleblaster's
+// Punch 0.75 s, PunchBlast 1.39 s). Neither arm can start a punch before then, so the two cannot be
+// thrown together.
+static double g_punch_ready_at = 0;
 static float g_fist_cooldown = 0;
 static volatile LONG g_punches = 0, g_punch_hits = 0, g_parries = 0, g_blasts = 0;
 static bool g_prev_punch_key = false, g_prev_knuckle_key = false;
@@ -2134,6 +2334,7 @@ static void do_parry(const Target &tg, int anim) {
     g_boost = 300.0f;
     g_punch_stamina = 2.0f;
     g_freeze_request = 0.25f;
+    sound_play("punch_projectile", 0.6f, 1.0f);  // Punch's "specialHit", which every parry sets off beside the parry light's ring
     sound_play("coin_hit", 0.6f, 1.0f);
     logf("parry: chr %p hp %d was in attack animation %d\n", (void *)tg.chr, tg.hp, anim);
 }
@@ -2166,23 +2367,34 @@ static void timed_sounds_update(double t) {
 // projectile (rows 9000142 and 9000143) sent straight up from the spot, which the game hits everything
 // in its radius with. The fireball that is drawn is ours.
 static const int BEHAVIOR_PELLET = 9000140, BEHAVIOR_SHOTGUN_PARRY = 9000141, BEHAVIOR_EXPLOSION = 9000142, BEHAVIOR_EXPLOSION_SUPER = 9000143;
+static const int BEHAVIOR_EXPLOSION_PUMP = 9000144, BEHAVIOR_EXPLOSION_MALICIOUS = 9000172;
 static const int BEHAVIOR_SHARP = 9000150;
 static const float EXPLOSION_RADIUS = 6.0f * UK_UNIT, EXPLOSION_SUPER_RADIUS = 12.0f * UK_UNIT;
-struct BlastFx { float p[3], radius; double born; bool wave; };   // wave: the Knuckleblaster's, a ring with little fire
+struct BlastFx { float p[3], radius; double born; bool wave, hidden; };   // wave: the Knuckleblaster's, a ring with little fire
 enum { MAX_BLAST_FX = 6 };
 static BlastFx g_blast_fx[MAX_BLAST_FX];
 static int g_blast_fx_next = 0;
 static volatile LONG g_explosions = 0;
-static void explode(const float *p, bool super) {
+// kind: the plain one, the "super" one (a core shot in the air), the Pump Charge shotgun going off in the
+// hand after three pumps (the plain one half again as large, damage 50 against 35), and the Malicious
+// Railcannon's (13.5 u).
+static void explode(const float *p, int kind) {
+    static const int rows[4] = {BEHAVIOR_EXPLOSION, BEHAVIOR_EXPLOSION_SUPER, BEHAVIOR_EXPLOSION_PUMP, BEHAVIOR_EXPLOSION_MALICIOUS};
+    static const float radii[4] = {EXPLOSION_RADIUS, EXPLOSION_SUPER_RADIUS, EXPLOSION_RADIUS * 1.5f, 13.5f * UK_UNIT};
+    if (kind < 0 || kind > 3) kind = 0;
+    bool super = kind == EXPLODE_SUPER || kind == EXPLODE_MALICIOUS;
     const float up[3] = {0, 1, 0};
-    bool ok = shoot(super ? BEHAVIOR_EXPLOSION_SUPER : BEHAVIOR_EXPLOSION, p, up);
+    bool ok = shoot(rows[kind], p, up);
     note_attack(HIT_EXPLOSION);
     InterlockedIncrement(&g_explosions);
     BlastFx &b = g_blast_fx[g_blast_fx_next++ % MAX_BLAST_FX];
     memcpy(b.p, p, sizeof(b.p));
-    b.radius = super ? EXPLOSION_SUPER_RADIUS : EXPLOSION_RADIUS;
+    b.radius = radii[kind];
     b.born = now_s();
     b.wave = false;
+    b.hidden = false;
+    if (kind == EXPLODE_SUPER) g_freeze_request = 0.25f;         // RevolverBeam: a beam that reaches a grenade calls ParryFlash
+    fx_explosion_sparks(p);
     float eye[3], d = 0;
     if (eye_pos(eye)) d = sqrtf((p[0] - eye[0]) * (p[0] - eye[0]) + (p[1] - eye[1]) * (p[1] - eye[1]) + (p[2] - eye[2]) * (p[2] - eye[2]));
     float vol = 1.0f - d / (75.0f * UK_UNIT);    // the explosion's sound reaches 75 u
@@ -2222,10 +2434,10 @@ static const double SHOTGUN_READY = 1.33, SHOTGUN_CLICK = 1.16, CORE_READY = 3.0
 static const double SHOTGUN_EQUIP_READY = 0.44, REVOLVER_PICKUP_READY = 0.36;
 static const double BOOST_WINDOW = 0.15;         // ours: how long after the shot a punch still catches a pellet
 static const float CORE_GRAVITY = 40.0f * UK_UNIT, CORE_HIT_RADIUS = 0.5f, CORE_LIFE = 10.0f;
-struct Pellet { bool alive, boosted; float p[3], v[3], end[3]; double die_at; };
+struct Pellet { bool alive, boosted, lands; float p[3], v[3], end[3], normal[3]; double die_at; };   // lands: its line ends on a surface
 enum { MAX_PELLETS = 48 };
 static Pellet g_pellets[MAX_PELLETS];
-struct Core { bool alive; float p[3], v[3]; double born; };
+struct Core { bool alive, hidden; float p[3], v[3]; double born; };
 enum { MAX_CORES = 4 };
 static Core g_cores[MAX_CORES];
 static double g_shotgun_ready_at = 0, g_cores_ready_at = 0, g_last_shotgun_shot = -100.0, g_last_core = -100.0, g_last_feedbacker = -100.0;
@@ -2233,6 +2445,12 @@ static bool g_shot_boosted = true;               // one boost per shot
 static volatile float g_core_force = 0;          // 0..60 while the alt fire is held
 static bool g_core_charging = false;
 static volatile LONG g_shotgun_shots = 0, g_cores_thrown = 0, g_boosts = 0, g_shotgun_parries = 0;
+static volatile int g_pump_charge = 0;           // the Pump Charge shotgun: 0..3 pumps
+static double g_pump_beep_at = -100.0;           // when its warning last beeped
+static volatile float g_rail_charge = 5.0f;      // the railcannon: 0..5, full at 5
+static double g_rail_ready_at = 0;
+static volatile LONG g_rail_shots = 0, g_pumps = 0;
+static bool g_prev_lmb = false;
 static volatile double g_muzzle_flash = -100.0;
 
 static void spawn_pellet(const float *from, const float *dir, float speed, float range, bool boosted) {
@@ -2249,7 +2467,11 @@ static void spawn_pellet(const float *from, const float *dir, float speed, float
         // it flies until the first surface on its line
         RayHit h;
         float reach = ray_cast(from, far_end, h) && h.hit ? h.dist : range;
-        for (int i = 0; i < 3; i++) pl.end[i] = from[i] + dir[i] * (reach > 0.2f ? reach - 0.2f : 0.0f);
+        pl.lands = h.hit;
+        for (int i = 0; i < 3; i++) {
+            pl.end[i] = from[i] + dir[i] * (reach > 0.2f ? reach - 0.2f : 0.0f);
+            pl.normal[i] = h.hit ? h.normal[i] : -dir[i];
+        }
         pl.die_at = now_s() + reach / speed;
         return;
     }
@@ -2267,6 +2489,7 @@ static void update_pellets(double t, float dt) {
         }
         if (t >= pl.die_at) {
             if (pl.boosted) explode(pl.end, false);
+            else if (pl.lands) fx_pellet_hit(pl.end, pl.normal);
             pl.alive = false;
             continue;
         }
@@ -2326,8 +2549,37 @@ static void update_cores(double t, float dt) {
             continue;
         }
         memcpy(c.p, next, sizeof(next));
+        c.hidden = !in_sight(c.p);
+    }
+    // explosions: in sight if the eye can see the middle or the top of the ball
+    for (BlastFx &b : g_blast_fx) {
+        if (b.radius <= 0 || t - b.born > 1.2) continue;
+        float top[3] = {b.p[0], b.p[1] + b.radius, b.p[2]};
+        b.hidden = !in_sight(b.p) && !in_sight(top);
     }
 }
+// A shot coming off a coin goes for a core in the air before it goes for an enemy (the coin's own order
+// in ULTRAKILL: other coins, then grenades, then enemies), and sets it off as the larger explosion.
+static bool coin_hits_core(const Coin &c) {
+    Core *best = nullptr;
+    float best_d2 = COIN_RANGE * COIN_RANGE;
+    for (Core &k : g_cores) {
+        if (!k.alive) continue;
+        float dx = k.p[0] - c.p[0], dy = k.p[1] - c.p[1], dz = k.p[2] - c.p[2], d2 = dx * dx + dy * dy + dz * dz;
+        if (d2 >= best_d2 || ray_blocked(c.p, k.p) == 1) continue;
+        best = &k;
+        best_d2 = d2;
+    }
+    if (!best) return false;
+    add_tracer(c.p, best->p, 0.3f, 0.06f, TRACER_GOLD);
+    logf("coin shot: power %d into a core %.1f m from the coin\n", c.power, sqrtf(best_d2));
+    int coins = c.power - 1;
+    style_add(50 + (coins > 1 ? coins * 15 : 0), "RICOSHOT", STYLE_CYAN, coins);
+    explode(best->p, true);
+    best->alive = false;
+    return true;
+}
+
 // Punch.ParryProjectile on one of the player's own pellets.
 static void boost_pellet(double t) {
     float right[3], up[3], fwd[3], eye[3];
@@ -2349,10 +2601,27 @@ static void fire_shotgun(double t) {
     if (!eye_pos(eye)) return;
     view_axes(right, up, fwd);
     float start[3] = {eye[0] + fwd[0] * 0.6f, eye[1] + fwd[1] * 0.6f, eye[2] + fwd[2] * 0.6f};
-    int sent = 0;
-    for (int i = 0; i < SHOTGUN_PELLETS; i++) {
+    // Shotgun.Shoot, variation 1: the Pump Charge sends 10 pellets in two thirds of the spread unpumped, 16
+    // in the full spread after one pump and 24 in twice the spread after two. After three there are no
+    // pellets: the gun goes off as an explosion one unit ahead (or just short of a wall nearer than that).
+    bool pump = g_shotgun_var == 1;
+    int charge = pump ? (int)g_pump_charge : -1, pellets = SHOTGUN_PELLETS, sent = 0;
+    float spread = SHOTGUN_SPREAD, pitch = frand(0.95f, 1.05f);
+    if (charge == 0) { pellets = 10; spread = SHOTGUN_SPREAD / 1.5f; pitch = frand(1.15f, 1.25f); }
+    else if (charge == 1) pellets = 16;
+    else if (charge == 2) { pellets = 24; spread = SHOTGUN_SPREAD * 2.0f; pitch = frand(0.75f, 0.85f); }
+    else if (charge >= 3) { pellets = 0; pitch = frand(0.75f, 0.85f); }
+    if (charge >= 3) {
+        float ahead[3], at[3];
+        for (int i = 0; i < 3; i++) ahead[i] = eye[i] + fwd[i] * UK_UNIT;
+        RayHit h;
+        float reach = ray_cast(eye, ahead, h) && h.hit ? fmaxf(h.dist - 0.1f * UK_UNIT, 0.0f) : UK_UNIT;
+        for (int i = 0; i < 3; i++) at[i] = eye[i] + fwd[i] * reach;
+        explode(at, EXPLODE_PUMP);
+    }
+    for (int i = 0; i < pellets; i++) {
         // transform.Rotate(x, y, z) with each angle random within the spread: a pitch, then a yaw
-        float rx = frand(-SHOTGUN_SPREAD, SHOTGUN_SPREAD), ry = frand(-SHOTGUN_SPREAD, SHOTGUN_SPREAD);
+        float rx = frand(-spread, spread), ry = frand(-spread, spread);
         float lx = sinf(ry) * cosf(rx), ly = -sinf(rx), lz = cosf(ry) * cosf(rx), d[3];
         for (int k = 0; k < 3; k++) d[k] = right[k] * lx + up[k] * ly + fwd[k] * lz;
         if (shoot(BEHAVIOR_PELLET, start, d)) sent++;
@@ -2369,16 +2638,27 @@ static void fire_shotgun(double t) {
         shoot(BEHAVIOR_SHOTGUN_PARRY);
         do_parry(tg, anim);
     }
-    sound_play("shotgun_shot", 0.45f, frand(0.95f, 1.05f), false, CH_GUN);
-    play_revolver("FireWithReload");
+    sound_play("shotgun_shot", 0.45f, pitch, false, CH_GUN);
     timed_sounds_clear();
-    sound_later(SHOTGUN_CLICK, "shotgun_click", 0.5f, frand(0.95f, 1.05f));
-    g_shotgun_ready_at = t + SHOTGUN_READY;
+    if (pump) {
+        // FireWithPump: the gun pumps itself once after the shot (its sounds at 0.44 and 0.75 s) and is ready at 0.99 s
+        play_revolver("FireWithPump");
+        sound_later(0.44, "pump1", 1.0f, frand(0.95f, 1.05f), CH_FREE);
+        sound_later(0.44, "pump_charge", 0.5f, 1.0f, CH_FREE);
+        sound_later(0.75, "pump2", 1.0f, frand(0.95f, 1.05f), CH_FREE);
+        g_shotgun_ready_at = t + 0.99;
+        g_pump_charge = 0;
+    } else {
+        play_revolver("FireWithReload");
+        sound_later(SHOTGUN_CLICK, "shotgun_click", 0.5f, frand(0.95f, 1.05f));
+        g_shotgun_ready_at = t + SHOTGUN_READY;
+    }
     g_last_shotgun_shot = t;
     g_muzzle_flash = t;
-    g_shot_boosted = false;
+    g_shot_boosted = pellets == 0;               // nothing to punch on when the gun went off instead
     if (t - g_last_feedbacker < 0.03) boost_pellet(t);       // punched on the same frame
-    logf("shotgun: %d of %d pellets accepted%s\n", sent, SHOTGUN_PELLETS, parried ? ", point-blank parry" : in_reach ? ", enemy in reach" : "");
+    if (pump) logf("shotgun: Pump Charge fired at %d pumps\n", charge);
+    logf("shotgun: %d of %d pellets accepted%s\n", sent, pellets, parried ? ", point-blank parry" : in_reach ? ", enemy in reach" : "");
 }
 
 // ---- the Sharpshooter (Revolver, variation 2). Holding the alt fire spins the gun: the charge rises at
@@ -2397,7 +2677,8 @@ struct Ricochet { bool pending; double at; float from[3], dir[3]; int left; };
 enum { MAX_RICOCHETS = 6 };
 static Ricochet g_ricochets[MAX_RICOCHETS];
 static volatile LONG g_sharp_shots = 0, g_sharp_bounces = 0;
-static void shot_tracer(const float *end, float life, float width, const float *rgb);
+static int g_sharp_behavior = BEHAVIOR_SHARP;    // the row the beam in flight is fired with: BEHAVIOR_SLAB_SHARP from the alternate revolver
+static void shot_tracer(const float *end, float life, float width, const float *rgb, bool shrink);
 
 // One leg of the beam, from `from` along `dir` to the first surface; `first` is the leg from the gun.
 static void sharp_leg(const float *from, const float *dir, int left, bool first) {
@@ -2405,9 +2686,10 @@ static void sharp_leg(const float *from, const float *dir, int left, bool first)
     for (int i = 0; i < 3; i++) far_end[i] = from[i] + dir[i] * 150.0f;
     RayHit h;
     bool cast = ray_cast(from, far_end, h);
-    bool ok = first ? shoot(BEHAVIOR_SHARP) : shoot(BEHAVIOR_SHARP, from, dir);
-    if (first) shot_tracer(h.point, 0.5f, 0.10f, TRACER_RED);
+    bool ok = first ? shoot(g_sharp_behavior) : shoot(g_sharp_behavior, from, dir);
+    if (first) shot_tracer(h.point, 0.5f, 0.10f, TRACER_RED, false);
     else add_tracer(from, h.point, 0.5f, 0.10f, TRACER_RED);
+    if (h.hit) fx_beam_hit(h.point, h.normal);
     logf("sharpshooter: %s leg %.1f m, %s, %d bounces left, surface normal (%.2f %.2f %.2f): %s\n", first ? "first" : "bounced", h.dist,
          h.hit ? "hit a surface" : "hit nothing", left, h.normal[0], h.normal[1], h.normal[2], ok ? "accepted" : "REFUSED");
     if (!cast || !h.hit || left <= 0) return;
@@ -2510,6 +2792,8 @@ static bool punch_coin(double t) {
     c.v[0] = c.v[2] = 0;
     c.v[1] = 25.0f * UK_UNIT;
     c.shot = c.flashed = c.charged = false;
+    c.carry = 0;
+    c.trail_n = 0;                               // it starts a new path from where it came off
     c.born = t;
     c.thrown_y = land[1];
     c.power = c.power + 1;
@@ -2535,6 +2819,7 @@ static void update_punch(bool armed, float dt) {
             play_arm2("PunchBlast");
             sound_play("knuckle_blast", 1.0f, 1.0f);
             sound_later(0.78, "knuckle_eject", 0.5f, 1.0f, CH_FREE);   // the clip's Eject event: the shells go out
+            g_punch_ready_at = t + 1.39;
             note_attack(HIT_EXPLOSION);
             shoot(BEHAVIOR_BLAST);
             float right[3], up[3], fwd[3], eye[3];
@@ -2546,13 +2831,15 @@ static void update_punch(bool armed, float dt) {
                 b.radius = 3.0f;                 // the blast row's radius (tools/patch_v1.py)
                 b.born = t;
                 b.wave = true;
+                b.hidden = false;
             }
             logf("knuckleblaster: blast wave\n");
         }
     }
-    if ((!edge && !edge2) || g_fist_cooldown > 0 || g_punch_stamina < 1.0f) return;
+    if ((!edge && !edge2) || g_fist_cooldown > 0 || g_punch_stamina < 1.0f || t < g_punch_ready_at) return;
     bool heavy = edge2 && !edge;
     g_last_arm = heavy ? 1 : 0;
+    g_punch_ready_at = t + (heavy ? 0.75 : 0.33);
     g_fist_cooldown = heavy ? 0.75f : 0.5f;
     g_punch_stamina = g_punch_stamina - (heavy ? 1.5f : 1.0f) < 0 ? 0 : g_punch_stamina - (heavy ? 1.5f : 1.0f);
     InterlockedIncrement(&g_punches);
@@ -2593,7 +2880,45 @@ static void update_punch(bool armed, float dt) {
 
 // A tracer for a shot fired from the gun: from about where the barrel is on screen to `end`, or, with no
 // end given, to where the view line first meets the world (150 m if it meets nothing).
-static void shot_tracer(const float *end, float life, float width, const float *rgb) {
+// Where a shot along the view ends and which way that spot faces: the first surface on the line, or,
+// for a shot that stops at enemies, the first enemy standing on the line before it (a body is taken as
+// 0.45 m to either side of its aim point, from 1.2 m under it to 0.7 m over it).
+static void shot_end(bool stops_at_enemies, float *end, float *normal) {
+    float right[3], up[3], fwd[3], eye[3], far_end[3];
+    for (int i = 0; i < 3; i++) end[i] = normal[i] = 0;
+    if (!eye_pos(eye)) return;
+    view_axes(right, up, fwd);
+    for (int i = 0; i < 3; i++) far_end[i] = eye[i] + fwd[i] * 150.0f;
+    RayHit h;
+    ray_cast(eye, far_end, h);
+    float reach = h.hit ? h.dist : 150.0f;
+    for (int i = 0; i < 3; i++) normal[i] = h.hit ? h.normal[i] : -fwd[i];
+    if (stops_at_enemies) {
+        Target cand[12];
+        int n = find_targets(eye, cand, 12, reach + 2.0f);
+        for (int k = 0; k < n; k++) {
+            float d[3] = {cand[k].p[0] - eye[0], cand[k].p[1] - eye[1], cand[k].p[2] - eye[2]};
+            float along = d[0] * fwd[0] + d[1] * fwd[1] + d[2] * fwd[2];
+            if (along <= 0.3f || along - 0.3f >= reach) continue;
+            float ox = eye[0] + fwd[0] * along - cand[k].p[0], oy = eye[1] + fwd[1] * along - cand[k].p[1], oz = eye[2] + fwd[2] * along - cand[k].p[2];
+            if (ox * ox + oz * oz > 0.45f * 0.45f || oy < -1.2f || oy > 0.7f) continue;
+            reach = along - 0.3f;
+            for (int i = 0; i < 3; i++) normal[i] = -fwd[i];
+        }
+    }
+    for (int i = 0; i < 3; i++) end[i] = eye[i] + fwd[i] * reach;
+}
+
+static void shot_tracer(const float *end, float life, float width, const float *rgb, bool shrink = false);
+// A plain revolver shot's beam and the particles where it lands. The beam's width runs down at 1.5 u a second.
+static void revolver_beam_fx(float width = BEAM_WIDTH) {
+    float end[3], normal[3];
+    shot_end(true, end, normal);
+    shot_tracer(end, width / (1.5f * UK_UNIT), width, BEAM_WHITE, true);
+    fx_beam_hit(end, normal);
+}
+
+static void shot_tracer(const float *end, float life, float width, const float *rgb, bool shrink) {
     g_muzzle_flash = now_s();
     float right[3], up[3], fwd[3], eye[3], muzzle[3], far_end[3];
     if (!eye_pos(eye)) return;
@@ -2601,18 +2926,79 @@ static void shot_tracer(const float *end, float life, float width, const float *
     // the muzzle is wherever the HUD last drew it: the point 0.9 m out that lands on that spot of the screen
     float mx = 0.26f, my = -0.32f;
     hud_muzzle(&mx, &my);
-    float tan_y = tanf(BASE_FOV * g_fov_scale * 0.5f), tan_x = tan_y * g_aspect;
+    float tan_y = tanf(BASE_FOV * g_fov_scale * g_zoom * 0.5f), tan_x = tan_y * g_aspect;
     for (int i = 0; i < 3; i++) {
         muzzle[i] = eye[i] + (right[i] * mx * tan_x + up[i] * my * tan_y + fwd[i]) * 0.9f;
         far_end[i] = eye[i] + fwd[i] * 150.0f;
     }
     if (end) {
-        add_tracer(muzzle, end, life, width, rgb);
+        add_tracer(muzzle, end, life, width, rgb, shrink, false);
         return;
     }
     RayHit h;
     ray_cast(eye, far_end, h);
-    add_tracer(muzzle, h.point, life, width, rgb);
+    add_tracer(muzzle, h.point, life, width, rgb, shrink, false);
+    if (h.hit) fx_beam_hit(h.point, h.normal);
+}
+
+// Shotgun.Pump (variation 1): each press of the alt fire while the gun is ready pumps it once, three
+// times at most. The Pump2 clip's events are the two sounds (0.10 and 0.50 s) and ReadyGun at 0.64 s; the
+// first sound comes with a rising tone pitched 1 + pumps / 5.
+static void pump_shotgun(double t) {
+    if (g_pump_charge < 3) g_pump_charge = g_pump_charge + 1;
+    InterlockedIncrement(&g_pumps);
+    play_revolver("Pump2");
+    timed_sounds_clear();
+    sound_later(0.10, "pump1", 1.0f, frand(0.95f, 1.05f), CH_FREE);
+    sound_later(0.10, "pump_charge", 0.5f, 1.0f + g_pump_charge / 5.0f, CH_FREE);
+    sound_later(0.50, "pump2", 1.0f, frand(0.95f, 1.05f), CH_FREE);
+    g_shotgun_ready_at = t + 0.64;
+    logf("shotgun: pumped, %d of 3\n", (int)g_pump_charge);
+}
+
+// ---- the railcannon (Railcannon, WeaponCharges.raicharge). One charge shared by its variations: 0 to 5 at
+// a quarter a second, taken as full from 4 (16 s). A press of fire while it is full empties it.
+//   Electric (variation 0)   'Railcannon Beam': a beam 1 u wide through every enemy on the line, damage 2
+//                            up to four times on each (row 9000170 deals the 8 at once).
+//   Malicious (variation 2)  'Railcannon Beam Malicious': damage 2 to the first thing on the line, where
+//                            it sets off an explosion 13.5 u across (rows 9000171 and 9000172).
+// Either beam that meets a coin is passed on by the coin, and one that meets a core sets it off. The alt
+// fire zooms. The Screwdriver (variation 1), a drill that stays in what it hits, is not in yet.
+static void fire_railcannon(double t) {
+    static const float RAIL_BLUE[3] = {0.25f, 0.85f, 1.0f}, RAIL_RED[3] = {1.0f, 0.3f, 0.25f};
+    const float width = 1.0f * UK_UNIT;
+    bool malicious = g_rail_var == 1;
+    const float *rgb = malicious ? RAIL_RED : RAIL_BLUE;
+    g_rail_charge = 0;
+    InterlockedIncrement(&g_rail_shots);
+    play_revolver("Fire");
+    timed_sounds_clear();
+    sound_play(malicious ? "rail_fire_malicious" : "rail_fire", malicious ? 1.0f : 0.65f, malicious ? 3.0f : 1.0f, false, CH_GUN);
+    note_attack(HIT_REVOLVER);
+    if (Coin *c = coin_on_line()) {
+        shot_tracer(c->p, 0.5f, width, rgb, true);
+        hit_coin(*c, t);
+        c->charged = true;
+        c->carry = malicious ? BEHAVIOR_RAIL_MALICIOUS : BEHAVIOR_RAIL;
+        logf("railcannon: %s, into a coin\n", malicious ? "Malicious" : "Electric");
+    } else if (Core *k = core_on_line()) {
+        shot_tracer(k->p, 0.5f, width, rgb, true);
+        explode(k->p, EXPLODE_SUPER);
+        k->alive = false;
+        logf("railcannon: %s, into a core\n", malicious ? "Malicious" : "Electric");
+    } else if (malicious) {
+        float end[3], normal[3], at[3];
+        shot_end(true, end, normal);
+        bool ok = shoot(BEHAVIOR_RAIL_MALICIOUS);
+        shot_tracer(end, 0.5f, width, rgb, true);
+        for (int i = 0; i < 3; i++) at[i] = end[i] + normal[i] * 0.15f;
+        explode(at, EXPLODE_MALICIOUS);
+        logf("railcannon: Malicious, %s\n", ok ? "accepted" : "REFUSED");
+    } else {
+        bool ok = shoot(BEHAVIOR_RAIL);
+        shot_tracer(nullptr, 0.5f, width, rgb, true);     // through enemies, to the first surface
+        logf("railcannon: Electric, %s\n", ok ? "accepted" : "REFUSED");
+    }
 }
 
 // once per frame, on the game's thread
@@ -2640,57 +3026,116 @@ static void try_instant_fire() {
     if (g_ctrl) watch_enemies(t, dt);
     style_update(dt);
     update_punch(armed, dt);
+    update_particles(t, dt);
+    {
+        // the wind of a dash, and of a slide while it lasts
+        uintptr_t pos = g_player_pos;
+        static float slide_owed = 0;
+        if (pos && g_ctrl) {
+            const float *feet = (const float *)(pos + OFF_POS_X);
+            float middle[3] = {feet[0], feet[1] + 1.0f, feet[2]};
+            if (g_fx_dash_pending) {
+                float dir[3] = {g_dash_x, 0, g_dash_z}, len = sqrtf(dir[0] * dir[0] + dir[2] * dir[2]);
+                if (len > 0.01f) {
+                    dir[0] /= len;
+                    dir[2] /= len;
+                    fx_wind(middle, dir, 20, 30.0f, 50.0f, 2.0f * UK_UNIT, 2.0f * UK_UNIT);
+                }
+            }
+            float speed = sqrtf(g_vx * g_vx + g_vz * g_vz);
+            if (g_sliding && speed > 1.0f) {
+                float dir[3] = {g_vx / speed, 0, g_vz / speed};
+                slide_owed += 20.0f * dt;
+                int count = (int)slide_owed;
+                slide_owed -= count;
+                if (count > 0) fx_wind(middle, dir, count, 40.0f, 40.0f, 2.5f * UK_UNIT, 0.5f * UK_UNIT);
+            }
+        }
+        g_fx_dash_pending = false;
+    }
     update_pellets(t, dt);
     update_cores(t, dt);
     update_ricochets(t);
     timed_sounds_update(t);
     bool lmb = armed && key_down(VK_LBUTTON) != 0, rmb = armed && key_down(VK_RBUTTON) != 0;
-    // Weapon slots as in ULTRAKILL: 1 is the revolver, 2 the shotgun. The revolver always comes out as
-    // the Marksman (the variation last held is not remembered, Davi's choice); 1 again, or E, goes on
-    // through Piercer and Sharpshooter and back round. Q goes straight to the last of the three. The
-    // shotgun has only the Core Eject so far.
+    // Weapon slots as in ULTRAKILL: 1 is the revolver, 2 the shotgun, 4 the railcannon (3, the nailgun, is
+    // not in). A weapon always comes out as its first variation (the revolver as the Marksman, Davi's
+    // choice; the one last held is not remembered); its key again, or E, goes on to its next variation
+    // and back round. Q goes straight to the Sharpshooter. X swaps the revolver variation in the hand
+    // between its standard and its alternate ("Slab") form; that choice is kept for each variation.
     {
-        static bool prev1 = false, prev2 = false, prev_e = false, prev_q = false;
+        static bool prev1 = false, prev2 = false, prev4 = false, prev_e = false, prev_q = false, prev_x = false;
         static const int next_variation[3] = {2, 0, 1};      // Piercer -> Sharpshooter, Marksman -> Piercer, Sharpshooter -> Marksman
-        bool k1 = armed && key_down('1'), k2 = armed && key_down('2'), ke = armed && key_down('E'), kq = armed && key_down('Q');
-        int weapon = g_weapon, variation = g_variation;
+        bool k1 = armed && key_down('1'), k2 = armed && key_down('2'), k4 = armed && key_down('4'), ke = armed && key_down('E'),
+             kq = armed && key_down('Q'), kx = armed && key_down('X');
+        int weapon = g_weapon, variation = g_variation, shotgun_var = g_shotgun_var, rail_var = g_rail_var, slab_mask = g_slab_mask;
+        bool next = ke && !prev_e;
         if (k1 && !prev1) {
+            next = weapon == WEAPON_REVOLVER;
+            if (!next) { weapon = WEAPON_REVOLVER; variation = 1; }
+        } else if (k2 && !prev2) {
+            next = weapon == WEAPON_SHOTGUN;
+            if (!next) { weapon = WEAPON_SHOTGUN; shotgun_var = 0; }
+        } else if (k4 && !prev4) {
+            next = weapon == WEAPON_RAILCANNON;
+            if (!next) { weapon = WEAPON_RAILCANNON; rail_var = 0; }
+        }
+        if (next) {
             if (weapon == WEAPON_REVOLVER) variation = next_variation[variation];
-            else { weapon = WEAPON_REVOLVER; variation = 1; }
-        } else if (ke && !prev_e && weapon == WEAPON_REVOLVER) {
-            variation = next_variation[variation];
+            else if (weapon == WEAPON_SHOTGUN) shotgun_var ^= 1;
+            else rail_var ^= 1;
         }
         if (kq && !prev_q) { weapon = WEAPON_REVOLVER; variation = 2; }
-        if (k2 && !prev2) weapon = WEAPON_SHOTGUN;
+        if (kx && !prev_x && weapon == WEAPON_REVOLVER) slab_mask ^= 1 << variation;
         prev1 = k1;
         prev2 = k2;
+        prev4 = k4;
         prev_e = ke;
         prev_q = kq;
-        if (weapon != g_weapon || variation != g_variation) {
+        prev_x = kx;
+        if (weapon != g_weapon || variation != g_variation || shotgun_var != g_shotgun_var || rail_var != g_rail_var || slab_mask != g_slab_mask) {
+            bool choice_changed = slab_mask != g_slab_mask;
             g_weapon = weapon;
             g_variation = variation;
+            g_shotgun_var = shotgun_var;
+            g_rail_var = rail_var;
+            g_slab_mask = slab_mask;
+            if (choice_changed) save_settings();
             g_pierce_charge = 0;
             g_twirl_charge = 0;
             g_twirl_angle = 0;
             g_twirling = g_twirl_recovery = false;
             g_core_force = 0;
             g_core_charging = false;
+            g_pump_charge = 0;                   // Shotgun.OnEnable
+            g_slab_click_at = -1;                // a Click that had not come yet does not come
             timed_sounds_clear();
             sound_play("weapon_draw", 0.35f, 3.0f);
             // Drawing a weapon starts its animation over, and it is ready when the draw's ReadyGun event
-            // comes: for the shotgun that cuts a reload short, as swapping weapons does in ULTRAKILL.
+            // comes: for the shotgun that cuts a reload short, as swapping weapons does in ULTRAKILL. Each
+            // weapon keeps its own time between shots, so the one drawn does not wait out the last one's.
             if (weapon == WEAPON_SHOTGUN) {
                 play_revolver("Equip");
                 g_shotgun_ready_at = g_cores_ready_at = t + SHOTGUN_EQUIP_READY;
+            } else if (weapon == WEAPON_RAILCANNON) {
+                play_revolver("Equip");
+                g_rail_ready_at = t + 0.2;       // ours: its Equip clip has no event; long enough that the click that drew it cannot fire it
+            } else if (slab_held()) {
+                bool slow = t < g_slab_slow_until[variation];
+                play_revolver(slow ? "PickUpWithReload" : "PickUp");
+                g_next_shot = t + (slow ? 1.15 : 0.33);
+                if (slow) g_slab_click_at = t + 0.90;
             } else {
                 play_revolver("PickUp");
-                if (g_next_shot < t + REVOLVER_PICKUP_READY) g_next_shot = t + REVOLVER_PICKUP_READY;
+                g_next_shot = t + REVOLVER_PICKUP_READY;
             }
             static const char *const names[3] = {"Piercer", "Marksman", "Sharpshooter"};
+            const char *held = weapon == WEAPON_SHOTGUN ? (shotgun_var ? "shotgun (Pump Charge)" : "shotgun (Core Eject)")
+                               : weapon == WEAPON_RAILCANNON ? (rail_var ? "railcannon (Malicious)" : "railcannon (Electric)") : names[variation];
             Target all[16];
             float eye[3];
             int n = eye_pos(eye) ? find_targets(eye, all, 16, 500.0f, true) : 0;
-            logf("weapon: %s; %d other characters active:\n", weapon == WEAPON_SHOTGUN ? "shotgun (Core Eject)" : names[variation], n);
+            logf("weapon: %s%s; %d other characters active:\n", slab_held() ? "Slab " : "", held, n);
             for (int i = 0; i < n; i++) {
                 // how far the view would have to turn to face it (positive = to the right), for driving the game from a script
                 float turn = atan2f(all[i].p[0] - eye[0], all[i].p[2] - eye[2]) - g_yaw;
@@ -2768,10 +3213,41 @@ static void try_instant_fire() {
         }
         prev4 = k4;
     }
-    if (g_pierce_ready < 100.0f) g_pierce_ready = g_pierce_ready + PIERCE_RECHARGE_RATE * dt > 100.0f ? 100.0f : g_pierce_ready + PIERCE_RECHARGE_RATE * dt;
-    if (g_sharp_charge < 300.0f) g_sharp_charge = g_sharp_charge + SHARP_REFILL * dt > 300.0f ? 300.0f : g_sharp_charge + SHARP_REFILL * dt;
+    bool slab = slab_held();
+    {
+        // WeaponCharges.Charge: the alternate Piercer's shot comes back at half the rate (20 a second),
+        // and the alternate Sharpshooter's one shot, which costs all 300, at 35 a second against 15.
+        float pierce_rate = PIERCE_RECHARGE_RATE * ((g_slab_mask & 1) ? 0.5f : 1.0f), sharp_rate = (g_slab_mask & 4) ? 35.0f : SHARP_REFILL;
+        if (g_pierce_ready < 100.0f) g_pierce_ready = fminf(100.0f, g_pierce_ready + pierce_rate * dt);
+        if (g_sharp_charge < 300.0f) g_sharp_charge = fminf(300.0f, g_sharp_charge + sharp_rate * dt);
+    }
+    // the railcannon charges whatever is in the hand: 0 to 5 at a quarter a second, full from 4, with its chime
+    if (g_rail_charge < 5.0f) {
+        float c = g_rail_charge + 0.25f * dt;
+        if (c >= 4.0f) {
+            c = 5.0f;
+            if (armed) sound_play("rail_charged", 0.35f, 1.0f, false, CH_FREE);
+        }
+        g_rail_charge = c;
+    }
+    g_zoom = move_towards(g_zoom, g_weapon == WEAPON_RAILCANNON && rmb ? 0.5f : 1.0f, dt * 300.0f / 105.0f);
+    // the alternate revolver's hammer comes back, if the gun is still in the hand
+    if (g_slab_click_at > 0 && t >= g_slab_click_at) {
+        g_slab_click_at = -1;
+        if (slab) {
+            g_slab_slow_until[g_variation] = 0;
+            sound_play("slab_click", 0.5f, 1.0f, false, CH_FREE);
+        }
+    }
     bool alt_fired = false;
-    if (g_weapon != WEAPON_REVOLVER) {
+    if (g_weapon == WEAPON_RAILCANNON) {
+        g_pierce_charge = 0;
+        if (lmb && !g_prev_lmb && g_rail_charge >= 5.0f && t >= g_rail_ready_at) fire_railcannon(t);
+    } else if (g_weapon == WEAPON_SHOTGUN && g_shotgun_var == 1) {
+        g_pierce_charge = 0;
+        if (rmb && !g_prev_rmb && t >= g_shotgun_ready_at) pump_shotgun(t);
+        else if (lmb && t >= g_shotgun_ready_at) fire_shotgun(t);
+    } else if (g_weapon == WEAPON_SHOTGUN) {
         g_pierce_charge = 0;
         // Shotgun.Update: the alt fire winds the core up while held and throws it when let go
         if (rmb && t - g_last_core > 0.5 && t >= g_cores_ready_at) {
@@ -2804,29 +3280,35 @@ static void try_instant_fire() {
         g_pierce_charge = 0;
     } else if (g_variation == 2) {
         g_pierce_charge = 0;
+        // Revolver.Update: the alternate Sharpshooter winds up at 750 a second against 75, and its shot
+        // needs, and spends, all 300 of the charge
+        float rate = slab ? 750.0f : TWIRL_RATE, cost = slab ? 300.0f : 100.0f;
         bool let_go = (g_prev_rmb && !rmb) || lmb;
         if (let_go && g_twirl_charge >= 25.0f && t >= g_next_shot) {
             int bounces = (int)(g_twirl_charge / 25.0f);
             if (bounces > 3) bounces = 3;
-            g_sharp_charge = g_sharp_charge - 100.0f;
+            g_sharp_charge = g_sharp_charge - cost < 0 ? 0 : g_sharp_charge - cost;
             g_twirl_charge = 0;
             if (g_twirling) g_twirl_recovery = true;
             g_twirling = false;
             alt_fired = true;
             InterlockedIncrement(&g_sharp_shots);
-            sound_play("shot_sharpshooter", 0.55f, frand(0.9f, 1.1f), false, CH_GUN);
+            sound_play(slab ? "shot_slab" : "shot_sharpshooter", 0.55f, frand(0.9f, 1.1f), false, CH_GUN);
             sound_play("twirl_shot", 0.75f, 1.0f);
             note_attack(HIT_REVOLVER);
             play_revolver("Shoot");
             g_last_pierce_time = t;
-            g_next_shot = t + FIRE_INTERVAL;
+            g_next_shot = t + (slab ? SLAB_READY : FIRE_INTERVAL);
+            if (slab) slab_fired(t);
+            g_sharp_behavior = slab ? BEHAVIOR_SLAB_SHARP : BEHAVIOR_SHARP;
             if (Coin *c = coin_on_line()) {
                 shot_tracer(c->p, 0.5f, 0.10f, TRACER_RED);
                 hit_coin(*c, t);
                 c->charged = true;
+                c->carry = slab ? BEHAVIOR_SLAB_SHARP : 0;
             } else if (Core *k = core_on_line()) {
                 shot_tracer(k->p, 0.5f, 0.10f, TRACER_RED);
-                explode(k->p, true);
+                explode(k->p, EXPLODE_SUPER);
                 k->alive = false;
             } else {
                 float right[3], up[3], fwd[3], eye[3];
@@ -2835,53 +3317,51 @@ static void try_instant_fire() {
                     sharp_leg(eye, fwd, bounces, true);
                 }
             }
-        } else if (rmb && g_sharp_charge >= 100.0f) {
+        } else if (rmb && g_sharp_charge >= cost) {
             g_twirling = true;
             g_twirl_recovery = false;
-            g_twirl_charge = g_twirl_charge + TWIRL_RATE * dt > 100.0f ? 100.0f : g_twirl_charge + TWIRL_RATE * dt;
+            g_twirl_charge = g_twirl_charge + rate * dt > 100.0f ? 100.0f : g_twirl_charge + rate * dt;
         } else {
             if (g_twirling) g_twirl_recovery = true;
             g_twirling = false;
-            g_twirl_charge = g_twirl_charge - TWIRL_RATE * dt < 0 ? 0 : g_twirl_charge - TWIRL_RATE * dt;
+            g_twirl_charge = g_twirl_charge - rate * dt < 0 ? 0 : g_twirl_charge - rate * dt;
         }
-    } else if (rmb && g_pierce_ready >= 100.0f) {
+    } else if (rmb && g_pierce_ready >= 100.0f && (!slab || t >= g_next_shot)) {
         g_pierce_charge = g_pierce_charge + PIERCE_CHARGE_RATE * dt > 100.0f ? 100.0f : g_pierce_charge + PIERCE_CHARGE_RATE * dt;
     } else if (g_prev_rmb && g_pierce_charge >= 100.0f) {
+        // the charged shot: it stops at a coin, which passes it on, and sets off a core in the air
+        bool fired = true;
         if (Coin *c = coin_on_line()) {
-            // the charged shot stops at a coin too, and the coin passes it on
-            sound_play("shot_super", 0.5f, 1.0f);
             note_attack(HIT_REVOLVER);
-            play_revolver("Shoot");
             shot_tracer(c->p, 0.4f, 0.10f, TRACER_BLUE);
             hit_coin(*c, t);
             c->charged = true;
-            g_last_pierce_time = t;
-            g_pierce_ready = 0;
-            g_next_shot = t + FIRE_INTERVAL;
+            c->carry = slab ? BEHAVIOR_SLAB_CHARGED : 0;
         } else if (Core *k = core_on_line()) {
-            sound_play("shot_super", 0.5f, 1.0f);
-            play_revolver("Shoot");
             shot_tracer(k->p, 0.4f, 0.10f, TRACER_BLUE);
-            explode(k->p, true);
+            explode(k->p, EXPLODE_SUPER);
             k->alive = false;
-            g_last_pierce_time = t;
-            g_pierce_ready = 0;
-            g_next_shot = t + FIRE_INTERVAL;
-        } else if (shoot(BEHAVIOR_PIERCER)) {
-            shot_tracer(nullptr, 0.4f, 0.10f, TRACER_BLUE);
+        } else if (shoot(slab ? BEHAVIOR_SLAB_CHARGED : BEHAVIOR_PIERCER)) {
+            shot_tracer(nullptr, 0.4f, slab ? 0.25f : 0.10f, TRACER_BLUE);
             InterlockedIncrement(&g_pierce_shots);
-            sound_play("shot_super", 0.5f, 1.0f);
             note_attack(HIT_REVOLVER);
+        } else {
+            fired = false;
+        }
+        if (fired) {
+            sound_play(slab ? "shot_super_alt" : "shot_super", 0.5f, 1.0f);
             play_revolver("Shoot");
             g_last_pierce_time = t;
             g_pierce_ready = 0;
-            g_next_shot = t + FIRE_INTERVAL;
+            g_next_shot = t + (slab ? SLAB_READY : FIRE_INTERVAL);
+            if (slab) slab_fired(t);
         }
         g_pierce_charge = 0;
     } else {
         g_pierce_charge = 0;   // released early: the charge is lost
     }
     g_prev_rmb = rmb;
+    g_prev_lmb = lmb;
     // The Sharpshooter's spin (Revolver.Update): 1200 degrees a second times (level / 3 + 0.5), where the
     // level is 1 to 4 with the charge; let go, the level drops to 0.1 and the gun turns on until it is
     // upright again.
@@ -2915,7 +3395,7 @@ static void try_instant_fire() {
             charge_voice = 0;
         }
         bool refilling = g_weapon == WEAPON_REVOLVER && g_variation == 0 && g_pierce_ready < 100.0f;
-        if (refilling && !refill_voice) refill_voice = sound_play("pierce_recharging", 0.25f, 1.0f, true, CH_SCREEN);
+        if (refilling && !refill_voice) refill_voice = sound_play("pierce_recharging", 0.25f, slab ? 0.5f : 1.0f, true, CH_SCREEN);   // the alternate one's ticks at half pitch
         if (!refilling && refill_voice) {
             sound_stop(refill_voice);
             refill_voice = 0;
@@ -2938,33 +3418,63 @@ static void try_instant_fire() {
             sound_stop(core_voice);
             core_voice = 0;
         }
+        // the full railcannon hums while it is in the hand
+        static int rail_voice = 0;
+        bool humming = armed && g_weapon == WEAPON_RAILCANNON && g_rail_charge >= 5.0f;
+        if (humming && !rail_voice) rail_voice = sound_play("rail_hum", 0.35f, 1.0f, true);
+        if (!humming && rail_voice) {
+            sound_stop(rail_voice);
+            rail_voice = 0;
+        }
+        // Shotgun.UpdateMeter: pumped three times, the shotgun beeps five times a second
+        if (armed && g_weapon == WEAPON_SHOTGUN && g_shotgun_var == 1 && g_pump_charge >= 3 && t - g_pump_beep_at >= 0.2) {
+            g_pump_beep_at = t;
+            sound_play("pump_warning", 0.5f, 1.0f, false, CH_SCREEN);
+        }
     }
 
     if (g_weapon == WEAPON_REVOLVER && !alt_fired && lmb && g_pierce_charge <= 0 && !g_twirling && t >= g_next_shot) {
-        g_next_shot = t + FIRE_INTERVAL;
-        const char *shot_sound = g_variation == 1 ? "shot_marksman" : g_variation == 2 ? "shot_sharpshooter" : "shot_piercer";
+        g_next_shot = t + (slab ? SLAB_READY : FIRE_INTERVAL);
+        const char *shot_sound = slab ? "shot_slab" : g_variation == 1 ? "shot_marksman" : g_variation == 2 ? "shot_sharpshooter" : "shot_piercer";
+        // 'Revolver Beam Alternative' is 0.35 u wide against 0.25
+        float width = slab ? 0.35f * UK_UNIT : BEAM_WIDTH, life = width / (1.5f * UK_UNIT);
+        bool fired = true;
         if (Coin *c = coin_on_line()) {
             sound_play(shot_sound, 0.55f, frand(0.9f, 1.1f), false, CH_GUN);
             play_revolver_shot();
-            shot_tracer(c->p, 0.2f, 0.04f, TRACER_WHITE);
+            shot_tracer(c->p, life, width, BEAM_WHITE, true);
             hit_coin(*c, t);                     // the shot stops at the coin
             g_last_shot_time = t;
+            if (slab && c->hit_times > 1) {
+                // RevolverBeam: the alternate revolver's shot on a coin in its split window reloads the
+                // gun at once (Revolver.InstaClick plays ShootTwirl, ready after 0.47 s)
+                play_revolver("ShootTwirl");
+                g_next_shot = t + 0.47;
+                g_slab_slow_until[g_variation] = 0;
+                g_slab_click_at = -1;
+                sound_later(0.12, "slab_click", 0.5f, 1.0f, CH_FREE);
+                fired = false;                   // (nothing left for slab_fired to arm)
+                logf("slab: split-window coin shot, instant reload\n");
+            }
         } else if (Core *k = core_on_line()) {
             // a core shot in the air goes off as the larger explosion
             sound_play(shot_sound, 0.55f, frand(0.9f, 1.1f), false, CH_GUN);
             play_revolver_shot();
-            shot_tracer(k->p, 0.2f, 0.04f, TRACER_WHITE);
-            explode(k->p, true);
+            shot_tracer(k->p, life, width, BEAM_WHITE, true);
+            explode(k->p, EXPLODE_SUPER);
             k->alive = false;
             g_last_shot_time = t;
-        } else if (shoot(BEHAVIOR_REVOLVER)) {
+        } else if (shoot(slab ? BEHAVIOR_SLAB : BEHAVIOR_REVOLVER)) {
             sound_play(shot_sound, 0.55f, frand(0.9f, 1.1f), false, CH_GUN);
             note_attack(HIT_REVOLVER);
             play_revolver_shot();
-            shot_tracer(nullptr, 0.2f, 0.04f, TRACER_WHITE);
+            revolver_beam_fx(width);
             InterlockedIncrement(&g_instant_shots);
             g_last_shot_time = t;
+        } else {
+            fired = false;
         }
+        if (slab && fired) slab_fired(t);
     }
 }
 
@@ -3081,6 +3591,9 @@ static bool draw_full_hud(IDXGISwapChain *sc) {
                 st.show_viewmodel = g_viewmodel;
                 st.variation = g_variation;
                 st.weapon = g_weapon;
+                st.alt = slab_held();
+                st.weapon_var = g_weapon == WEAPON_SHOTGUN ? (int)g_shotgun_var : g_weapon == WEAPON_RAILCANNON ? (int)g_rail_var : 0;
+                st.rail_charge = g_rail_charge;
                 st.twirl = g_twirl_angle * 3.14159265f / 180.0f;
                 st.twirl_blend = g_twirl_blend;
                 st.arm = g_last_arm;
@@ -3096,6 +3609,22 @@ static bool draw_full_hud(IDXGISwapChain *sc) {
                 // it is wound up, empty from the throw until the gun is ready again
                 st.core_meter = g_core_charging ? g_core_force / 60.0f : now_s() >= g_cores_ready_at ? 1.0f : 0.0f;
                 st.core_meter_red = g_core_charging ? g_core_force / 60.0f : 0.0f;
+                if (g_weapon == WEAPON_SHOTGUN && g_shotgun_var == 1) {
+                    // The Pump Charge's meter: a third per pump, going from the variation's green to red
+                    // over two pumps; at three it is full and blinks red and black with the warning beep.
+                    int pumps = g_pump_charge;
+                    st.core_meter = pumps >= 3 ? 1.0f : pumps / 3.0f;
+                    st.meter_rgb_set = true;
+                    if (pumps >= 3) {
+                        st.meter_rgb[0] = now_s() - g_pump_beep_at < 0.1 ? 1.0f : 0.0f;
+                        st.meter_rgb[1] = st.meter_rgb[2] = 0.0f;
+                    } else {
+                        float k = pumps / 2.0f;
+                        st.meter_rgb[0] = 0.2667f + (1.0f - 0.2667f) * k;
+                        st.meter_rgb[1] = 1.0f + (0.25f - 1.0f) * k;
+                        st.meter_rgb[2] = 0.2706f + (0.25f - 0.2706f) * k;
+                    }
+                }
                 st.boss_count = g_ctrl ? (int)g_boss_count : 0;
                 for (int i = 0; i < st.boss_count && i < HudState::MAX_BOSSES; i++) st.bosses[i] = g_bosses[i];
                 st.coin_charge = g_coin_charge;
@@ -3126,7 +3655,7 @@ static bool draw_full_hud(IDXGISwapChain *sc) {
                 float right[3], up[3], fwd[3], eye[3];
                 if (eye_pos(eye) && bd.Height) {
                     view_axes(right, up, fwd);
-                    float tan_y = tanf(BASE_FOV * g_fov_scale * 0.5f), tan_x = tan_y * (float)bd.Width / (float)bd.Height;
+                    float tan_y = tanf(BASE_FOV * g_fov_scale * g_zoom * 0.5f), tan_x = tan_y * (float)bd.Width / (float)bd.Height;
                     g_aspect = (float)bd.Width / (float)bd.Height;
                     // a line between two points of the world, as the HUD wants it: projected, cut at the eye
                     auto line = [&](const float *pa, const float *pb, float width, float r, float g, float b, float alpha) {
@@ -3154,6 +3683,13 @@ static bool draw_full_hud(IDXGISwapChain *sc) {
                         ln.w1 = w1 < 0.0008f ? 0.0008f : w1 > 0.02f ? 0.02f : w1;
                         ln.r = r; ln.g = g; ln.b = b;
                         ln.a = alpha;
+                        ln.plain = false;
+                    };
+                    // the same without the wide soft glow round it, for trails and streaks
+                    auto thin_line = [&](const float *pa, const float *pb, float width, float r, float g, float b, float alpha) {
+                        int before = st.tracer_count;
+                        line(pa, pb, width, r, g, b, alpha);
+                        if (st.tracer_count > before) st.tracers[before].plain = true;
                     };
                     // a glowing ball in the world: `size` metres across, with a shock ring `ring` metres across
                     auto ball = [&](const float *p, float size, float ring, float r, float g, float b, float alpha) {
@@ -3169,46 +3705,157 @@ static bool draw_full_hud(IDXGISwapChain *sc) {
                         o.ring = ring / (vz * tan_y * 2.0f);
                         o.r = r; o.g = g; o.b = b; o.a = alpha;
                     };
+                    // the camera, for the effect meshes
+                    st.cam_valid = true;
+                    for (int i = 0; i < 3; i++) {
+                        st.cam_eye[i] = eye[i];
+                        st.cam_right[i] = right[i];
+                        st.cam_up[i] = up[i];
+                        st.cam_fwd[i] = fwd[i];
+                    }
+                    st.cam_tan_x = tan_x;
+                    st.cam_tan_y = tan_y;
+                    static int have_fx = -1;                     // whether the model pack has ULTRAKILL's effect meshes
+                    if (have_fx < 0) have_fx = hud_has_model("fx_sphere") && hud_has_model("fx_shock") && hud_has_model("fx_coin") ? 1 : 0;
+                    auto mesh = [&](const char *model, const float *p, float radius, float flip, float u, float v, float alpha) {
+                        if (st.world_mesh_count >= HudState::MAX_WORLD_MESHES || alpha <= 0) return;
+                        HudState::WorldMesh &w = st.world_meshes[st.world_mesh_count++];
+                        w.model = model;
+                        memcpy(w.p, p, sizeof(w.p));
+                        w.radius = radius;
+                        w.flip = flip;
+                        w.uv[0] = u;
+                        w.uv[1] = v;
+                        w.rgba[0] = w.rgba[1] = w.rgba[2] = 1.0f;
+                        w.rgba[3] = alpha > 1.0f ? 1.0f : alpha;
+                    };
+                    // a picture in the world facing the eye: `size` metres across
+                    auto sprite = [&](const char *name, const float *p, float size, float rot, float r, float g, float b, float alpha) {
+                        if (st.fx_sprite_count >= HudState::MAX_FX_SPRITES || alpha <= 0) return;
+                        float d[3] = {p[0] - eye[0], p[1] - eye[1], p[2] - eye[2]};
+                        float vx = d[0] * right[0] + d[1] * right[1] + d[2] * right[2], vy = d[0] * up[0] + d[1] * up[1] + d[2] * up[2],
+                              vz = d[0] * fwd[0] + d[1] * fwd[1] + d[2] * fwd[2];
+                        if (vz < 0.15f) return;
+                        HudState::FxSprite &o = st.fx_sprites[st.fx_sprite_count++];
+                        o.sprite = name;
+                        o.x = vx / (vz * tan_x);
+                        o.y = vy / (vz * tan_y);
+                        o.size = size / (vz * tan_y * 2.0f);
+                        o.rot = rot;
+                        o.r = r; o.g = g; o.b = b;
+                        o.a = alpha > 1.0f ? 1.0f : alpha;
+                    };
                     for (const Tracer &tr : g_tracers) {
                         float age = (float)(st.time - tr.born);
                         if (tr.life <= 0 || age < 0 || age > tr.life) continue;
-                        line(tr.a, tr.b, tr.width, tr.r, tr.g, tr.bl, 1.0f - age / tr.life);
-                    }
-                    // pellets in flight: a short streak behind each (the trail lasts a tenth of a second
-                    // in ULTRAKILL; here it is as long as the pellet travels in 0.05 s)
-                    for (const Pellet &pl : g_pellets) {
-                        if (!pl.alive) continue;
-                        float tail[3] = {pl.p[0] - pl.v[0] * 0.05f, pl.p[1] - pl.v[1] * 0.05f, pl.p[2] - pl.v[2] * 0.05f};
-                        if (pl.boosted) {
-                            line(tail, pl.p, 0.16f, 1.0f, 0.35f, 0.0f, 1.0f);
-                            ball(pl.p, 0.5f, 0, 1.0f, 0.35f, 0.0f, 1.0f);
-                        } else {
-                            line(tail, pl.p, 0.05f, 1.0f, 0.85f, 0.3f, 0.9f);
+                        float left = 1.0f - age / tr.life, width = tr.shrink ? tr.width * left : tr.width, alpha = tr.shrink ? 1.0f : left;
+                        // each run of eighths that was in sight when the tracer was made
+                        for (int k = 0; k < 8; k++) {
+                            if (!(tr.seen & (1 << k))) continue;
+                            int last = k;
+                            while (last + 1 < 8 && (tr.seen & (1 << (last + 1)))) last++;
+                            float f0 = k / 8.0f, f1 = (last + 1) / 8.0f, pa[3], pb[3];
+                            for (int i = 0; i < 3; i++) {
+                                pa[i] = tr.a[i] + (tr.b[i] - tr.a[i]) * f0;
+                                pb[i] = tr.a[i] + (tr.b[i] - tr.a[i]) * f1;
+                            }
+                            line(pa, pb, width, tr.r, tr.g, tr.bl, alpha);
+                            k = last;
                         }
                     }
-                    for (const Core &c : g_cores)
-                        if (c.alive) ball(c.p, 0.3f, 0, 1.0f, 0.3f, 0.1f, 1.0f);
-                    // explosions: the ball reaches full size in 0.2 s, then fades over 0.3 s as the ring runs on
+                    // Pellets in flight ("Shotgun Projectile"): a small yellow ball 0.2 u across with a
+                    // white trail a tenth of a second long. A punched one is orange and four times the size.
+                    for (const Pellet &pl : g_pellets) {
+                        if (!pl.alive) continue;
+                        float tail[3] = {pl.p[0] - pl.v[0] * 0.1f, pl.p[1] - pl.v[1] * 0.1f, pl.p[2] - pl.v[2] * 0.1f};
+                        if (pl.boosted) {
+                            float short_tail[3] = {pl.p[0] - pl.v[0] * 0.03f, pl.p[1] - pl.v[1] * 0.03f, pl.p[2] - pl.v[2] * 0.03f};
+                            line(short_tail, pl.p, 0.16f, 1.0f, 0.35f, 0.0f, 1.0f);
+                            ball(pl.p, 0.4f, 0, 1.0f, 0.35f, 0.0f, 1.0f);
+                        } else {
+                            line(tail, pl.p, 0.04f, 1.0f, 1.0f, 1.0f, 0.8f);
+                            sprite("softglow", pl.p, 0.2f, 0, 1.0f, 0.8f, 0.1f, 1.0f);
+                        }
+                    }
+                    // The core in flight: the "Grenade" object's own mesh (a small canister with a skull's
+                    // face), tumbling, at its real size of 0.31 u.
+                    static int have_core = -1;
+                    if (have_core < 0) have_core = hud_has_model("fx_core") ? 1 : 0;
+                    for (const Core &c : g_cores) {
+                        if (!c.alive || c.hidden) continue;
+                        if (have_core == 1) mesh("fx_core", c.p, 0.3092f * UK_UNIT, (float)(st.time - c.born) * 12.0f, 0, 0, 1.0f);
+                        else ball(c.p, 0.3f, 0, 1.0f, 0.3f, 0.1f, 1.0f);
+                    }
+                    // particles: pictures facing the eye, or thin streaks along their own motion
+                    for (const Particle &pt : g_particles) {
+                        if (!pt.alive || pt.hidden) continue;
+                        if (pt.streak) {
+                            float tail[3] = {pt.p[0] - pt.v[0] * 0.06f, pt.p[1] - pt.v[1] * 0.06f, pt.p[2] - pt.v[2] * 0.06f};
+                            float age = (float)(st.time - pt.born);
+                            thin_line(tail, pt.p, 0.03f, pt.r, pt.g, pt.b, pt.a * (1.0f - age / pt.life));
+                        } else {
+                            sprite(pt.sprite, pt.p, pt.size, 0, pt.r, pt.g, pt.b, pt.a);
+                        }
+                    }
+                    // Explosions, as the "Explosion" prefab is put together. The ball of fire grows by 15 u
+                    // of radius a second (1.75 times that for the larger one) and, past its full size, fades
+                    // over half a second while its texture scrolls. The faint shell runs ahead at 2.5 times
+                    // the speed to a third again the size. Two rings spread from the middle, the first by
+                    // 192 u of width a second and gone in 0.4 s, the second by 58 u a second, gone in 0.67 s.
+                    // The Knuckleblaster's wave is the shell and the slower ring alone.
                     for (const BlastFx &bf : g_blast_fx) {
                         float age = (float)(st.time - bf.born);
-                        if (bf.radius <= 0 || age < 0 || age > 0.5f) continue;
-                        float grow = age < 0.2f ? age / 0.2f : 1.0f, fade = age < 0.2f ? 1.0f : 1.0f - (age - 0.2f) / 0.3f;
-                        if (bf.wave) ball(bf.p, bf.radius * 0.5f * grow, bf.radius * 2.0f * (0.2f + age * 2.0f), 0.85f, 0.92f, 1.0f, fade * 0.7f);
-                        else ball(bf.p, bf.radius * 2.0f * (0.3f + 0.7f * grow), bf.radius * 2.0f * (0.4f + age * 2.4f), 1.0f, 0.55f, 0.1f, fade);
+                        if (bf.radius <= 0 || age < 0 || age > 1.2f || bf.hidden) continue;
+                        float speed = bf.wave ? 1.0f : bf.radius > EXPLOSION_RADIUS * 1.5f ? 1.75f : 1.0f;
+                        float fire_rate = 15.0f * UK_UNIT * speed, shell_rate = fire_rate * 2.5f, shell_full = bf.wave ? bf.radius : bf.radius * 8.0f / 6.0f;
+                        float fire = fire_rate * age, shell = 0.6f * UK_UNIT + shell_rate * age;
+                        float fire_alpha = fire <= bf.radius ? 1.0f : 1.0f - 2.0f * (age - bf.radius / fire_rate);
+                        float shell_alpha = shell <= shell_full ? 1.0f : 1.0f - 2.0f * (age - (shell_full - 0.6f * UK_UNIT) / shell_rate);
+                        if (have_fx == 1) {
+                            if (!bf.wave) mesh("fx_sphere", bf.p, fire, 0, 0, age, fire_alpha);
+                            mesh("fx_shock", bf.p, shell, 0, age, 0, 0.35f * shell_alpha);
+                        } else if (!bf.wave) {
+                            ball(bf.p, fire * 2.0f, 0, 1.0f, 0.55f, 0.1f, fire_alpha);
+                        }
+                        // One ring: the prefab's second ring is never switched on. By the prefab's numbers
+                        // it would spread by 192 u of width a second; it is a flat picture standing in the
+                        // world there, seldom seen face on, and drawn facing the eye at that rate it was far
+                        // larger than ULTRAKILL's looks (Davi's comparison), so it spreads at a third of it.
+                        sprite("Shockwave", bf.p, (3.84f + 64.0f * age) * UK_UNIT, 0, 1, 1, 1, (1.0f - 2.5f * age) * 0.5f);
                     }
+                    // Coins: ULTRAKILL's own coin at its own size (0.2 u across), turning end over end, with
+                    // the flash of its "CoinFlash" (the muzzle flash picture, 1.28 u across) while it can be
+                    // split and when it is hit, and a short pale trail. Without the effect meshes it is the
+                    // gold ring of before.
                     for (const Coin &c : g_coins) {
-                        if (!c.alive || st.coin_count >= HudState::MAX_COINS) continue;
+                        if (!c.alive || c.hidden) continue;
+                        float age = (float)(st.time - c.born);
+                        bool flash = c.shot || (age >= 0.35f && age < 0.417f);
+                        if (have_fx == 1) {
+                            // The trail: the last half second of the coin's path, 0.2 u wide, white, from a
+                            // quarter strength at the coin to nothing at its end (the gradient's 49% through
+                            // an additive material tinted a quarter grey).
+                            const float *from = c.p;
+                            for (int k = 0; k < c.trail_n; k++) {
+                                float fade = 1.0f - (k + 0.5f) / COIN_TRAIL;
+                                thin_line(from, c.trail[k], 0.2f * UK_UNIT * fade, 1.0f, 1.0f, 1.0f, 0.25f * fade);
+                                from = c.trail[k];
+                            }
+                            mesh("fx_coin", c.p, 0.1005f * UK_UNIT, age * 25.0f, 0, 0, 1.0f);
+                            if (flash) sprite("muzzleflash", c.p, 1.28f * UK_UNIT, age * 720.0f, 1, 1, 1, 1);
+                            continue;
+                        }
+                        if (st.coin_count >= HudState::MAX_COINS) continue;
                         float d[3] = {c.p[0] - eye[0], c.p[1] - eye[1], c.p[2] - eye[2]};
                         float vx = d[0] * right[0] + d[1] * right[1] + d[2] * right[2], vy = d[0] * up[0] + d[1] * up[1] + d[2] * up[2],
                               vz = d[0] * fwd[0] + d[1] * fwd[1] + d[2] * fwd[2];
                         if (vz < 0.2f) continue;
-                        float age = (float)(st.time - c.born);
                         HudState::CoinDot &dot = st.coins[st.coin_count++];
                         dot.x = vx / (vz * tan_x);
                         dot.y = vy / (vz * tan_y);
                         dot.size = 0.3f / (vz * tan_y * 2.0f);          // a coin drawn 0.3 m across
                         dot.phase = age * 25.0f;
-                        dot.flash = c.shot || (age >= 0.35f && age < 0.417f);
+                        dot.flash = flash;
                     }
                 }
                 hud_draw(dev, ctx, back, st);
@@ -3221,9 +3868,13 @@ static bool draw_full_hud(IDXGISwapChain *sc) {
     return ok;
 }
 
-// TimeController.ParryFlash: the screen goes white for 0.1 s and time stands still for 0.25 s. Here the
-// frame of the parry is shown under a white sheet for 0.1 s, then as it was for the rest, and the thread
-// that presents frames sleeps through both; the mod's clock leaves the time out.
+// TimeController.ParryFlash: a white sheet at 49% (the ParryFlash image's own colour) goes over the
+// screen and time stands still for 0.25 s of real time. The sheet is taken away by a timer of 0.1 s that
+// only runs once time does again, so it covers the whole stop and a tenth of a second after it. Here the
+// frame of the parry is shown under the sheet while the thread that presents frames waits out the stop
+// (to one deadline, so the two cannot add up to more), and the sheet then fades over the next 0.1 s.
+// The mod's clock leaves the stop out. (Until v0.63 the sheet was 85% white for 0.1 s and the picture was
+// then shown again without it for the rest of the stop.)
 static volatile LONG g_freezes = 0;
 static HRESULT WINAPI my_present(IDXGISwapChain *sc, UINT sync, UINT flags) {
     InterlockedIncrement(&g_presents);
@@ -3240,15 +3891,13 @@ static HRESULT WINAPI my_present(IDXGISwapChain *sc, UINT sync, UINT flags) {
     ID3D11Device *dev = nullptr;
     ID3D11DeviceContext *ctx = nullptr;
     ID3D11Texture2D *back = nullptr;
-    bool kept = false;
     if (SUCCEEDED(sc->GetDevice(__uuidof(ID3D11Device), (void **)&dev)) && dev) {
         dev->GetImmediateContext(&ctx);
         sc->GetBuffer(0, __uuidof(ID3D11Texture2D), (void **)&back);
         if (ctx && back) {
-            kept = hud_keep_frame(dev, ctx, back);
             HudState white;
             white.flash_only = true;
-            white.flash = 0.85f;
+            white.flash = 0.4902f;
             hud_draw(dev, ctx, back, white);
         }
     }
@@ -3259,18 +3908,9 @@ static HRESULT WINAPI my_present(IDXGISwapChain *sc, UINT sync, UINT flags) {
     double t0 = real_s();
     g_frozen_s = g_frozen_s + freeze;
     HRESULT hr = g_orig_present(sc, sync, flags);
-    DWORD flash_ms = freeze < 0.1f ? (DWORD)(freeze * 1000.0f) : 100, total_ms = (DWORD)(freeze * 1000.0f);
-    Sleep(flash_ms);
-    if (kept && ctx && total_ms > flash_ms) {
-        sc->GetBuffer(0, __uuidof(ID3D11Texture2D), (void **)&back);   // asked for again: a flip chain has moved on to another buffer
-        if (back) {
-            hud_put_frame(ctx, back);
-            back->Release();
-            g_orig_present(sc, sync, flags);
-        }
-    }
-    if (total_ms > flash_ms) Sleep(total_ms - flash_ms);
+    while (real_s() - t0 < (double)freeze - 0.002) Sleep(1);
     g_frozen_s = g_frozen_s + (real_s() - t0) - freeze;
+    g_flash_until = now_s() + 0.1;
     InterlockedIncrement(&g_freezes);
     if (ctx) ctx->Release();
     if (dev) dev->Release();
@@ -3482,7 +4122,7 @@ static DWORD WINAPI mod_thread(LPVOID) {
     char *slash = strrchr(path, '\\');
     strcpy(slash ? slash + 1 : path, "ultrasouls.log");
     g_log = fopen(path, "w");
-    logf("ultrasouls v0.61 loaded\n");
+    logf("ultrasouls v0.66 loaded\n");
     logf("settings: %s (sensitivity %.5f, fov scale %.1f, eye height %.2f, volume %.2f)\n", load_settings() ? "read from ultrasouls.ini" : "defaults, no ultrasouls.ini yet",
          (float)g_sens, (float)g_fov_scale, (float)g_eye_height, (float)g_volume);
     // Patching the code at startup made the game exit before showing a window (v0.7), so the hook

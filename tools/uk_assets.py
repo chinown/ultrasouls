@@ -121,7 +121,14 @@ EXTRA_SPRITES = ["RankD", "RankC", "RankB", "RankA", "RankS", "RankSS", "RankSSS
                  "RevolverSpecial", "RevolverSpecialGlow", "RevolverSharp", "RevolverSharpGlow", "Shotgun", "ShotgunGlow",
                  "Shockwave", "ShockwaveFilled", "glow", "muzzleflash", "muzzleflashshotgun", "spark",
                  # the fist icon's two pictures: HudController swaps them with the arm in use
-                 "ArmFeedbacker", "ArmKnuckleblaster"]
+                 "ArmFeedbacker", "ArmKnuckleblaster",
+                 # the Slab revolvers, the Pump Charge shotgun and the railcannons
+                 "RevolverAltSingle", "RevolverAltSingleGlow", "RevolverAltSpecial", "RevolverAltSpecialGlow", "RevolverAltSharp", "RevolverAltSharpGlow",
+                 "Shotgun1", "Shotgun1Glow", "Railcannon", "RailcannonGlow", "railcannonmalicious", "railcannonmaliciousglow"]
+
+
+# Plain textures the effects use as sprites (they are not Sprite objects in the game's files)
+EXTRA_TEXTURES = ["blooddrop"]                    # the revolver's hit particles
 
 
 def cmd_hud():
@@ -159,6 +166,21 @@ def cmd_hud():
                 print(f"sprite {m['name']!r} {m['w']}x{m['h']} (by name)")
         for n in wanted:
             print("sprite not found by name:", n)
+    need = [n for n in EXTRA_TEXTURES if n not in have]
+    if need:
+        for path in sorted({b for b in cab_index().values() if os.path.basename(b) in ("textures.bundle", "other_assets_all.bundle")}):
+            env = load_bundle(path)
+            for o in env.objects:
+                if need and o.type.name == "Texture2D" and o.peek_name() in need:
+                    name = o.peek_name()
+                    img = o.read().image
+                    img.save(os.path.join(out_s, safe(name) + ".png"))
+                    meta["sprites"].append({"name": name, "path_id": o.path_id, "file": safe(name) + ".png", "w": img.width, "h": img.height,
+                                            "border": [0, 0, 0, 0], "ppu": 100.0})
+                    need.remove(name)
+                    print(f"texture {name!r} {img.width}x{img.height} (by name)")
+        for n in need:
+            print("texture not found by name:", n)
     json.dump(meta, open(os.path.join(ASSETS, "hud_assets.json"), "w", encoding="utf-8"), indent=1)
 
 

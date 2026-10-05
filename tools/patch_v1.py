@@ -50,6 +50,10 @@ ARM_ROWS = {
     # air is the "super" one, 12 units and twice the damage
     "explosion": (9000142, 3.5,                       0.6,   3.0,    4,        400,   4.0),
     "explosion_super": (9000143, 7.0,                 0.6,   6.0,    4,        600,   6.0),
+    # the Pump Charge shotgun fired at three pumps: the same explosion half again as large, at damage 50 against 35
+    "explosion_pump": (9000144, 5.0,                  0.6,   4.5,    4,        400,   4.0),
+    # 'Explosion Malicious Railcannon': 13.5 units, damage 50 with enemyDamageMultiplier 1.25
+    "explosion_malicious": (9000172, 6.25,            0.6,   6.75,   4,        600,   6.0),
 }
 PELLET_ID = 9000140         # one shotgun pellet. Shotgun.Shoot sends twelve; Projectile deals damage / 4 = a quarter of a revolver shot
 # Dark Souls takes a flat defence off every hit, which punishes many small hits. Measured on a hollow that
@@ -60,6 +64,19 @@ PELLET_DAMAGE = int(REVOLVER_DAMAGE * 0.57)
 PELLET_SPEED = 37.5         # 75 units a second
 PELLET_RANGE = 60.0
 SHARP_ID = 9000150          # the Sharpshooter's charged shot: goes through enemies (hitAmount 999); the DLL does the ricochets
+# The alternate ("Slab") revolvers and the Railcannon. ULTRAKILL's beams hit one enemy up to maxHitsPerTarget
+# times for `damage` each; a row here deals that product in one hit.
+#   'Revolver Beam Alternative'         1.25 x 2: the Slab's plain shot
+#   'Revolver Beam Super Alternative'   1.25 x 4, through enemies: the Slab Piercer's charged shot
+#   'Revolver Beam Sharp Alternative'   1.25 x 2, through enemies: the Slab Sharpshooter's
+#   'Railcannon Beam'                   2 x 4, through enemies: the Electric Railcannon
+#   'Railcannon Beam Malicious'         2, stops at the first thing it meets and sets off its explosion there
+#              id       damage  trail  through  radius  name
+MORE_SHOTS = [(9000160, 2.5,    20131, 0,       0.15,   "slab"),
+              (9000161, 5.0,    20133, 1,       0.3,    "slab_charged"),
+              (9000162, 2.5,    20133, 1,       0.3,    "slab_sharpshooter"),
+              (9000170, 8.0,    20133, 1,       0.3,    "railcannon"),
+              (9000171, 2.0,    20133, 0,       0.3,    "railcannon_malicious")]
 PUNCH_SPEED = 30.0          # m/s: slow enough to exist for four frames. At the revolver's 300 m/s the punch
                             # lived 7 ms, less than a frame, and never hit anything (v0.49: 11 punches in reach, no damage)
 PUNCH_RADIUS = 0.5          # the 1-unit sphere ULTRAKILL sweeps when the straight line misses
@@ -122,18 +139,22 @@ for r in shop.order:
 coin_rows = [(COIN_ID + i, power) for i, power in enumerate(COIN_POWERS)]
 g.add_rows("AtkParam_Pc", [(REVOLVER_ID, 1050, "revolver"), (PIERCER_ID, 1050, "piercer")] + [(rid, 1050, "coin") for rid, _ in coin_rows]
            + [(PUNCH_ID, 1050, "punch")] + [(v[0], 1050, k) for k, v in ARM_ROWS.items()]
-           + [(PELLET_ID, 1050, "pellet"), (SHARP_ID, 1050, "sharpshooter")])
+           + [(PELLET_ID, 1050, "pellet"), (SHARP_ID, 1050, "sharpshooter")] + [(m[0], 1050, m[5]) for m in MORE_SHOTS])
 g.add_rows("Bullet", [(REVOLVER_ID, 603, "revolver"), (PIERCER_ID, 603, "piercer")] + [(rid, 603, "coin") for rid, _ in coin_rows]
            + [(PUNCH_ID, 603, "punch")] + [(v[0], 603, k) for k, v in ARM_ROWS.items()]
-           + [(PELLET_ID, 603, "pellet"), (SHARP_ID, 603, "sharpshooter")])
+           + [(PELLET_ID, 603, "pellet"), (SHARP_ID, 603, "sharpshooter")] + [(m[0], 603, m[5]) for m in MORE_SHOTS])
 g.add_rows("BehaviorParam_PC", [(REVOLVER_ID, 101103300, "revolver"), (PIERCER_ID, 101103300, "piercer")]
            + [(rid, 101103300, "coin") for rid, _ in coin_rows] + [(PUNCH_ID, 101103300, "punch")]
            + [(v[0], 101103300, k) for k, v in ARM_ROWS.items()]
-           + [(PELLET_ID, 101103300, "pellet"), (SHARP_ID, 101103300, "sharpshooter")])
+           + [(PELLET_ID, 101103300, "pellet"), (SHARP_ID, 101103300, "sharpshooter")] + [(m[0], 101103300, m[5]) for m in MORE_SHOTS])
 atk, bul, beh = g["AtkParam_Pc"], g["Bullet"], g["BehaviorParam_PC"]
-shots = [(REVOLVER_ID, REVOLVER_DAMAGE, 20131, 20230, 0, 0.15), (PIERCER_ID, PIERCER_DAMAGE, 20133, 20236, 1, 0.3)]
-shots += [(rid, REVOLVER_DAMAGE * power, 20133, 20236, 0, 0.3) for rid, power in coin_rows]
-shots += [(SHARP_ID, REVOLVER_DAMAGE, 20133, 20236, 1, 0.3)]
+# Dark Souls' own effect where a projectile lands (20230 and 20236 are bursts of sparks and lightning) is
+# switched off for every shot: the DLL draws ULTRAKILL's hit particles there instead.
+NO_EFFECT = -1
+shots = [(REVOLVER_ID, REVOLVER_DAMAGE, 20131, NO_EFFECT, 0, 0.15), (PIERCER_ID, PIERCER_DAMAGE, 20133, NO_EFFECT, 1, 0.3)]
+shots += [(rid, REVOLVER_DAMAGE * power, 20133, NO_EFFECT, 0, 0.3) for rid, power in coin_rows]
+shots += [(SHARP_ID, REVOLVER_DAMAGE, 20133, NO_EFFECT, 1, 0.3)]
+shots += [(rid, int(REVOLVER_DAMAGE * mult), sfx, NO_EFFECT, pierce, radius) for rid, mult, sfx, pierce, radius, _ in MORE_SHOTS]
 for rid, damage, sfx, sfx_hit, pierce, radius in shots:
     # The attack row stays exactly as the throwing knife's apart from the damage: the game's own
     # flat-damage rows all keep their "Correction" at 100, and zeroing it made the shots do nothing.
@@ -177,7 +198,7 @@ for rid, mult, reach, radius, level, poise, knock in ARM_ROWS.values():
 
 # a pellet: a slower, short-lived row with no trail of its own (the DLL draws the pellets)
 atk.set(PELLET_ID, "atkPhys", PELLET_DAMAGE)
-for k, v in (("atkId_Bullet", PELLET_ID), ("sfxId_Bullet", -1), ("sfxId_Hit", 20230), ("sfxId_Flick", -1),
+for k, v in (("atkId_Bullet", PELLET_ID), ("sfxId_Bullet", -1), ("sfxId_Hit", NO_EFFECT), ("sfxId_Flick", -1),
              ("initVellocity", PELLET_SPEED), ("maxVellocity", PELLET_SPEED), ("minVellocity", PELLET_SPEED),
              ("accelInRange", 0.0), ("accelOutRange", 0.0), ("gravityInRange", 0.0), ("gravityOutRange", 0.0),
              ("dist", PELLET_RANGE), ("life", PELLET_RANGE / PELLET_SPEED), ("hitRadius", 0.1), ("isPenetrate", 0)):
@@ -185,6 +206,18 @@ for k, v in (("atkId_Bullet", PELLET_ID), ("sfxId_Bullet", -1), ("sfxId_Hit", 20
 beh.set(PELLET_ID, "refId", PELLET_ID)
 beh.set(PELLET_ID, "variationId", 0)
 beh.set(PELLET_ID, "behaviorJudgeId", 0)
+
+# Every row the DLL fires is made silent and sparkless at its end. A projectile row carries three things
+# for that moment: its hit effect (sfxId_Hit), a switch for the sparks its "material" makes on what it
+# strikes (isAttackSFX), and the material itself, which also picks the sound (the throwing knife's is
+# type 2, material 0: a blade on stone or flesh). With only the first cleared, every shot and punch still
+# ended in a faint knock somewhere ahead, and punches in a burst of sparks. The values set here are the
+# ones the game's own spell projectiles carry (571 of its 632 rows): type 0, material 6, no sparks.
+OWN_ROWS = [REVOLVER_ID, PIERCER_ID, SHARP_ID, PUNCH_ID, PELLET_ID] + [rid for rid, _ in coin_rows] + [v[0] for v in ARM_ROWS.values()] + [m[0] for m in MORE_SHOTS]
+for rid in OWN_ROWS:
+    for k, v in (("sfxId_Hit", NO_EFFECT), ("sfxId_Flick", NO_EFFECT), ("isAttackSFX", 0), ("Material_AttackType", 0), ("Material_AttackMaterial", 6),
+                 ("Material_Size", 0)):
+        bul.set(rid, k, v)
 
 os.makedirs(os.path.dirname(OUT), exist_ok=True)
 g.save(OUT)
@@ -201,6 +234,9 @@ assert abs(chk["Bullet"].get(PUNCH_ID, "life") - PUNCH_REACH / PUNCH_SPEED) < 1e
 assert chk["AtkParam_Pc"].get(ARM_ROWS["knuckle"][0], "dmgLevel") == 4 and chk["Bullet"].get(ARM_ROWS["blast"][0], "hitRadius") == 3.0
 assert chk["Bullet"].get(PELLET_ID, "initVellocity") == PELLET_SPEED and chk["AtkParam_Pc"].get(PELLET_ID, "atkPhys") == PELLET_DAMAGE
 assert chk["Bullet"].get(SHARP_ID, "isPenetrate") == 1 and chk["Bullet"].get(ARM_ROWS["explosion_super"][0], "hitRadius") == 6.0
+assert all(chk["Bullet"].get(r, "sfxId_Hit") == NO_EFFECT and chk["Bullet"].get(r, "isAttackSFX") == 0 and chk["Bullet"].get(r, "Material_AttackMaterial") == 6 for r in OWN_ROWS)
+assert chk["AtkParam_Pc"].get(9000170, "atkPhys") == REVOLVER_DAMAGE * 8 and chk["Bullet"].get(9000161, "isPenetrate") == 1 and chk["Bullet"].get(9000171, "isPenetrate") == 0
+assert chk["Bullet"].get(ARM_ROWS["explosion_malicious"][0], "hitRadius") == 6.75 and chk["BehaviorParam_PC"].get(9000162, "refId") == 9000162
 assert chk["Bullet"].get(PUNCH_ID, "dist") == PUNCH_REACH and chk["AtkParam_Pc"].get(PUNCH_ID, "atkPhys") == PUNCH_DAMAGE
 assert all(chk["BehaviorParam_PC"].get(r, "stamina") == 0 for r in chk["BehaviorParam_PC"].order)
 assert chk["SpEffectParam"].get(HEAL_SPEFFECT, "changeHpPoint") == -HEAL_PER_HIT

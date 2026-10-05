@@ -24,7 +24,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 BUILD = os.path.join(HERE, "..", "build")
 GAME_DIR = r"F:\SteamLibrary\steamapps\common\DARK SOULS REMASTERED"
 CLASSES = ("NewMovement", "Revolver", "Coin", "GroundCheck", "RevolverBeam", "Punch", "WeaponCharges", "PlayerFootsteps", "Shotgun",
-           "Grenade")
+           "Grenade", "Railcannon", "RevolverAnimationReceiver")
 
 # sound name in the pack -> (class, object the component is on, field). A field that names a prefab is
 # followed to the first AudioSource under it. Volumes and pitches are set by the DLL, from ULTRAKILL's code.
@@ -78,6 +78,20 @@ WANTED = {
     "twirl_shot": ("Revolver", "Revolver Twirl", "twirlShotSound"),
     "twirl_loop": ("Revolver", "Revolver Twirl", "chargeEffect"),
     "ricochet": ("RevolverBeam", "Revolver Beam Sharp", "ricochetSound"),
+    # the alternate ("Slab") revolvers
+    "shot_slab": ("Revolver", "Alternative Revolver Pierce", "gunShots[0]"),
+    "shot_super_alt": ("Revolver", "Alternative Revolver Pierce", "superGunSound"),
+    "slab_click": ("RevolverAnimationReceiver", "Revolver_Rerigged_Alternate", "click"),   # the hammer coming back, 0.89 s after a shot
+    # the Pump Charge shotgun
+    "pump1": ("Shotgun", "Shotgun Pump", "pump1sound"),
+    "pump2": ("Shotgun", "Shotgun Pump", "pump2sound"),
+    "pump_charge": ("Shotgun", "Shotgun Pump", "pumpChargeSound"),
+    "pump_warning": ("Shotgun", "Shotgun Pump", "warningBeep"),      # pumped three times: it will go off in the hand
+    # the Railcannon
+    "rail_fire": ("Railcannon", "Railcannon Electric", "fireSound"),
+    "rail_fire_malicious": ("Railcannon", "Railcannon Malicious", "fireSound"),
+    "rail_hum": ("Railcannon", "Railcannon Electric", "fullCharge"),
+    "rail_charged": ("WeaponCharges", "Guns", "railCannonFullChargeSound"),
 }
 
 

@@ -4,6 +4,7 @@
 //   build/hud_test.exe build/ultrasouls_assets.bin build/hud_test
 #include <windows.h>
 #include <d3d11.h>
+#include <cmath>
 #include <cstdio>
 #include <cstdint>
 #include <string>
@@ -259,6 +260,33 @@ int main(int argc, char **argv) {
         shots.push_back({f.name, s, {0.30f, 0.30f, 0.32f, 1}});
     }
 
+    // ULTRAKILL's effect meshes and sprites in the world, seen by a camera at the origin looking along +Z
+    for (int k = 0; k < 3; k++) {
+        static const char *const fx_names[3] = {"fx_explosion_a", "fx_explosion_b", "fx_coins"};
+        s = HudState();
+        s.time = 140.0;
+        s.cam_valid = true;
+        s.cam_tan_y = 0.8f;
+        s.cam_tan_x = 0.8f * 16.0f / 9.0f;
+        if (k < 2) {
+            float grow = k == 0 ? 0.6f : 1.0f, fade = k == 0 ? 1.0f : 0.5f;
+            s.world_meshes[s.world_mesh_count++] = {"fx_sphere", {0, 0.5f, 9}, 3.0f * grow, 0, {0, 0.3f * (k + 1)}, {1, 1, 1, fade}};
+            s.world_meshes[s.world_mesh_count++] = {"fx_shock", {0, 0.5f, 9}, 4.0f * grow, 0, {0.4f * (k + 1), 0}, {1, 1, 1, 0.35f * fade}};
+            s.fx_sprites[s.fx_sprite_count++] = {"Shockwave", 0.0f, 0.07f, 0.9f + 0.6f * k, 0, 1, 1, 1, 0.5f * fade};
+            for (int i = 0; i < 24; i++)
+                s.fx_sprites[s.fx_sprite_count++] = {nullptr, cosf(i * 0.9f) * (0.25f + 0.02f * i), 0.07f + sinf(i * 0.9f) * (0.3f + 0.02f * i), 0.012f + 0.001f * i, 0, 1, 1, 1, 1};
+        } else {
+            for (int i = 0; i < 5; i++)
+                s.world_meshes[s.world_mesh_count++] = {"fx_coin", {-2.0f + i, 0.6f, 5}, 0.3f, 0.7f * i, {0, 0}, {1, 1, 1, 1}};
+            for (int i = 0; i < 20; i++)
+                s.fx_sprites[s.fx_sprite_count++] = {i % 2 ? "blooddrop" : "spark", -0.5f + 0.05f * i, -0.3f + 0.02f * (i % 5), 0.02f, 0, 1, 1, 1, 1};
+            s.fx_sprites[s.fx_sprite_count++] = {"muzzleflash", 0.3f, 0.4f, 0.2f, 30, 1, 1, 1, 1};
+            for (int i = 0; i < 4; i++)
+                s.world_meshes[s.world_mesh_count++] = {"fx_core", {-1.2f + 0.8f * i, -0.4f, 3}, 0.31f, 0.9f * i, {0, 0}, {1, 1, 1, 1}};
+        }
+        shots.push_back({fx_names[k], s, {0.22f, 0.24f, 0.28f, 1}});
+    }
+
     // strips for checking motion: the spin through a whole turn, and the shotgun's two reloads
     static char strip_names[40][24];
     int sn = 0;
@@ -288,6 +316,102 @@ int main(int argc, char **argv) {
         s.revolver_clip_start = 97.0 - 3.3 * i / 8.0;
         snprintf(strip_names[sn], sizeof(strip_names[sn]), "sgcore_%d", i);
         shots.push_back({strip_names[sn++], s, {0.28f, 0.30f, 0.28f, 1}});
+    }
+
+    // v0.66: the alternate revolvers, the Pump Charge shotgun and the railcannons
+    static char new_names[80][24];
+    int nn = 0;
+    auto add = [&](const char *fmt, int i, const HudState &st, float r, float g, float b) {
+        snprintf(new_names[nn], sizeof(new_names[nn]), fmt, i);
+        shots.push_back({new_names[nn++], st, {r, g, b, 1}});
+    };
+    for (int v = 0; v < 3; v++) {
+        s = HudState();
+        s.time = 150.0;
+        s.alt = true;
+        s.variation = v;
+        s.sharp_charge = 200.0f;
+        s.coin_charge = 250.0f;
+        add("slab_idle_%d", v, s, 0.30f, 0.30f, 0.33f);
+    }
+    for (int i = 0; i < 8; i++) {
+        s = HudState();
+        s.time = 151.0;
+        s.alt = true;
+        s.variation = 1;
+        s.revolver_clip = "Shoot";
+        s.revolver_clip_start = 151.0 - 1.4 * i / 8.0;
+        add("slab_shoot_%d", i, s, 0.30f, 0.30f, 0.33f);
+    }
+    for (int i = 0; i < 8; i++) {
+        s = HudState();
+        s.time = 152.0;
+        s.alt = true;
+        s.variation = 2;
+        s.twirl = 6.2831853f * i / 8.0f;
+        s.twirl_blend = 1.0f;
+        s.sharp_charge = 300.0f;
+        add("slab_twirl_%d", i, s, 0.30f, 0.26f, 0.26f);
+    }
+    for (int i = 0; i < 4; i++) {
+        s = HudState();
+        s.time = 153.0;
+        s.alt = true;
+        s.variation = 0;
+        s.revolver_clip = i < 2 ? "PickUpWithReload" : "ShootTwirl";
+        s.revolver_clip_start = 153.0 - (i < 2 ? 0.3 + 0.6 * i : 0.1 + 0.25 * (i - 2));
+        add("slab_reload_%d", i, s, 0.30f, 0.30f, 0.33f);
+    }
+    for (int i = 0; i < 6; i++) {
+        static const float charges[6] = {0.0f, 0.6f, 1.5f, 2.5f, 3.7f, 5.0f};
+        s = HudState();
+        s.time = 160.0;
+        s.weapon = 2;
+        s.rail_charge = charges[i];
+        add("rail_charge_%d", i, s, 0.28f, 0.28f, 0.32f);
+    }
+    s = HudState();
+    s.time = 161.0;
+    s.weapon = 2;
+    s.weapon_var = 1;
+    add("rail_malicious_%d", 0, s, 0.30f, 0.26f, 0.26f);
+    for (int i = 0; i < 6; i++) {
+        s = HudState();
+        s.time = 162.0;
+        s.weapon = 2;
+        s.rail_charge = 0.0f;
+        s.revolver_clip = "Fire";
+        s.revolver_clip_start = 162.0 - 1.3 * i / 6.0;
+        if (i == 0) s.muzzle_flash = 162.0;
+        add("rail_fire_%d", i, s, 0.28f, 0.28f, 0.32f);
+    }
+    for (int i = 0; i < 3; i++) {
+        s = HudState();
+        s.time = 163.0;
+        s.weapon = 2;
+        s.revolver_clip = "Equip";
+        s.revolver_clip_start = 163.0 - 0.1 - 0.35 * i;
+        add("rail_equip_%d", i, s, 0.28f, 0.28f, 0.32f);
+    }
+    for (int i = 0; i < 4; i++) {
+        static const float rgb[4][3] = {{0.27f, 1, 0.27f}, {0.27f, 1, 0.27f}, {0.63f, 0.63f, 0.26f}, {1, 0, 0}};
+        s = HudState();
+        s.time = 170.0;
+        s.weapon = 1;
+        s.weapon_var = 1;
+        s.core_meter = i / 3.0f;
+        s.meter_rgb_set = true;
+        memcpy(s.meter_rgb, rgb[i], sizeof(s.meter_rgb));
+        add("pump_meter_%d", i, s, 0.28f, 0.30f, 0.28f);
+    }
+    for (int i = 0; i < 6; i++) {
+        s = HudState();
+        s.time = 171.0;
+        s.weapon = 1;
+        s.weapon_var = 1;
+        s.revolver_clip = i < 3 ? "Pump2" : "FireWithPump";
+        s.revolver_clip_start = 171.0 - (i < 3 ? 0.1 + 0.2 * i : 0.2 + 0.3 * (i - 3));
+        add("pump_clip_%d", i, s, 0.28f, 0.30f, 0.28f);
     }
 
     for (Shot &shot : shots) {

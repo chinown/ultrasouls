@@ -49,13 +49,21 @@ GAME_DIR = r"F:\SteamLibrary\steamapps\common\DARK SOULS REMASTERED"
 SAMPLE_FPS = 60.0
 CAB = uk_assets.REVOLVER_PREFAB[0]
 MODELS = {"revolver": "Revolver Pierce", "feedbacker": "Arm Blue", "knuckleblaster": "Arm Red",
-          "shotgun": "Shotgun Grenade"}     # pack name -> prefab root object
+          "shotgun": "Shotgun Grenade", "revolver_alt": "Alternative Revolver Pierce",
+          "railcannon": "Railcannon Electric"}     # pack name -> prefab root object
 # The displays on each weapon: model -> [(name prefix, the prefab they are read from)]. The three
 # revolvers share one rig, so the Marksman's and the Sharpshooter's displays are fixed to the same bone of
 # the one revolver model that is packed.
 SCREENS = {"revolver": [("pierce", "Revolver Pierce"), ("marksman", "Revolver Ricochet"), ("sharp", "Revolver Twirl")],
-           "shotgun": [("core", "Shotgun Grenade")]}
+           "revolver_alt": [("pierce", "Alternative Revolver Pierce"), ("marksman", "Alternative Revolver Ricochet"), ("sharp", "Alternative Revolver Twirl")],
+           "shotgun": [("core", "Shotgun Grenade"), ("pump", "Shotgun Pump")]}
 BATTERY = (("batteryFull", "battery_full"), ("batteryMid", "battery_mid"), ("batteryLow", "battery_low"))
+# Meshes of ULTRAKILL's effects, packed as models of one fixed part: pack name -> (prefab root, object in it).
+# Each is scaled so that its furthest point is 1 from its middle; the DLL gives it the size the effect has.
+PROPS = {"fx_sphere": ("Explosion", "Sphere_8"),          # the explosion's ball of fire (its texture scrolls)
+         "fx_shock": ("Explosion", "Sphere_8 (1)"),       # the faint shell that runs ahead of it
+         "fx_coin": ("Coin", "Model"),                    # the Marksman's coin
+         "fx_core": ("Grenade", "Grenade")}               # the shotgun's ejected core
 
 
 def find_root(name):
@@ -252,25 +260,35 @@ def build_model(name, root_name):
             weights = weights / np.where(total > 1e-9, total, 1.0)
             binds = [np.array([[getattr(b, f"e{r}{col}") for col in range(4)] for r in range(4)], dtype=np.float64) for b in mesh.m_BindPose]
             bones = [(index[b["m_PathID"]], binds[i][:3, :].reshape(-1)) for i, b in enumerate(t["m_Bones"])]
-            tris = []
+            # One mesh entry per look: the parts of a mesh are grouped by their material's texture and
+            # colour, and a coloured material gets its own tinted copy of the texture. (Until v0.63 every
+            # part was drawn with the first material's texture: the shotgun's black screen and its orange
+            # heat sinks came out in the gun's own brown.)
+            looks = {}
             for si, sub in enumerate(h.get_triangles()):
-                # A part drawn with an additive particle material only shows while the game lights it up
-                # (the shotgun's heat glow: its tint's alpha is driven by code). Drawn as plain geometry
-                # it was two dark slabs beside the barrels, so such parts are left out.
                 smat = follow(c, t["m_Materials"][si]) if si < len(t["m_Materials"]) else None
+                # A part drawn with an additive particle material only shows while the game lights it up
+                # (the shotgun's heat glow: its tint's alpha is driven by code), so it is left out.
                 if smat is not None and any(n == "_TintColor" for n, _ in smat.read_typetree()["m_SavedProperties"]["m_Colors"]):
                     print("    %s: part %d (%s) left out" % (node["name"], si, smat.read_typetree()["m_Name"]))
                     continue
-                tris.extend(sub)
-            mat = follow(c, t["m_Materials"][0]) if t["m_Materials"] else None
-            tex, _color = material_texture(mat)
-            tname = tex.peek_name() if tex else "white"
-            if tname not in tex_index:
-                img = (tex.read().image if tex else Image.new("RGBA", (4, 4), (255, 255, 255, 255))).convert("RGBA")
-                tex_index[tname] = len(textures)
-                textures.append((tname, img.width, img.height, img.tobytes()))
+                tex, color = material_texture(smat)
+                rgb = tuple(int(round(min(max(x, 0.0), 1.0) * 255)) for x in color[:3])
+                tname = (tex.peek_name() if tex else "white") + ("" if rgb == (255, 255, 255) else "_%02x%02x%02x" % rgb)
+                if tname not in tex_index:
+                    img = (tex.read().image if tex else Image.new("RGBA", (4, 4), (255, 255, 255, 255))).convert("RGBA")
+                    if rgb != (255, 255, 255):
+                        r, g, bl, al = img.split()
+                        img = Image.merge("RGBA", (r.point(lambda v: v * rgb[0] // 255), g.point(lambda v: v * rgb[1] // 255), bl.point(lambda v: v * rgb[2] // 255), al))
+                    tex_index[tname] = len(textures)
+                    textures.append((tname, img.width, img.height, img.tobytes()))
+                looks.setdefault(tname, []).extend(sub)
+                used = sorted({i for tri in sub for i in tri})
+                lo, hi = pos[used].min(axis=0), pos[used].max(axis=0)
+                print("    %s part %d: %s, %d triangles, box %s to %s" % (node["name"], si, tname, len(sub), np.round(lo, 3), np.round(hi, 3)))
             verts = np.concatenate([pos, nrm, uv], axis=1).astype("<f4")
-            meshes.append((node["name"], tex_index[tname], verts, slots, weights.astype("<f4"), np.array(tris, dtype="<u4").reshape(-1), bones))
+            for tname, tris in looks.items():
+                meshes.append((node["name"], tex_index[tname], verts, slots, weights.astype("<f4"), np.array(tris, dtype="<u4").reshape(-1), bones))
 
     clips = []
     base_paths = {}
@@ -488,15 +506,61 @@ def build_screens(prefix, root_name, node_rows, textures, tex_index):
     return out
 
 
+def build_prop(name, root_name, part_name):
+    """One rigid mesh as a model: a single node, and every vertex fully on its one bone."""
+    from PIL import Image
+    from UnityPy.helpers.MeshHelper import MeshHandler
+    nodes = prefab_nodes(find_root(root_name))
+    pid = next(p for p, n in nodes.items() if n["name"] == part_name and any(c.type.name == "MeshFilter" for c in n["components"]))
+    node = nodes[pid]
+    mf = next(c for c in node["components"] if c.type.name == "MeshFilter")
+    mr = next(c for c in node["components"] if c.type.name == "MeshRenderer")
+    mesh = follow(mf, mf.read_typetree()["m_Mesh"]).read()
+    h = MeshHandler(mesh)
+    h.process()
+    pos = np.array(h.m_Vertices, dtype=np.float64).reshape(-1, 3)
+    nrm = np.array(h.m_Normals, dtype=np.float64).reshape(-1, 3) if h.m_Normals else np.zeros_like(pos)
+    uv = np.array(h.m_UV0, dtype=np.float64).reshape(len(pos), -1)[:, :2].copy() if h.m_UV0 else np.zeros((len(pos), 2))
+    uv[:, 1] = 1.0 - uv[:, 1]
+    # the part's own proportions (the coin is a cylinder squashed flat), then unit size
+    s = node["local"]["m_LocalScale"]
+    pos = pos * np.array([s["x"], s["y"], s["z"]])
+    # its real size, for the DLL's constants: the furthest point from its middle, in the prefab's units
+    world_pts = (node["world"] @ np.concatenate([np.array(h.m_Vertices, dtype=np.float64).reshape(-1, 3), np.ones((len(pos), 1))], axis=1).T).T[:, :3]
+    real = np.linalg.norm(world_pts - (world_pts.max(axis=0) + world_pts.min(axis=0)) / 2, axis=1).max()
+    pos = pos - (pos.max(axis=0) + pos.min(axis=0)) / 2
+    pos = pos / np.linalg.norm(pos, axis=1).max()
+    tris = []
+    for sub in h.get_triangles():
+        tris.extend(sub)
+    mat = follow(mr, mr.read_typetree()["m_Materials"][0])
+    tex, color = material_texture(mat)
+    img = (tex.read().image if tex else Image.new("RGBA", (4, 4), (255, 255, 255, 255))).convert("RGBA")
+    textures = [(tex.peek_name() if tex else "white", img.width, img.height, img.tobytes())]
+    verts = np.concatenate([pos, nrm, uv], axis=1).astype("<f4")
+    slots = np.zeros((len(pos), 4), dtype="<u2")
+    weights = np.zeros((len(pos), 4), dtype="<f4")
+    weights[:, 0] = 1.0
+    bind = np.eye(4)[:3, :].reshape(-1)
+    meshes = [(part_name, 0, verts, slots, weights, np.array(tris, dtype="<u4").reshape(-1), [(0, bind)])]
+    node_rows = [(name, -1, [0, 0, 0, 0, 0, 0, 1, 1, 1, 1])]
+    print("    prop %-10s %d vertices, texture %s %dx%d, material colour %s, real radius %.4f units" % (
+        name, len(pos), textures[0][0], img.width, img.height, [round(c, 2) for c in color], real))
+    return name, node_rows, textures, meshes, []
+
+
 def _name(s):
     return s.encode("ascii", "replace").ljust(40, b"\0")[:40]
 
 
 def cmd_pack(install=False):
     out = bytearray(b"USMDL002")
-    out += struct.pack("<I", len(MODELS))
-    for name, root_name in MODELS.items():
-        name, node_rows, textures, meshes, clips = build_model(name, root_name)
+    out += struct.pack("<I", len(MODELS) + len(PROPS))
+    for name, root_name in list(MODELS.items()) + list(PROPS.items()):
+        if name in PROPS:
+            name, node_rows, textures, meshes, clips = build_prop(name, *root_name)
+        else:
+            name, node_rows, textures, meshes, clips = build_model(name, root_name)
         tex_index = {t[0]: i for i, t in enumerate(textures)}
         screens = []
         for prefix, prefab in SCREENS.get(name, []):

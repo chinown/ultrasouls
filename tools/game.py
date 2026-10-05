@@ -3,7 +3,9 @@
   python tools/game.py start                 launch through Steam and load the last save
   python tools/game.py shot NAME [SCALE]     screenshot -> build/shots/NAME.png and NAME_small.png
   python tools/game.py do CMD [CMD ...]      input commands, e.g. "key 0x74" "rel 300 0" "mdown 960 540" "wait 1.5" "mup"
+  python tools/game.py clip NAME CMD [...]   the same input commands, recorded: frames -> build/shots/NAME_000.png ...
   python tools/game.py log [N]               last N lines of the mod's log
+  python tools/game.py hp                    the player's health, read from the game's memory
   python tools/game.py quit [--keep]         save, return to the title screen and close the game, then put
                                              the save file back as it was before `start` (unless --keep)
 
@@ -124,6 +126,26 @@ def do(drive, commands):
             print(c, "->", drive.cmd(c))
 
 
+def clip(name, commands, fps=20, width=960):
+    """Record the game window while a `do` sequence runs, then save the frames as SHOTS/NAME_000.png ...
+    (for effects that are over in a fraction of a second: an explosion, a muzzle flash, pellets in flight)."""
+    import subprocess
+    os.makedirs(SHOTS, exist_ok=True)
+    base = os.path.join(SHOTS, name)
+    for old in glob.glob(base + "_[0-9][0-9][0-9].png"):
+        os.remove(old)
+    rec = win.Recorder(exe=EXE, out=base, fps=fps, audio=False)
+    rec.start()
+    time.sleep(0.6)                                # the recorder needs a moment before its first frame
+    do(win.Drive(PROC), commands)
+    rec.stop()
+    subprocess.run([win.ffmpeg_win(), "-hide_banner", "-loglevel", "error", "-y", "-i", base + ".mkv", "-vf", "scale=%d:-2" % width,
+                    base + "_%03d.png"], check=False)
+    frames = sorted(glob.glob(base + "_[0-9][0-9][0-9].png"))
+    print("%d frames at %d fps: %s ... %s" % (len(frames), fps, frames[0] if frames else "-", frames[-1] if frames else "-"))
+    return frames
+
+
 def start():
     if not running():
         backup_save()
@@ -157,9 +179,66 @@ def start():
     for _ in range(60):
         if any(l.startswith("physics step hook") for l in log_lines()):
             print("in game; mod hooks installed")
+            try:
+                protect(True)
+            except Exception as e:
+                print("could not set the no-damage flag:", e)
             return
         time.sleep(1)
     sys.exit("the save did not load (no hook line in the mod log)")
+
+
+def _process():
+    """(handle, exe base) of the running game, opened for reading and writing its memory."""
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    psapi = ctypes.WinDLL("psapi", use_last_error=True)
+    k32.OpenProcess.restype = ctypes.wintypes.HANDLE
+    psapi.EnumProcessModules.argtypes = [ctypes.wintypes.HANDLE, ctypes.POINTER(ctypes.c_void_p), ctypes.wintypes.DWORD,
+                                         ctypes.POINTER(ctypes.wintypes.DWORD)]
+    h = k32.OpenProcess(0x0010 | 0x0020 | 0x0008 | 0x0400, False, running())
+    mods = (ctypes.c_void_p * 1)()
+    need = ctypes.wintypes.DWORD()
+    psapi.EnumProcessModules(h, mods, ctypes.sizeof(mods), ctypes.byref(need))
+    return k32, h, mods[0]
+
+
+def _read(k32, h, addr, n):
+    k32.ReadProcessMemory.argtypes = [ctypes.wintypes.HANDLE, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_size_t)]
+    buf = ctypes.create_string_buffer(n)
+    got = ctypes.c_size_t()
+    if not k32.ReadProcessMemory(h, ctypes.c_void_p(addr), buf, n, ctypes.byref(got)):
+        raise OSError("read failed at %x" % addr)
+    return buf.raw
+
+
+# The player object is [[exe+1C77E50]+0x68]; its second flag word is at +0x524 (DSR-Gadget's ChrFlags2 at
+# 0x514, moved by 0x10 in this build, as health is). Bit 0x40 is "no damage".
+PLAYER_FLAGS2 = 0x524
+FLAG_NO_DAMAGE = 0x40
+
+
+def protect(on=True):
+    """Make the player take no damage for this session, so a character left standing among enemies while a
+    test script runs is still alive at the end. The flag lives in memory only, and the save is restored anyway."""
+    import struct
+    k32, h, base = _process()
+    world = struct.unpack("<Q", _read(k32, h, base + 0x1C77E50, 8))[0]
+    player = struct.unpack("<Q", _read(k32, h, world + 0x68, 8))[0]
+    flags = struct.unpack("<I", _read(k32, h, player + PLAYER_FLAGS2, 4))[0]
+    new = (flags | FLAG_NO_DAMAGE) if on else (flags & ~FLAG_NO_DAMAGE)
+    k32.WriteProcessMemory.argtypes = [ctypes.wintypes.HANDLE, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_size_t)]
+    got = ctypes.c_size_t()
+    ok = k32.WriteProcessMemory(h, ctypes.c_void_p(player + PLAYER_FLAGS2), struct.pack("<I", new), 4, ctypes.byref(got))
+    hp = struct.unpack("<ii", _read(k32, h, player + 0x3E8, 8))
+    print("player flags %08x -> %08x (%s); hp %d/%d" % (flags, new, "written" if ok else "WRITE FAILED", hp[0], hp[1]))
+
+
+def player_hp():
+    import struct
+    k32, h, base = _process()
+    world = struct.unpack("<Q", _read(k32, h, base + 0x1C77E50, 8))[0]
+    player = struct.unpack("<Q", _read(k32, h, world + 0x68, 8))[0]
+    return struct.unpack("<ii", _read(k32, h, player + 0x3E8, 8))
 
 
 def first_person_on():
@@ -211,8 +290,12 @@ if __name__ == "__main__":
         print(shot(sys.argv[2], float(sys.argv[3]) if len(sys.argv) > 3 else 0.5))
     elif cmd == "do":
         do(win.Drive(PROC), sys.argv[2:])
+    elif cmd == "clip" and len(sys.argv) >= 4:
+        clip(sys.argv[2], sys.argv[3:])
     elif cmd == "log":
         print("\n".join(log_lines()[-(int(sys.argv[2]) if len(sys.argv) > 2 else 20):]))
+    elif cmd == "hp":
+        print("player hp %d/%d" % player_hp())
     elif cmd == "quit":
         quit_game(keep="--keep" in sys.argv[2:])
     else:

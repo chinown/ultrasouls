@@ -115,6 +115,15 @@ def export_font(obj, out_dir):
             "render_mode": t.get("m_AtlasRenderMode"), "scale": face.get("m_Scale", 1.0), "chars": chars}
 
 
+EXTRA_SPRITE_CAB = "cab-de51d3e6aa471d5bb7ced5fa03cdd504"       # in textures.bundle
+EXTRA_SPRITES = ["RankD", "RankC", "RankB", "RankA", "RankS", "RankSS", "RankSSS", "RankU",
+                 # the other weapon icons, and what the effects are drawn with
+                 "RevolverSpecial", "RevolverSpecialGlow", "RevolverSharp", "RevolverSharpGlow", "Shotgun", "ShotgunGlow",
+                 "Shockwave", "ShockwaveFilled", "glow", "muzzleflash", "muzzleflashshotgun", "spark",
+                 # the fist icon's two pictures: HudController swaps them with the arm in use
+                 "ArmFeedbacker", "ArmKnuckleblaster"]
+
+
 def cmd_hud():
     sprites, fonts = hud_refs()
     out_s, out_f = os.path.join(ASSETS, "sprites"), os.path.join(ASSETS, "fonts")
@@ -137,6 +146,19 @@ def cmd_hud():
         m = export_font(o, out_f)
         meta["fonts"].append(m)
         print(f"font {m['name']!r} atlas {m['atlas_w']}x{m['atlas_h']} point size {m['point_size']} glyphs {len(m['chars'])} mode {m['render_mode']} padding {m['padding']}")
+    # sprites the HUD needs that no canvas object points at: the style meter's rank letters are swapped in by code
+    have = {m["name"] for m in meta["sprites"]}
+    wanted = [n for n in EXTRA_SPRITES if n not in have]
+    if wanted:
+        env = load_bundle(cab_index()[EXTRA_SPRITE_CAB])
+        for o in env.objects:
+            if o.type.name == "Sprite" and o.assets_file.name.lower() == EXTRA_SPRITE_CAB and o.peek_name() in wanted:
+                m = export_sprite(o, out_s)
+                meta["sprites"].append(m)
+                wanted.remove(m["name"])
+                print(f"sprite {m['name']!r} {m['w']}x{m['h']} (by name)")
+        for n in wanted:
+            print("sprite not found by name:", n)
     json.dump(meta, open(os.path.join(ASSETS, "hud_assets.json"), "w", encoding="utf-8"), indent=1)
 
 

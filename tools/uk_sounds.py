@@ -23,7 +23,8 @@ from uk_bundles import cab_index
 HERE = os.path.dirname(os.path.abspath(__file__))
 BUILD = os.path.join(HERE, "..", "build")
 GAME_DIR = r"F:\SteamLibrary\steamapps\common\DARK SOULS REMASTERED"
-CLASSES = ("NewMovement", "Revolver", "Coin", "GroundCheck", "RevolverBeam", "Punch", "WeaponCharges", "PlayerFootsteps")
+CLASSES = ("NewMovement", "Revolver", "Coin", "GroundCheck", "RevolverBeam", "Punch", "WeaponCharges", "PlayerFootsteps", "Shotgun",
+           "Grenade")
 
 # sound name in the pack -> (class, object the component is on, field). A field that names a prefab is
 # followed to the first AudioSource under it. Volumes and pitches are set by the DLL, from ULTRAKILL's code.
@@ -57,6 +58,26 @@ WANTED = {
     "punch_swing": ("Punch", "Arm Blue", "m_GameObject"),
     "punch_hit": ("Punch", "Arm Blue", "normalHit"),
     "punch_hit_heavy": ("Punch", "Arm Blue", "heavyHit"),
+    # the Knuckleblaster ("Arm Red") and its blast wave
+    "knuckle_swing": ("Punch", "Arm Red", "aud"),
+    "knuckle_hit": ("Punch", "Arm Red", "normalHit"),
+    "knuckle_hit_heavy": ("Punch", "Arm Red", "heavyHit"),
+    "knuckle_blast": ("Punch", "Arm Red", "blastWave"),
+    "knuckle_eject": ("Punch", "Arm Red", "shellEjector"),            # the shells thrown out after a blast
+    "punch_projectile": ("Punch", "Arm Blue", "specialHit"),          # a punched projectile: the projectile boost
+    # the Core Eject shotgun
+    "shotgun_shot": ("Shotgun", "Shotgun Grenade", "shootSound"),
+    "shotgun_click": ("Shotgun", "Shotgun Grenade", "clickSound"),
+    "shotgun_smack": ("Shotgun", "Shotgun Grenade", "smackSound"),
+    "shotgun_core": ("Shotgun", "Shotgun Grenade", "grenadeSoundBubble"),
+    "shotgun_charge": ("Shotgun", "Shotgun Grenade", "chargeSoundBubble"),
+    "explosion": ("Shotgun", "Shotgun Grenade", "explosion"),
+    "explosion_super": ("Grenade", "Grenade", "superExplosion"),      # a core shot in the air
+    # the Sharpshooter
+    "shot_sharpshooter": ("Revolver", "Revolver Twirl", "gunShots[0]"),
+    "twirl_shot": ("Revolver", "Revolver Twirl", "twirlShotSound"),
+    "twirl_loop": ("Revolver", "Revolver Twirl", "chargeEffect"),
+    "ricochet": ("RevolverBeam", "Revolver Beam Sharp", "ricochetSound"),
 }
 
 
@@ -73,6 +94,9 @@ def clip_of(owner, pptr, depth=0):
     kind = target.type.name
     if kind == "AudioClip":
         return target, 1.0, 1.0, "clip"
+    if kind in ("Transform", "RectTransform") and depth < 3:
+        # a field that names a transform (the Knuckleblaster's shell ejector): its object's AudioSource
+        return clip_of(target, target.read_typetree()["m_GameObject"], depth + 1)
     if kind == "AudioSource":
         t = target.read_typetree()
         clip = follow(target, t.get("m_audioClip"))

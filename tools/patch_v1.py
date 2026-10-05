@@ -37,6 +37,31 @@ COIN_POWERS = (2, 3, 4, 5)  # Coin.power starts at 2 and gains 1 per extra coin 
 PUNCH_ID = 9000130          # the Feedbacker's punch: an unseen, very short projectile from the eye
 PUNCH_DAMAGE = REVOLVER_DAMAGE   # Punch: damage 1, the same as a plain revolver shot
 PUNCH_REACH = 2.0           # 4 units
+# The other arm attacks are rows of the same kind. Dark Souls' own stagger settings do the rest:
+# dmgLevel 3 is a heavy stagger and 4 knocks a character off its feet; atkSuperArmor is poise damage.
+#                 id        damage (x a revolver shot)  reach  radius  dmgLevel  poise  knockback
+ARM_ROWS = {
+    "parry":   (9000131, 2.0,                         2.0,   0.5,    3,        200,   1.0),   # a punch that lands on an attacking enemy
+    "knuckle": (9000132, 2.5,                         2.0,   0.5,    4,        400,   3.0),   # Knuckleblaster: damage 2.5, force 100 against 25
+    "blast":   (9000133, 1.0,                         1.5,   3.0,    4,        400,   5.0),   # its blast wave: wide, mostly a shove
+    # the shotgun fired into an attacking enemy at arm's length (Shotgun.Shoot's 4-unit "shotgunzone": 4 x 1.5)
+    "shotgun_parry": (9000141, 6.0,                   2.0,   0.5,    4,        400,   3.0),
+    # Explosion: a core or a punched pellet going off is 6 units across at damage 3.5; a core shot in the
+    # air is the "super" one, 12 units and twice the damage
+    "explosion": (9000142, 3.5,                       0.6,   3.0,    4,        400,   4.0),
+    "explosion_super": (9000143, 7.0,                 0.6,   6.0,    4,        600,   6.0),
+}
+PELLET_ID = 9000140         # one shotgun pellet. Shotgun.Shoot sends twelve; Projectile deals damage / 4 = a quarter of a revolver shot
+# Dark Souls takes a flat defence off every hit, which punishes many small hits. Measured on a hollow that
+# one revolver shot takes 64 health from: a pellet at 0.45 of the revolver's attack value took 10. By the
+# game's damage formula for an attack below the defence (0.4 a^3/d^2 - 0.09 a^2/d + 0.1 a, which gives
+# that 10 with d = 136), 0.57 of the revolver's attack value is what lands a quarter of its damage there.
+PELLET_DAMAGE = int(REVOLVER_DAMAGE * 0.57)
+PELLET_SPEED = 37.5         # 75 units a second
+PELLET_RANGE = 60.0
+SHARP_ID = 9000150          # the Sharpshooter's charged shot: goes through enemies (hitAmount 999); the DLL does the ricochets
+PUNCH_SPEED = 30.0          # m/s: slow enough to exist for four frames. At the revolver's 300 m/s the punch
+                            # lived 7 ms, less than a frame, and never hit anything (v0.49: 11 punches in reach, no damage)
 PUNCH_RADIUS = 0.5          # the 1-unit sphere ULTRAKILL sweeps when the straight line misses
 BEAM_SPEED = 300.0          # m/s, as close to hitscan as a projectile gets
 BEAM_RANGE = 150.0
@@ -96,14 +121,19 @@ for r in shop.order:
 #    Damage is flat, from a copy of the throwing knife's attack row.
 coin_rows = [(COIN_ID + i, power) for i, power in enumerate(COIN_POWERS)]
 g.add_rows("AtkParam_Pc", [(REVOLVER_ID, 1050, "revolver"), (PIERCER_ID, 1050, "piercer")] + [(rid, 1050, "coin") for rid, _ in coin_rows]
-           + [(PUNCH_ID, 1050, "punch")])
+           + [(PUNCH_ID, 1050, "punch")] + [(v[0], 1050, k) for k, v in ARM_ROWS.items()]
+           + [(PELLET_ID, 1050, "pellet"), (SHARP_ID, 1050, "sharpshooter")])
 g.add_rows("Bullet", [(REVOLVER_ID, 603, "revolver"), (PIERCER_ID, 603, "piercer")] + [(rid, 603, "coin") for rid, _ in coin_rows]
-           + [(PUNCH_ID, 603, "punch")])
+           + [(PUNCH_ID, 603, "punch")] + [(v[0], 603, k) for k, v in ARM_ROWS.items()]
+           + [(PELLET_ID, 603, "pellet"), (SHARP_ID, 603, "sharpshooter")])
 g.add_rows("BehaviorParam_PC", [(REVOLVER_ID, 101103300, "revolver"), (PIERCER_ID, 101103300, "piercer")]
-           + [(rid, 101103300, "coin") for rid, _ in coin_rows] + [(PUNCH_ID, 101103300, "punch")])
+           + [(rid, 101103300, "coin") for rid, _ in coin_rows] + [(PUNCH_ID, 101103300, "punch")]
+           + [(v[0], 101103300, k) for k, v in ARM_ROWS.items()]
+           + [(PELLET_ID, 101103300, "pellet"), (SHARP_ID, 101103300, "sharpshooter")])
 atk, bul, beh = g["AtkParam_Pc"], g["Bullet"], g["BehaviorParam_PC"]
 shots = [(REVOLVER_ID, REVOLVER_DAMAGE, 20131, 20230, 0, 0.15), (PIERCER_ID, PIERCER_DAMAGE, 20133, 20236, 1, 0.3)]
 shots += [(rid, REVOLVER_DAMAGE * power, 20133, 20236, 0, 0.3) for rid, power in coin_rows]
+shots += [(SHARP_ID, REVOLVER_DAMAGE, 20133, 20236, 1, 0.3)]
 for rid, damage, sfx, sfx_hit, pierce, radius in shots:
     # The attack row stays exactly as the throwing knife's apart from the damage: the game's own
     # flat-damage rows all keep their "Correction" at 100, and zeroing it made the shots do nothing.
@@ -120,13 +150,41 @@ for rid, damage, sfx, sfx_hit, pierce, radius in shots:
 # the punch: the same kind of row, but it only travels the punch's reach, is wider, and has no visible trail
 atk.set(PUNCH_ID, "atkPhys", PUNCH_DAMAGE)
 for k, v in (("atkId_Bullet", PUNCH_ID), ("sfxId_Bullet", -1), ("sfxId_Hit", 20230), ("sfxId_Flick", -1),
-             ("initVellocity", BEAM_SPEED), ("maxVellocity", BEAM_SPEED), ("minVellocity", BEAM_SPEED),
+             ("initVellocity", PUNCH_SPEED), ("maxVellocity", PUNCH_SPEED), ("minVellocity", PUNCH_SPEED),
              ("accelInRange", 0.0), ("accelOutRange", 0.0), ("gravityInRange", 0.0), ("gravityOutRange", 0.0),
-             ("dist", PUNCH_REACH), ("life", PUNCH_REACH / BEAM_SPEED), ("hitRadius", PUNCH_RADIUS), ("isPenetrate", 0)):
+             ("dist", PUNCH_REACH), ("life", PUNCH_REACH / PUNCH_SPEED), ("hitRadius", PUNCH_RADIUS), ("isPenetrate", 0)):
     bul.set(PUNCH_ID, k, v)
 beh.set(PUNCH_ID, "refId", PUNCH_ID)
 beh.set(PUNCH_ID, "variationId", 0)
 beh.set(PUNCH_ID, "behaviorJudgeId", 0)
+
+for rid, mult, reach, radius, level, poise, knock in ARM_ROWS.values():
+    atk.set(rid, "atkPhys", int(REVOLVER_DAMAGE * mult))
+    atk.set(rid, "dmgLevel", level)
+    atk.set(rid, "atkSuperArmor", poise)
+    atk.set(rid, "knockbackDist", knock)
+    # The hit effect: the game's large burst (20236) suits the wide rows, which are explosions; on the
+    # arm's-length ones it whited out the whole view for a third of a second (seen in a v0.59 recording),
+    # so those use the small spark the plain punch has.
+    for k, v in (("atkId_Bullet", rid), ("sfxId_Bullet", -1), ("sfxId_Hit", 20236 if radius > 1.0 else 20230), ("sfxId_Flick", -1),
+                 ("initVellocity", PUNCH_SPEED), ("maxVellocity", PUNCH_SPEED), ("minVellocity", PUNCH_SPEED),
+                 ("accelInRange", 0.0), ("accelOutRange", 0.0), ("gravityInRange", 0.0), ("gravityOutRange", 0.0),
+                 ("dist", reach), ("life", reach / PUNCH_SPEED), ("hitRadius", radius), ("isPenetrate", 1 if radius > 1.0 else 0)):
+        bul.set(rid, k, v)
+    beh.set(rid, "refId", rid)
+    beh.set(rid, "variationId", 0)
+    beh.set(rid, "behaviorJudgeId", 0)
+
+# a pellet: a slower, short-lived row with no trail of its own (the DLL draws the pellets)
+atk.set(PELLET_ID, "atkPhys", PELLET_DAMAGE)
+for k, v in (("atkId_Bullet", PELLET_ID), ("sfxId_Bullet", -1), ("sfxId_Hit", 20230), ("sfxId_Flick", -1),
+             ("initVellocity", PELLET_SPEED), ("maxVellocity", PELLET_SPEED), ("minVellocity", PELLET_SPEED),
+             ("accelInRange", 0.0), ("accelOutRange", 0.0), ("gravityInRange", 0.0), ("gravityOutRange", 0.0),
+             ("dist", PELLET_RANGE), ("life", PELLET_RANGE / PELLET_SPEED), ("hitRadius", 0.1), ("isPenetrate", 0)):
+    bul.set(PELLET_ID, k, v)
+beh.set(PELLET_ID, "refId", PELLET_ID)
+beh.set(PELLET_ID, "variationId", 0)
+beh.set(PELLET_ID, "behaviorJudgeId", 0)
 
 os.makedirs(os.path.dirname(OUT), exist_ok=True)
 g.save(OUT)
@@ -139,6 +197,10 @@ assert chk["BehaviorParam_PC"].get(PIERCER_ID, "refId") == PIERCER_ID and chk["A
 assert chk["AtkParam_Pc"].get(COIN_ID + 1, "atkPhys") == REVOLVER_DAMAGE * 3 and chk["Bullet"].get(COIN_ID + 3, "atkId_Bullet") == COIN_ID + 3
 assert chk["AtkParam_Pc"].get(COIN_ID + 1, "atkPhys") == REVOLVER_DAMAGE * 3 and chk["Bullet"].get(COIN_ID + 3, "atkId_Bullet") == COIN_ID + 3
 assert chk["AtkParam_Pc"].get(COIN_ID + 1, "atkPhys") == REVOLVER_DAMAGE * 3 and chk["Bullet"].get(COIN_ID + 3, "atkId_Bullet") == COIN_ID + 3
+assert abs(chk["Bullet"].get(PUNCH_ID, "life") - PUNCH_REACH / PUNCH_SPEED) < 1e-4 and chk["Bullet"].get(PUNCH_ID, "initVellocity") == PUNCH_SPEED
+assert chk["AtkParam_Pc"].get(ARM_ROWS["knuckle"][0], "dmgLevel") == 4 and chk["Bullet"].get(ARM_ROWS["blast"][0], "hitRadius") == 3.0
+assert chk["Bullet"].get(PELLET_ID, "initVellocity") == PELLET_SPEED and chk["AtkParam_Pc"].get(PELLET_ID, "atkPhys") == PELLET_DAMAGE
+assert chk["Bullet"].get(SHARP_ID, "isPenetrate") == 1 and chk["Bullet"].get(ARM_ROWS["explosion_super"][0], "hitRadius") == 6.0
 assert chk["Bullet"].get(PUNCH_ID, "dist") == PUNCH_REACH and chk["AtkParam_Pc"].get(PUNCH_ID, "atkPhys") == PUNCH_DAMAGE
 assert all(chk["BehaviorParam_PC"].get(r, "stamina") == 0 for r in chk["BehaviorParam_PC"].order)
 assert chk["SpEffectParam"].get(HEAL_SPEFFECT, "changeHpPoint") == -HEAL_PER_HIT

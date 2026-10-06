@@ -414,6 +414,180 @@ int main(int argc, char **argv) {
         add("pump_clip_%d", i, s, 0.28f, 0.30f, 0.28f);
     }
 
+    // v0.67: the lights on the guns, the railcannon's meter and moving parts, beams drawn with pictures,
+    // and an explosion's ball pressed against a floor and a wall
+    for (int v = 0; v < 6; v++) {
+        s = HudState();
+        s.time = 180.0;
+        s.alt = v >= 3;
+        s.variation = v % 3;
+        s.cylinder = 0.5f * v;
+        s.pierce_ready = 70.0f;
+        add("lights_%d", v, s, 0.10f, 0.10f, 0.12f);
+    }
+    for (int i = 0; i < 4; i++) {
+        static const float charges[4] = {0.5f, 2.4f, 4.5f, 5.0f};
+        s = HudState();
+        s.time = 181.0 + 0.013 * i;
+        s.weapon = 2;
+        s.weapon_var = i == 3 ? 1 : 0;
+        s.rail_charge = charges[i] > 4.0f ? 5.0f : charges[i];
+        s.rail_meter = true;
+        s.rail_flash = i == 2 ? 0.7f : 0.0f;
+        add("railhud_%d", i, s, 0.10f, 0.10f, 0.12f);
+    }
+    for (int k = 0; k < 8; k++) {
+        // each beam from the muzzle (down and to the right of an eye at the origin looking along +Z) to a wall
+        // 40 m off, fresh and then half spent; the railcannons' also seen from the side, 6 m away
+        static const int kinds[8] = {BEAM_REVOLVER, BEAM_SLAB, BEAM_SUPER, BEAM_SHARP, BEAM_RAIL, BEAM_RAIL, BEAM_MALICIOUS, BEAM_MALICIOUS};
+        int kind = kinds[k];
+        bool side = k == 5 || k == 7;
+        s = HudState();
+        s.time = 182.0 + 0.07 * k;
+        s.weapon = kind >= BEAM_RAIL ? 2 : 0;
+        s.weapon_var = kind == BEAM_MALICIOUS ? 1 : 0;
+        s.alt = kind == BEAM_SLAB;
+        s.variation = kind == BEAM_SHARP ? 2 : kind == BEAM_SUPER ? 0 : 1;
+        s.rail_charge = 0.0f;
+        s.rail_meter = true;
+        s.show_viewmodel = !side;
+        s.cam_valid = true;
+        s.cam_tan_y = 1.3f;
+        s.cam_tan_x = 1.3f * 16.0f / 9.0f;
+        float left = side ? 0.8f : k % 2 ? 0.5f : 1.0f;
+        if (side) {
+            const float a[3] = {-12, -0.5f, 6}, b[3] = {14, 0.5f, 6};
+            hud_beam(s, a, b, kind, BEAM_LOOKS[kind].width_u * 0.5f * left, 0.5f, 0xFF, k);
+        } else {
+            const float a[3] = {0.35f, -0.3f, 0.9f}, b[3] = {0.5f, 1.0f, 40.0f};
+            hud_beam(s, a, b, kind, BEAM_LOOKS[kind].width_u * 0.5f * left, 0.5f, 0xFF, k);
+        }
+        add("beam_%d", k, s, 0.10f, 0.10f, 0.12f);
+    }
+    static float limit_a[64], limit_b[64];
+    for (int k = 0; k < 2; k++) {
+        // an explosion 1 m over a floor and 1.5 m from a wall on its right, at two sizes
+        s = HudState();
+        s.time = 183.0;
+        s.show_viewmodel = true;
+        s.cam_valid = true;
+        s.cam_tan_y = 0.8f;
+        s.cam_tan_x = 0.8f * 16.0f / 9.0f;
+        float dirs[64 * 3];
+        const char *names[2] = {"fx_sphere", "fx_shock"};
+        float *limits[2] = {limit_a, limit_b};
+        int counts[2];
+        for (int m = 0; m < 2; m++) {
+            counts[m] = hud_model_dirs(names[m], dirs, 64);
+            for (int v = 0; v < counts[m]; v++) {
+                float lim = 1e9f;
+                if (dirs[v * 3 + 1] < -0.01f) lim = fminf(lim, 1.0f / -dirs[v * 3 + 1]);
+                if (dirs[v * 3] > 0.01f) lim = fminf(lim, 1.5f / dirs[v * 3]);
+                limits[m][v] = lim;
+            }
+        }
+        float grow = k == 0 ? 0.6f : 1.0f;
+        s.world_meshes[s.world_mesh_count++] = {"fx_sphere", {0, 0.2f, 9}, 3.0f * grow, 0, {0, 0.3f}, {1, 1, 1, 1}, limit_a, counts[0]};
+        s.world_meshes[s.world_mesh_count++] = {"fx_shock", {0, 0.2f, 9}, 4.0f * grow, 0, {0.4f, 0}, {1, 1, 1, 0.35f}, limit_b, counts[1]};
+        // where the floor and the wall are, as lines
+        s.tracers[s.tracer_count++] = {-0.9f, -0.2f * 1.0f / 0.8f * 0.11f - 0.0f, 0.9f, -0.2f * 1.0f / 0.8f * 0.11f, 0.002f, 0.002f, 1, 0, 0, 1, true};
+        add("fx_pressed_%d", k, s, 0.22f, 0.24f, 0.28f);
+        printf("fx_sphere has %d vertices, fx_shock %d\n", counts[0], counts[1]);
+    }
+
+    // v0.69: the whiplash arm through its three clips, with its cable to a point 20 m ahead
+    {
+        static const struct { const char *clip; float at; bool out; float warp; } whip[] = {
+            {"Throw", 0.05f, true, 0.8f}, {"Throw", 0.20f, true, 0.3f}, {"Throw", 0.60f, true, 0.0f}, {"Pull", 0.20f, true, 0.0f},
+            {"Pull", 1.60f, true, 0.0f},  {"Catch", 0.10f, false, 0.0f}, {"Catch", 0.40f, false, 0.0f}, {"Catch", 0.70f, false, 0.0f},
+        };
+        int k = 0;
+        for (const auto &w : whip) {
+            s = HudState();
+            s.time = 190.0;
+            s.whip_clip = w.clip;
+            s.whip_clip_start = 190.0 - w.at;
+            s.whip_hold = w.out;
+            s.whip_out = w.out;
+            s.cam_valid = true;
+            s.cam_tan_y = 0.8f;
+            s.cam_tan_x = 0.8f * 16.0f / 9.0f;
+            if (w.out) {
+                // as the DLL does it: the cable starts where the hand was drawn the frame before
+                hud_draw(dev, ctx, target, s);
+                float hx = -0.45f, hy = -0.55f;
+                bool known = hud_whip_hand(&hx, &hy);
+                printf("whip %s %.2f: hand at %.2f %.2f (%s)\n", w.clip, w.at, hx, hy, known ? "drawn" : "default");
+                const float hook[3] = {0.5f, 0.6f, 20.0f}, wire[3] = {0.16f, 0.16f, 0.155f}, claw[3] = {0.30f, 0.33f, 0.30f};
+                float hand[3] = {hx * s.cam_tan_x * 0.6f, hy * s.cam_tan_y * 0.6f, 0.6f}, prev[3], pt[3];
+                memcpy(prev, hand, sizeof(prev));
+                for (int j = 1; j <= 8; j++) {
+                    float wobble = j < 8 ? 1.0f / j * (j % 2 == 0 ? -3.0f : 3.0f) * w.warp * 0.5f : 0.0f;
+                    for (int i = 0; i < 3; i++) pt[i] = j < 8 ? hand[i] + (hook[i] - hand[i]) * (j / 9.0f) + (i == 1 ? wobble : 0.0f) : hook[i];
+                    hud_strip(s, prev, pt, 0.05f, wire, wire, 1.0f, nullptr, 0, 0, 0.01f);
+                    memcpy(prev, pt, sizeof(prev));
+                }
+                float tail[3] = {hook[0], hook[1], hook[2] - 0.3f};
+                hud_strip(s, tail, hook, 0.15f, claw, claw, 1.0f, nullptr, 0, 0, 0.03f);
+            }
+            add("whip_%d", k++, s, 0.45f, 0.43f, 0.40f);
+        }
+    }
+
+    // v0.70: an explosion's pictures behind a punching arm and the gun (0), and the same given no distance,
+    // which is how the HUD's own pictures are drawn: over everything (1)
+    for (int k = 0; k < 2; k++) {
+        s = HudState();
+        s.time = 195.0;
+        s.arm_clip = "Jab";
+        s.arm_clip_start = 195.0 - 0.2;
+        float z = k == 0 ? 6.0f : 0.0f;
+        s.fx_sprites[s.fx_sprite_count++] = {"Shockwave", 0.0f, -0.2f, 1.2f, 0, 1, 1, 1, 0.8f, z};
+        for (int i = 0; i < 40; i++)
+            s.fx_sprites[s.fx_sprite_count++] = {nullptr, -0.8f + 0.04f * i, -0.6f + 0.2f * (i % 5), 0.03f, 0, 1, 1, 1, 1, z};
+        s.blasts[s.blast_count++] = {0.1f, -0.3f, 0.3f, 0, 1.0f, 0.55f, 0.1f, 1.0f, z};
+        add("cover_%d", k, s, 0.30f, 0.30f, 0.33f);
+    }
+
+    // v0.75: the Sawblade Launcher: at rest (both variations), drawing, firing, the heated shot; saws and a magnet in the world
+    {
+        static const struct { const char *clip; float at; int var; const char *note; } saw[] = {
+            {nullptr, 0, 0, "SAWS 10  MAGNETS 3"}, {nullptr, 0, 1, "HEAT 62%  SINK IN"}, {"Equip", 0.15f, 0, ""}, {"Equip", 0.50f, 0, ""},
+            {"Shoot", 0.04f, 0, "SAWS 7  MAGNETS 1"}, {"Shoot", 0.15f, 0, ""}, {"ShootSuper", 0.10f, 1, "HEAT 0%  SINK OUT"}, {"ShootSuper", 0.40f, 1, ""},
+        };
+        int k = 0;
+        for (const auto &w : saw) {
+            s = HudState();
+            s.time = 198.0;
+            s.weapon = 3;
+            s.weapon_var = w.var;
+            snprintf(s.weapon_note, sizeof(s.weapon_note), "%s", w.note);
+            s.revolver_clip = w.clip;
+            s.revolver_clip_start = w.clip ? 198.0 - w.at : -100.0;
+            s.cam_valid = true;
+            s.cam_tan_y = 0.8f;
+            s.cam_tan_x = 0.8f * 16.0f / 9.0f;
+            if (k < 2) {
+                // a saw 8 m off (2 m across for the Attractor's, 1.5 m for the Overheat's), a heated one further, and a magnet
+                s.fx_sprites[s.fx_sprite_count++] = {"sawblade", -0.25f, 0.2f, (k == 0 ? 2.0f : 1.5f) / (8.0f * 0.8f * 2.0f), 30, k == 0 ? 1.0f : 0.5f, k == 0 ? 1.0f : 0.5f, k == 0 ? 1.0f : 0.5f, 1, 8.0f};
+                s.fx_sprites[s.fx_sprite_count++] = {"sawblade 2", 0.35f, 0.35f, 3.0f / (14.0f * 0.8f * 2.0f), 70, 1.0f, 0.6f, 0.0f, 1, 14.0f};
+                s.world_meshes[s.world_mesh_count++] = {"fx_magnet", {-1.5f, 0.5f, 6.0f}, 0.4857f, 0, {0, 0}, {1, 1, 1, 1}, nullptr, 0};
+            }
+            add("saw_%d", k++, s, 0.33f, 0.34f, 0.37f);
+        }
+    }
+
+    // v0.73: blood on the screen after a heal, fresh and half gone
+    s = HudState();
+    s.time = 196.0;
+    s.health = 60;
+    s.screen_blood_count = 4;
+    s.screen_blood[0] = {-300, 120, 0, 0.49f};
+    s.screen_blood[1] = {250, -180, 2, 0.49f};
+    s.screen_blood[2] = {60, 40, 4, 0.25f};
+    s.screen_blood[3] = {380, 230, 1, 0.12f};
+    add("screen_blood_%d", 0, s, 0.55f, 0.52f, 0.47f);
+
     for (Shot &shot : shots) {
         ctx->ClearRenderTargetView(rtv, shot.bg);
         // two frames, so values that ease in have settled where a single frame would put them

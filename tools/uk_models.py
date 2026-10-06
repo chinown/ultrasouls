@@ -50,7 +50,8 @@ SAMPLE_FPS = 60.0
 CAB = uk_assets.REVOLVER_PREFAB[0]
 MODELS = {"revolver": "Revolver Pierce", "feedbacker": "Arm Blue", "knuckleblaster": "Arm Red",
           "shotgun": "Shotgun Grenade", "revolver_alt": "Alternative Revolver Pierce",
-          "railcannon": "Railcannon Electric"}     # pack name -> prefab root object
+          "railcannon": "Railcannon Electric", "whiplash": "Hook Arm",
+          "sawlauncher": "Sawblade Launcher Magnet"}     # pack name -> prefab root object
 # The displays on each weapon: model -> [(name prefix, the prefab they are read from)]. The three
 # revolvers share one rig, so the Marksman's and the Sharpshooter's displays are fixed to the same bone of
 # the one revolver model that is packed.
@@ -61,14 +62,17 @@ BATTERY = (("batteryFull", "battery_full"), ("batteryMid", "battery_mid"), ("bat
 # Meshes of ULTRAKILL's effects, packed as models of one fixed part: pack name -> (prefab root, object in it).
 # Each is scaled so that its furthest point is 1 from its middle; the DLL gives it the size the effect has.
 PROPS = {"fx_sphere": ("Explosion", "Sphere_8"),          # the explosion's ball of fire (its texture scrolls)
+         "fx_sphere_super": ("Explosion Super", "Sphere_8"),   # the super explosion's, with its own redder picture
          "fx_shock": ("Explosion", "Sphere_8 (1)"),       # the faint shell that runs ahead of it
          "fx_coin": ("Coin", "Model"),                    # the Marksman's coin
-         "fx_core": ("Grenade", "Grenade")}               # the shotgun's ejected core
+         "fx_core": ("Grenade", "Grenade"),               # the shotgun's ejected core
+         "fx_magnet": ("Harpoon", "Plane002")}            # the Attractor's magnet (a sawblade is a flat picture: tools/uk_assets.py)
 
 
 def find_root(name):
     """(asset file, path id) of the prefab root object called `name` (a GameObject whose transform has no parent)."""
     env = load_bundle(cab_index()[CAB])
+    inner = None
     for o in env.objects:
         if o.type.name != "GameObject":
             continue
@@ -77,8 +81,15 @@ def find_root(name):
             continue
         for c in t["m_Component"]:
             tr = follow(o, c["component"])
-            if tr is not None and tr.type.name == "Transform" and tr.read_typetree()["m_Father"]["m_PathID"] == 0:
-                return (o.assets_file.name.lower(), o.path_id)
+            if tr is not None and tr.type.name == "Transform":
+                if tr.read_typetree()["m_Father"]["m_PathID"] == 0:
+                    return (o.assets_file.name.lower(), o.path_id)
+                if inner is None:
+                    inner = (o.assets_file.name.lower(), o.path_id)
+    # The whiplash is not a prefab of its own: its 'Hook Arm' object is part of the player's, under the
+    # 'Punch' object the other arms are put under when they are equipped. The first one found is taken.
+    if inner is not None:
+        return inner
     raise SystemExit("prefab root not found: " + name)
 
 
@@ -210,7 +221,9 @@ def build_model(name, root_name):
                 break
         wanted = {b["path"] for b in first.read_typetree()["m_ClipBindingConstant"]["genericBindings"]} if first is not None else set()
         best = -1
-        for base in animators:
+        # (the whiplash's start at 'GreenArmFinal', which has no Animator at all: every object is tried,
+        # those with an Animator first)
+        for base in animators + [pid for pid in order if pid not in animators]:
             cand = paths_below(base)
             score = len(wanted & set(cand))
             if score > best:
@@ -283,6 +296,19 @@ def build_model(name, root_name):
                     tex_index[tname] = len(textures)
                     textures.append((tname, img.width, img.height, img.tobytes()))
                 looks.setdefault(tname, []).extend(sub)
+                # The lights on a gun: ULTRAKILL's shader adds the material's _EmissiveTex, times a colour
+                # the game sets (the variation's) and an intensity. The picture is packed beside the main
+                # one under the same name with "__emissive" after it, which is how the DLL finds it.
+                if smat is not None and tname + "__emissive" not in tex_index:
+                    emis = None
+                    for pname, env in smat.read_typetree()["m_SavedProperties"]["m_TexEnvs"]:
+                        if pname == "_EmissiveTex":
+                            emis = follow(smat, env["m_Texture"])
+                    if emis is not None:
+                        eimg = emis.read().image.convert("RGBA")
+                        tex_index[tname + "__emissive"] = len(textures)
+                        textures.append((tname + "__emissive", eimg.width, eimg.height, eimg.tobytes()))
+                        print("    %s: lights from %s %dx%d" % (node["name"], emis.peek_name(), eimg.width, eimg.height))
                 used = sorted({i for tri in sub for i in tri})
                 lo, hi = pos[used].min(axis=0), pos[used].max(axis=0)
                 print("    %s part %d: %s, %d triangles, box %s to %s" % (node["name"], si, tname, len(sub), np.round(lo, 3), np.round(hi, 3)))
@@ -309,7 +335,7 @@ def build_model(name, root_name):
             # Punch, and sampled against the wrong one it left the arm frozen in its rest pose.
             wanted = {b["path"] for b in tree["m_ClipBindingConstant"]["genericBindings"]}
             clip_paths, score = paths, len(wanted & set(paths))
-            for base in animators + [order[0]]:
+            for base in animators + [pid for pid in order if pid not in animators]:
                 cand = base_paths.get(base)
                 if cand is None:
                     cand = base_paths[base] = paths_below(base)
@@ -468,7 +494,8 @@ def build_screens(prefix, root_name, node_rows, textures, tex_index):
                 out.append((prefix + "." + name, node_index, tex, kind, [col["r"], col["g"], col["b"], col["a"]], corners))
                 print("    screen %-18s on %-14s %.3g x %.3g units, colour (%.2f %.2f %.2f %.2f), fill kind %d" % (
                     prefix + "." + name, nodes[anchor]["name"], w, h, col["r"], col["g"], col["b"], col["a"], kind))
-            elif c.type.name == "MeshRenderer" and node["name"] == "Monitor" and weapon is not None:
+            elif c.type.name == "MeshRenderer" and weapon is not None and (c.path_id == weapon[1].get("screenMR", {}).get("m_PathID") or node["name"] == "Monitor"):
+                # (the alternate revolver's is called 'Monitor (1)': the weapon's own screenMR field says which it is)
                 mf = next((m for m in node["components"] if m.type.name == "MeshFilter"), None)
                 mref = follow(mf, mf.read_typetree()["m_Mesh"]) if mf is not None else None
                 if mref is not None:

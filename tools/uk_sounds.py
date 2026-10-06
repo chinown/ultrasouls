@@ -24,7 +24,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 BUILD = os.path.join(HERE, "..", "build")
 GAME_DIR = r"F:\SteamLibrary\steamapps\common\DARK SOULS REMASTERED"
 CLASSES = ("NewMovement", "Revolver", "Coin", "GroundCheck", "RevolverBeam", "Punch", "WeaponCharges", "PlayerFootsteps", "Shotgun",
-           "Grenade", "Railcannon", "RevolverAnimationReceiver")
+           "Grenade", "Railcannon", "RevolverAnimationReceiver", "HookArm", "Nailgun", "Nail")
 
 # sound name in the pack -> (class, object the component is on, field). A field that names a prefab is
 # followed to the first AudioSource under it. Volumes and pitches are set by the DLL, from ULTRAKILL's code.
@@ -92,6 +92,25 @@ WANTED = {
     "rail_fire_malicious": ("Railcannon", "Railcannon Malicious", "fireSound"),
     "rail_hum": ("Railcannon", "Railcannon Electric", "fullCharge"),
     "rail_charged": ("WeaponCharges", "Guns", "railCannonFullChargeSound"),
+    # the whiplash ("Hook Arm", part of the player's own prefab)
+    "hook_throw": ("HookArm", "Hook Arm", "throwSound"),
+    "hook_throw_loop": ("HookArm", "Hook Arm", "throwLoop"),
+    "hook_hit": ("HookArm", "Hook Arm", "hitSound"),                  # the hook going into an enemy
+    "hook_pull": ("HookArm", "Hook Arm", "pullSound"),
+    "hook_pull_loop": ("HookArm", "Hook Arm", "pullLoop"),
+    "hook_pull_done": ("HookArm", "Hook Arm", "pullDoneSound"),
+    "hook_catch": ("HookArm", "Hook Arm", "catchSound"),              # the hook back in the hand
+    "hook_woosh": ("HookArm", "Hook Arm", "wooshSound"),
+    "hook_clink": ("HookArm", "Hook Arm", "clinkSparks"),             # the hook meeting a wall
+    # the Sawblade Launcher
+    "saw_shot": ("Nailgun", "Sawblade Launcher Magnet", "muzzleFlash"),
+    "saw_shot_super": ("Nailgun", "Sawblade Launcher Magnet", "muzzleFlash2"),
+    "saw_snap": ("Nailgun", "Sawblade Launcher Magnet", "snapSound"),
+    "saw_magnet": ("Nailgun", "Sawblade Launcher Magnet", "magnetShotSound"),
+    "saw_no_ammo": ("Nailgun", "Sawblade Launcher Magnet", "noAmmoSound"),
+    "saw_last_shot": ("Nailgun", "Sawblade Launcher Magnet", "lastShotSound"),
+    "saw_bounce": ("Nail", "NailAlt", "environmentHitSound"),
+    "saw_hit": ("Nail", "NailAlt", "enemyHitSound"),
 }
 
 

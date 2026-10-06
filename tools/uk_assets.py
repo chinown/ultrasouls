@@ -124,11 +124,24 @@ EXTRA_SPRITES = ["RankD", "RankC", "RankB", "RankA", "RankS", "RankSS", "RankSSS
                  "ArmFeedbacker", "ArmKnuckleblaster",
                  # the Slab revolvers, the Pump Charge shotgun and the railcannons
                  "RevolverAltSingle", "RevolverAltSingleGlow", "RevolverAltSpecial", "RevolverAltSpecialGlow", "RevolverAltSharp", "RevolverAltSharpGlow",
-                 "Shotgun1", "Shotgun1Glow", "Railcannon", "RailcannonGlow", "railcannonmalicious", "railcannonmaliciousglow"]
+                 "Shotgun1", "Shotgun1Glow", "Railcannon", "RailcannonGlow", "railcannonmalicious", "railcannonmaliciousglow",
+                 # the railcannon's charge meter beside the weapon panel, and the charged beams' blue muzzle flash
+                 "lightningboltbigvector", "muzzleflashblue",
+                 # the blood that splashes the screen after a heal ('ScreenBlood')
+                 "Bloodsplatter6", "Bloodsplatter7", "Bloodsplatter8", "Bloodsplatter9", "Bloodsplatter10",
+                 # the Sawblade Launcher's pictures for the weapon panel
+                 "SawbladeLauncher", "SawbladeLauncherGlow", "SawbladeLauncherOverheat", "SawbladeLauncherOverheatGlow"]
 
 
 # Plain textures the effects use as sprites (they are not Sprite objects in the game's files)
-EXTRA_TEXTURES = ["blooddrop"]                    # the revolver's hit particles
+EXTRA_TEXTURES = ["blooddrop",                    # the revolver's hit particles
+                  "lineglow16", "charge2",        # the railcannon beams' outer lines (materials GlowLine16 and ChargeEnemy)
+                  "sawblade", "sawblade 2"]       # a sawblade in flight (a spinning flat picture), and the heated one
+# Sprites stored black whose shape alone is used (the game's HUD material gives them their colour): packed white.
+MASK_SPRITES = {"lightningboltbigvector"}
+# Texture arrays whose slices are packed as sprites NAME0, NAME1, ...: the electric arcs along the
+# Electric Railcannon's beam (ElectricityLine picks a slice at random twenty times a second).
+EXTRA_ARRAYS = {"T_ElectricArcs": "arc"}
 
 
 def cmd_hud():
@@ -168,7 +181,10 @@ def cmd_hud():
             print("sprite not found by name:", n)
     need = [n for n in EXTRA_TEXTURES if n not in have]
     if need:
-        for path in sorted({b for b in cab_index().values() if os.path.basename(b) in ("textures.bundle", "other_assets_all.bundle")}):
+        for path in sorted({b for b in cab_index().values() if not any(k in os.path.basename(b).lower() for k in ("music", "sounds", "shaders", "scenes"))},
+                           key=lambda b: (os.path.basename(b) not in ("textures.bundle", "other_assets_all.bundle"), os.path.getsize(b))):
+            if not need:
+                break
             env = load_bundle(path)
             for o in env.objects:
                 if need and o.type.name == "Texture2D" and o.peek_name() in need:
@@ -181,6 +197,35 @@ def cmd_hud():
                     print(f"texture {name!r} {img.width}x{img.height} (by name)")
         for n in need:
             print("texture not found by name:", n)
+    for array_name, short in EXTRA_ARRAYS.items():
+        if short + "0" in have:
+            continue
+        from PIL import Image
+        done = False
+        for path in sorted({b for b in cab_index().values() if os.path.basename(b) == "gameprefabs_assets_all.bundle"}):
+            env = load_bundle(path)
+            for o in env.objects:
+                if done or o.type.name != "Texture2DArray" or o.read_typetree(check_read=False).get("m_Name") != array_name:
+                    continue
+                t = o.read_typetree(check_read=False)
+                w, h, depth, fmt = t["m_Width"], t["m_Height"], t["m_Depth"], t["m_Format"]
+                data = bytes(t.get("image data") or b"")
+                if not data:
+                    from UnityPy.helpers.ResourceReader import get_resource_data
+                    sd = t["m_StreamData"]
+                    data = bytes(get_resource_data(sd["path"], o.assets_file, sd["offset"], sd["size"]))
+                if fmt not in (4, 8) or len(data) < w * h * 4 * depth:      # R8G8B8A8, sRGB or not
+                    print("texture array %r: format %s with %d bytes is not plain RGBA; skipped" % (array_name, fmt, len(data)))
+                    continue
+                for i in range(depth):
+                    img = Image.frombytes("RGBA", (w, h), data[i * w * h * 4:(i + 1) * w * h * 4]).transpose(Image.FLIP_TOP_BOTTOM)
+                    name = "%s%d" % (short, i)
+                    img.save(os.path.join(out_s, safe(name) + ".png"))
+                    meta["sprites"].append({"name": name, "path_id": o.path_id, "file": safe(name) + ".png", "w": w, "h": h, "border": [0, 0, 0, 0], "ppu": 100.0})
+                print(f"texture array {array_name!r}: {depth} slices of {w}x{h}")
+                done = True
+        if not done:
+            print("texture array not found:", array_name)
     json.dump(meta, open(os.path.join(ASSETS, "hud_assets.json"), "w", encoding="utf-8"), indent=1)
 
 
@@ -364,6 +409,9 @@ def cmd_pack(install=False):
 
     for s in meta["sprites"]:
         img = Image.open(os.path.join(ASSETS, "sprites", s["file"]))
+        if s["name"] in MASK_SPRITES:
+            alpha = img.convert("RGBA").split()[3]
+            img = Image.merge("RGBA", (alpha.point(lambda v: 255),) * 3 + (alpha,))
         sprites.append((s["name"], add_texture(s["name"], img), s["border"], s["ppu"]))
     for f in meta["fonts"]:
         img = Image.open(os.path.join(ASSETS, "fonts", f["file"]))

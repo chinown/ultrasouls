@@ -34,6 +34,8 @@ REVOLVER_DAMAGE = 150       # flat attack value per shot (a throwing knife is 10
 PIERCER_DAMAGE = 450        # charged shot: 3x, and it passes through enemies
 COIN_ID = 9000120           # a shot ricocheted off a coin: 9000120 is power 2 (one coin), up to 9000123 for power 5
 COIN_POWERS = (2, 3, 4, 5)  # Coin.power starts at 2 and gains 1 per extra coin in the chain; a plain shot is 1
+COIN_BACK_ID = 9000180      # the same four for a ricochet that reaches its target from behind: a raised shield does not stop them.
+                            # (Dark Souls judges a block by where the attacker stands, not by where the projectile comes from.)
 PUNCH_ID = 9000130          # the Feedbacker's punch: an unseen, very short projectile from the eye
 PUNCH_DAMAGE = REVOLVER_DAMAGE   # Punch: damage 1, the same as a plain revolver shot
 PUNCH_REACH = 2.0           # 4 units
@@ -43,7 +45,7 @@ PUNCH_REACH = 2.0           # 4 units
 ARM_ROWS = {
     "parry":   (9000131, 2.0,                         2.0,   0.5,    3,        200,   1.0),   # a punch that lands on an attacking enemy
     "knuckle": (9000132, 2.5,                         2.0,   0.5,    4,        400,   3.0),   # Knuckleblaster: damage 2.5, force 100 against 25
-    "blast":   (9000133, 1.0,                         1.5,   3.0,    4,        400,   5.0),   # its blast wave: wide, mostly a shove
+    "blast":   (9000133, 1.0,                         1.5,   6.0,    4,        400,   5.0),   # its blast wave ('Explosion Wave Knuckleblaster': 12 u): wide, mostly a shove
     # the shotgun fired into an attacking enemy at arm's length (Shotgun.Shoot's 4-unit "shotgunzone": 4 x 1.5)
     "shotgun_parry": (9000141, 6.0,                   2.0,   0.5,    4,        400,   3.0),
     # Explosion: a core or a punched pellet going off is 6 units across at damage 3.5; a core shot in the
@@ -54,6 +56,17 @@ ARM_ROWS = {
     "explosion_pump": (9000144, 5.0,                  0.6,   4.5,    4,        400,   4.0),
     # 'Explosion Malicious Railcannon': 13.5 units, damage 50 with enemyDamageMultiplier 1.25
     "explosion_malicious": (9000172, 6.25,            0.6,   6.75,   4,        600,   6.0),
+    # a core set off by the Malicious Railcannon's beam, the "ultraboost": the super explosion at twice the size
+    "explosion_ultra": (9000174, 7.0,                 0.6,   12.0,   4,        600,   6.0),
+    # the whiplash's hook going in: HookArm deals 0.2. Half a revolver shot's attack value is what lands a
+    # fifth of its damage on the hollow the pellets were measured on (see PELLET_DAMAGE); a light flinch, no shove.
+    "whiplash": (9000190, 0.5,                        1.5,   0.5,    1,        20,    0.0),
+    # One hit of a sawblade: the Attractor's 0.75, the Overheat's 0.6, the heated one's 1 (the Nail prefabs). The
+    # attack values are the ones that land those shares of a revolver shot on the hollow the pellets were
+    # measured on (0.86 and 0.79: see PELLET_DAMAGE).
+    "saw_attractor": (9000191, 0.86,                  1.2,   0.5,    1,        20,    0.0),
+    "saw_overheat":  (9000192, 0.79,                  1.2,   0.5,    1,        20,    0.0),
+    "saw_heated":    (9000193, 1.0,                   1.2,   0.5,    2,        60,    0.0),
 }
 PELLET_ID = 9000140         # one shotgun pellet. Shotgun.Shoot sends twelve; Projectile deals damage / 4 = a quarter of a revolver shot
 # Dark Souls takes a flat defence off every hit, which punishes many small hits. Measured on a hollow that
@@ -77,6 +90,11 @@ MORE_SHOTS = [(9000160, 2.5,    20131, 0,       0.15,   "slab"),
               (9000162, 2.5,    20133, 1,       0.3,    "slab_sharpshooter"),
               (9000170, 8.0,    20133, 1,       0.3,    "railcannon"),
               (9000171, 2.0,    20133, 0,       0.3,    "railcannon_malicious")]
+# A charged or railcannon beam that a coin sends on (Coin.ReflectRevolver, "altBeam") is that beam made
+# stronger: every hit of it gains a quarter of the coin's power. The DLL works the total out and fires the
+# row whose damage is that many quarters of a revolver shot: 9000304 (one shot's worth) to 9000396 (24).
+COIN_ALT_ID, COIN_ALT_MAX = 9000300, 96
+MORE_SHOTS += [(COIN_ALT_ID + q, q / 4.0, 20133, 1, 0.3, "coin_alt") for q in range(4, COIN_ALT_MAX + 1)]
 PUNCH_SPEED = 30.0          # m/s: slow enough to exist for four frames. At the revolver's 300 m/s the punch
                             # lived 7 ms, less than a frame, and never hit anything (v0.49: 11 punches in reach, no damage)
 PUNCH_RADIUS = 0.5          # the 1-unit sphere ULTRAKILL sweeps when the straight line misses
@@ -136,7 +154,7 @@ for r in shop.order:
 # 5. V1's Piercer revolver, as new rows the DLL fires through the game's own shoot call.
 #    BehaviorParam_PC row -> Bullet row -> AtkParam_Pc row, all sharing one id per shot type.
 #    Damage is flat, from a copy of the throwing knife's attack row.
-coin_rows = [(COIN_ID + i, power) for i, power in enumerate(COIN_POWERS)]
+coin_rows = [(COIN_ID + i, power) for i, power in enumerate(COIN_POWERS)] + [(COIN_BACK_ID + i, power) for i, power in enumerate(COIN_POWERS)]
 g.add_rows("AtkParam_Pc", [(REVOLVER_ID, 1050, "revolver"), (PIERCER_ID, 1050, "piercer")] + [(rid, 1050, "coin") for rid, _ in coin_rows]
            + [(PUNCH_ID, 1050, "punch")] + [(v[0], 1050, k) for k, v in ARM_ROWS.items()]
            + [(PELLET_ID, 1050, "pellet"), (SHARP_ID, 1050, "sharpshooter")] + [(m[0], 1050, m[5]) for m in MORE_SHOTS])
@@ -218,6 +236,42 @@ for rid in OWN_ROWS:
     for k, v in (("sfxId_Hit", NO_EFFECT), ("sfxId_Flick", NO_EFFECT), ("isAttackSFX", 0), ("Material_AttackType", 0), ("Material_AttackMaterial", 6),
                  ("Material_Size", 0)):
         bul.set(rid, k, v)
+    # The effect that flies with the projectile is switched off as well (v0.67). The revolver's rows had
+    # kept the game's own (20131 and 20133) from the days before the DLL drew its own beams; an effect of
+    # that kind carries its own sounds, and after v0.65 a faint impact could still be heard after every
+    # revolver shot, though not after a punch or a shotgun shot, whose rows never had one.
+    bul.set(rid, "sfxId_Bullet", NO_EFFECT)
+
+# Shields (v0.68). An attack row can be made to ignore a guard altogether (disableGuard, which the game uses
+# for a handful of its own rows), and breaks a guard by the stamina it takes from the one blocking (atkStam:
+# the kick, row 1100, has 500 against a throwing knife's 10).
+#   Not stopped by a shield: explosions, both railcannons, the Piercer's charged shots, a coin's shot from behind.
+#   The Knuckleblaster's punch takes a kick's worth of stamina: one that is blocked breaks the guard.
+UNBLOCKABLE = [PIERCER_ID, 9000161, 9000170, 9000171] + [ARM_ROWS[k][0] for k in ("explosion", "explosion_super", "explosion_pump", "explosion_malicious", "explosion_ultra")] \
+    + [COIN_BACK_ID + i for i in range(len(COIN_POWERS))] + [COIN_ALT_ID + q for q in range(4, COIN_ALT_MAX + 1)]
+for rid in UNBLOCKABLE:
+    atk.set(rid, "disableGuard", 1)
+atk.set(ARM_ROWS["knuckle"][0], "atkStam", 500)
+
+# V1's body in third person (v0.71). tools/ds_v1_body.py builds V1 as three armour pieces of a model number
+# of their own (9800) and puts them in the game's parts folder. An empty armour slot is itself a row here
+# (900000 head, 901000 body, 902000 arms, 903000 legs, each naming model 0, the bare body): the body, arms
+# and legs rows are pointed at the new pieces, so a player with no armour on is drawn as V1 and any piece
+# of armour put on takes its slot back. V1's head is part of the body piece and the body row also hides
+# the human head (the first sixteen "invisible" flags, which the game's own all-covering helmets set: the
+# face is masks 12 and 13, the back of the head 15, hair 10 and 11). The bare-head row is left alone: every
+# helmetless character in the game uses it. Only done when the pieces are there, since a row that names a
+# model with no file would leave the player with no body, or worse.
+V1_MODEL_ID = 9800
+V1_PIECES = ["%s_A_%04d%s.partsbnd.dcx" % (p, V1_MODEL_ID, h) for p in ("BD", "AM", "LG") for h in ("", "_M")]
+v1_body = all(os.path.exists(os.path.join(os.path.dirname(GAME), "..", "..", "parts", n)) for n in V1_PIECES)
+if v1_body:
+    pro = g["EquipParamProtector"]
+    for rid in (901000, 902000, 903000):
+        pro.set(rid, "equipModelId", V1_MODEL_ID)
+        pro.set(rid, "equipModelGender", 0)          # 0: one file for both sexes ("_A_")
+    for i in range(16):
+        pro.set(901000, "invisibleFlag%02d" % i, 1)
 
 os.makedirs(os.path.dirname(OUT), exist_ok=True)
 g.save(OUT)
@@ -231,17 +285,26 @@ assert chk["AtkParam_Pc"].get(COIN_ID + 1, "atkPhys") == REVOLVER_DAMAGE * 3 and
 assert chk["AtkParam_Pc"].get(COIN_ID + 1, "atkPhys") == REVOLVER_DAMAGE * 3 and chk["Bullet"].get(COIN_ID + 3, "atkId_Bullet") == COIN_ID + 3
 assert chk["AtkParam_Pc"].get(COIN_ID + 1, "atkPhys") == REVOLVER_DAMAGE * 3 and chk["Bullet"].get(COIN_ID + 3, "atkId_Bullet") == COIN_ID + 3
 assert abs(chk["Bullet"].get(PUNCH_ID, "life") - PUNCH_REACH / PUNCH_SPEED) < 1e-4 and chk["Bullet"].get(PUNCH_ID, "initVellocity") == PUNCH_SPEED
-assert chk["AtkParam_Pc"].get(ARM_ROWS["knuckle"][0], "dmgLevel") == 4 and chk["Bullet"].get(ARM_ROWS["blast"][0], "hitRadius") == 3.0
+assert chk["AtkParam_Pc"].get(ARM_ROWS["knuckle"][0], "dmgLevel") == 4 and chk["Bullet"].get(ARM_ROWS["blast"][0], "hitRadius") == 6.0
 assert chk["Bullet"].get(PELLET_ID, "initVellocity") == PELLET_SPEED and chk["AtkParam_Pc"].get(PELLET_ID, "atkPhys") == PELLET_DAMAGE
 assert chk["Bullet"].get(SHARP_ID, "isPenetrate") == 1 and chk["Bullet"].get(ARM_ROWS["explosion_super"][0], "hitRadius") == 6.0
+assert all(chk["Bullet"].get(r, "sfxId_Bullet") == NO_EFFECT for r in OWN_ROWS)
 assert all(chk["Bullet"].get(r, "sfxId_Hit") == NO_EFFECT and chk["Bullet"].get(r, "isAttackSFX") == 0 and chk["Bullet"].get(r, "Material_AttackMaterial") == 6 for r in OWN_ROWS)
 assert chk["AtkParam_Pc"].get(9000170, "atkPhys") == REVOLVER_DAMAGE * 8 and chk["Bullet"].get(9000161, "isPenetrate") == 1 and chk["Bullet"].get(9000171, "isPenetrate") == 0
 assert chk["Bullet"].get(ARM_ROWS["explosion_malicious"][0], "hitRadius") == 6.75 and chk["BehaviorParam_PC"].get(9000162, "refId") == 9000162
+assert all(chk["AtkParam_Pc"].get(r, "disableGuard") == 1 for r in UNBLOCKABLE) and chk["AtkParam_Pc"].get(REVOLVER_ID, "disableGuard") == 0
+assert chk["AtkParam_Pc"].get(ARM_ROWS["knuckle"][0], "atkStam") == 500 and chk["AtkParam_Pc"].get(COIN_BACK_ID + 2, "atkPhys") == REVOLVER_DAMAGE * 4
 assert chk["Bullet"].get(PUNCH_ID, "dist") == PUNCH_REACH and chk["AtkParam_Pc"].get(PUNCH_ID, "atkPhys") == PUNCH_DAMAGE
 assert all(chk["BehaviorParam_PC"].get(r, "stamina") == 0 for r in chk["BehaviorParam_PC"].order)
 assert chk["SpEffectParam"].get(HEAL_SPEFFECT, "changeHpPoint") == -HEAL_PER_HIT
 assert chk["Bullet"].get(600, "initVellocity") == SHOT_SPEED
+assert chk["AtkParam_Pc"].get(COIN_ALT_ID + 49, "atkPhys") == int(REVOLVER_DAMAGE * 12.25) and chk["Bullet"].get(COIN_ALT_ID + 96, "isPenetrate") == 1
+assert chk["Bullet"].get(ARM_ROWS["explosion_ultra"][0], "hitRadius") == 12.0 and chk["AtkParam_Pc"].get(COIN_ALT_ID + 4, "disableGuard") == 1
+assert chk["EquipParamProtector"].get(901000, "equipModelId") == (V1_MODEL_ID if v1_body else 0) and chk["EquipParamProtector"].get(900000, "equipModelId") == 0
+assert chk["EquipParamProtector"].get(901000, "invisibleFlag12") == (1 if v1_body else 0) and chk["EquipParamProtector"].get(903000, "equipModelGender") == (0 if v1_body else 3)
+assert chk["AtkParam_Pc"].get(ARM_ROWS["whiplash"][0], "atkPhys") == REVOLVER_DAMAGE // 2 and chk["BehaviorParam_PC"].get(9000190, "refId") == 9000190
 print(f"stamina zeroed on {n_stam} behaviours; heal-on-hit on {n_heal} melee weapons ({n_full} had no free slot); {n_shot} projectiles retuned; {n_shop} ammo shop prices set to 1")
+print("V1's body for an unarmoured player: %s" % ("on (the pieces are in the game's parts folder)" if v1_body else "off (the pieces are not installed: tools/ds_v1_body.py)"))
 print("built", os.path.normpath(OUT), os.path.getsize(OUT), "bytes")
 
 if "--install" in sys.argv:

@@ -5,6 +5,7 @@
                                              its fields; references are shown as the kind and name they point to
   python tools/uk_dump.py show NAME NAME...  the same for several objects
   python tools/uk_dump.py tree NAME [N]      the object's children, with their components
+  python tools/uk_dump.py deep NAME [N]      the object and everything under it, each with every component's fields
 
 Reads your own install; nothing is written.
 """
@@ -118,8 +119,8 @@ def pick(name, n):
     return found[n]
 
 
-def cmd_show(name, n=0):
-    o, t = pick(name, n)
+def cmd_show(name, n=0, picked=None):
+    o, t = picked or pick(name, n)
     print("'%s' active %s" % (t["m_Name"], t.get("m_IsActive")))
     for c in components(o, t):
         if c is None:
@@ -156,6 +157,26 @@ def cmd_tree(name, n=0):
     walk(o, t, 0)
 
 
+def cmd_deep(name, n=0):
+    o, t = pick(name, n)
+
+    def walk(go, gt, path):
+        print("==== " + path)
+        cmd_show(None, picked=(go, gt))
+        for c in components(go, gt):
+            if c is not None and c.type.name in ("Transform", "RectTransform"):
+                for ch in c.read_typetree()["m_Children"]:
+                    cto = follow(c, ch)
+                    if cto is None:
+                        continue
+                    cgo = follow(cto, cto.read_typetree()["m_GameObject"])
+                    if cgo is not None:
+                        cgt = cgo.read_typetree()
+                        walk(cgo, cgt, path + " / " + cgt["m_Name"])
+
+    walk(o, t, t["m_Name"])
+
+
 if __name__ == "__main__":
     a = sys.argv[1:]
     if len(a) >= 2 and a[0] == "find":
@@ -168,5 +189,7 @@ if __name__ == "__main__":
             cmd_show(a[1], int(a[2]) if len(a) > 2 else 0)
     elif len(a) >= 2 and a[0] == "tree":
         cmd_tree(a[1], int(a[2]) if len(a) > 2 else 0)
+    elif len(a) >= 2 and a[0] == "deep":
+        cmd_deep(a[1], int(a[2]) if len(a) > 2 else 0)
     else:
         sys.exit(__doc__)

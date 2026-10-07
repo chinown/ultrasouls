@@ -18,6 +18,13 @@ struct HudState {
     double revolver_clip_start = -100.0;
     float revolver_clip_speed = 1.0f;      // how fast its Animator state plays the clip (1.5 for the shotgun's core reload, ...)
     float cylinder = 0.0f;                 // how far the revolver's cylinder has turned, in radians about its own axis
+    // The sawblade launcher: how far its clips are held back towards the rest pose (0..1, the weight of its
+    // Animator's second layer), how far the blade in its jaws has turned (radians), and how hot the
+    // Overheat's blade glows (0..1).
+    float clip_muddle = 0.0f, blade_spin = 0.0f, blade_heat = 0.0f;
+    // What the display on the launcher shows: the Attractor's saws and magnets (0..3), the Overheat's heat sink (0..1).
+    int saw_count = 10;
+    float magnet_charge = 3.0f, heat_sink = 1.0f;
     int weapon = 0;                        // 0 revolver, 1 shotgun, 2 railcannon, 3 sawblade launcher
     char weapon_note[40] = "";             // a line written under the weapon's picture (the launcher's saws, magnets and heat)
     bool alt = false;                      // the revolver is the alternate ("Slab") one
@@ -74,7 +81,7 @@ struct HudState {
     // fractions of the screen height, colour with alpha
     // plain: the line alone, no soft glow round it. grad: the colour runs from r, g, b at the first end to
     // r1, g1, b1 at the other. sprite: drawn with that picture, u0 to u1 of it along the line.
-    enum { MAX_TRACERS = 400 };
+    enum { MAX_TRACERS = 1100 };
     int tracer_count = 0;
     struct TracerLine {
         float x0, y0, x1, y1, w0, w1, r, g, b, a;
@@ -84,6 +91,17 @@ struct HudState {
         float u0, u1;
         float z0, z1;                      // how far each end is from the eye along the view, in metres (0: not known), for the world to hide it
     } tracers[MAX_TRACERS];
+    // Trails (Unity's TrailRenderer): runs of points, already projected like a tracer's ends (centre in -1..1,
+    // half-width as a fraction of the screen's height, distance along the view), each run drawn as one strip
+    // whose pieces share their corners, so a bend has no gaps and nothing is drawn twice. additive: the
+    // colour is added to the picture (the 'Additive' particle material the saws' trails have) instead of
+    // laid over it. Filled in with hud_trail_begin and hud_trail_point.
+    enum { MAX_RIBBON_POINTS = 2400, MAX_RIBBONS = 96 };
+    int ribbon_point_count = 0, ribbon_count = 0;
+    struct RibbonPoint { float x, y, w, r, g, b, a, z; } ribbon_points[MAX_RIBBON_POINTS];
+    struct Ribbon { int first, count; bool additive; } ribbons[MAX_RIBBONS];
+    bool trail_open = false, trail_has_prev = false, trail_additive = false;
+    float trail_prev[8] = {0, 0, 0, 0, 0, 0, 0, 0};   // the last point given: where the camera sees it (3), width, colour, alpha
     int variation = 0;             // revolver variation: 0 Piercer, 1 Marksman, 2 Sharpshooter
     float coin_charge = 400.0f;    // 0..400, four coins of 100
     // coins in flight, already projected: x, y in -1..1 from the screen centre (y up), size as a fraction
@@ -102,12 +120,24 @@ struct HudState {
     // texture has scrolled, and its colour with alpha.
     bool cam_valid = false;
     float cam_eye[3] = {0, 0, 0}, cam_right[3] = {1, 0, 0}, cam_up[3] = {0, 1, 0}, cam_fwd[3] = {0, 0, 1}, cam_tan_x = 1, cam_tan_y = 1;
-    enum { MAX_WORLD_MESHES = 32 };
+    enum { MAX_WORLD_MESHES = 96 };
     int world_mesh_count = 0;
     // limits: for an explosion's ball, how far each vertex of the mesh may go from the middle before it
     // meets the game's world (one distance per vertex, in the order hud_model_dirs gives them); the ball
     // is then drawn pressed against walls and floors instead of through them, and is not turned with the camera.
-    struct WorldMesh { const char *model; float p[3], radius, flip, uv[2], rgba[4]; const float *limits; int limit_count; } world_meshes[MAX_WORLD_MESHES];
+    // oriented: the model's own x, y and z axes are put along ax, ay and az (unit vectors of the world) and
+    // `radius` is the size of one of its units, instead of the turn with the camera. spin: its second
+    // node is turned by this much about that node's own z (a sawblade's teeth). cutout: the picture's
+    // transparent parts are left out.
+    struct WorldMesh {
+        const char *model;
+        float p[3], radius, flip, uv[2], rgba[4];
+        const float *limits;
+        int limit_count;
+        bool oriented = false;
+        float ax[3] = {1, 0, 0}, ay[3] = {0, 1, 0}, az[3] = {0, 0, 1}, spin = 0;
+        bool cutout = false;
+    } world_meshes[MAX_WORLD_MESHES];
     // effect sprites, already projected like the blasts: centre in -1..1, size as a fraction of the
     // screen height, a turn in degrees, colour with alpha. A null sprite is a plain square.
     enum { MAX_FX_SPRITES = 360 };
@@ -138,6 +168,10 @@ extern const BeamLook BEAM_LOOKS[BEAM_KINDS];
 // the strip. wmax: the most half its width may come to, as a share of the screen's height.
 void hud_strip(HudState &st, const float *pa, const float *pb, float width, const float *c0, const float *c1, float alpha, const char *sprite, float u0,
                float u1, float wmax);
+// A trail through points of the world, added to `st` as its camera sees it: begin one, then give its points
+// in order, each with the trail's width (metres), colour and alpha there. A stretch behind the eye is cut out.
+void hud_trail_begin(HudState &st, bool additive);
+void hud_trail_point(HudState &st, const float *p, float width, const float *rgb, float alpha);
 // One beam of a BEAM_ kind from a to b, `width` metres wide now, with whatever lines go round it. `unit` is
 // how many metres an ULTRAKILL unit is; `seen` has a bit for each eighth of the line that may be drawn;
 // `seed` tells beams apart for what is picked at random.

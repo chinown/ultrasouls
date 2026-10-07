@@ -24,7 +24,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 BUILD = os.path.join(HERE, "..", "build")
 GAME_DIR = r"F:\SteamLibrary\steamapps\common\DARK SOULS REMASTERED"
 CLASSES = ("NewMovement", "Revolver", "Coin", "GroundCheck", "RevolverBeam", "Punch", "WeaponCharges", "PlayerFootsteps", "Shotgun",
-           "Grenade", "Railcannon", "RevolverAnimationReceiver", "HookArm", "Nailgun", "Nail")
+           "Grenade", "Railcannon", "RevolverAnimationReceiver", "HookArm", "Nailgun", "Nail", "Spin", "Harpoon", "TimeBomb")
 
 # sound name in the pack -> (class, object the component is on, field). A field that names a prefab is
 # followed to the first AudioSource under it. Volumes and pitches are set by the DLL, from ULTRAKILL's code.
@@ -111,6 +111,12 @@ WANTED = {
     "saw_last_shot": ("Nailgun", "Sawblade Launcher Magnet", "lastShotSound"),
     "saw_bounce": ("Nail", "NailAlt", "environmentHitSound"),
     "saw_hit": ("Nail", "NailAlt", "enemyHitSound"),
+    "saw_break": ("Nail", "NailAlt", "sawBreakEffect"),               # a saw breaking ('BreakParticleMetalSaw')
+    "saw_chainsaw": ("Nail", "NailAltHeated", "stoppedAud"),          # the heated saw's own looping noise
+    "saw_spin": ("Spin", "Blade", "m_GameObject"),                    # the blade in the launcher's jaws, looping
+    "harpoon_stop": ("Harpoon", "Harpoon", "environmentHitSound"),    # the magnet's harpoon going into a wall
+    "harpoon_pierce": ("Harpoon", "Harpoon", "enemyHitSound"),        # and into an enemy
+    "magnet_beep": ("TimeBomb", "Harpoon", "beepLight"),              # the magnet's beep
 }
 
 

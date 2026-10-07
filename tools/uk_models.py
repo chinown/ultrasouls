@@ -22,7 +22,10 @@ A screen is a flat panel fixed to one node: the little displays on the weapons (
 monitor, the coin meters of the other two revolvers, the shotgun's core meter). Its corners are in the
 node's own space. Fill kind is the edge a meter's filled part starts from: 0 for a panel that is not a
 meter, 1 left, 2 right, 3 bottom, 4 top. The names tell the DLL which is which: "pierce.monitor",
-"marksman.coin0" ... "sharp.coin2", "core.fill"; everything else is decoration ("marksman.bg1").
+"marksman.coin0" ... "sharp.coin2", "core.fill"; everything else is decoration ("marksman.bg1"). The sawblade launcher's: "magnet.sink0" to
+"magnet.sink2" (a meter for each magnet), "magnet.ammo" (where the number of saws is written: a panel with no
+picture), "overheat.fill" (the heat), "overheat.heatbg" (the frame round it, which takes the heat's colour) and
+"overheat.sink0" (the heat sink).
 
 Animation clips are stored in Unity's runtime form: each animated value is a curve, and curves come in
 three kinds laid out one after the other (streamed: cubic segments keyed in time; dense: plain samples;
@@ -57,7 +60,8 @@ MODELS = {"revolver": "Revolver Pierce", "feedbacker": "Arm Blue", "knuckleblast
 # the one revolver model that is packed.
 SCREENS = {"revolver": [("pierce", "Revolver Pierce"), ("marksman", "Revolver Ricochet"), ("sharp", "Revolver Twirl")],
            "revolver_alt": [("pierce", "Alternative Revolver Pierce"), ("marksman", "Alternative Revolver Ricochet"), ("sharp", "Alternative Revolver Twirl")],
-           "shotgun": [("core", "Shotgun Grenade"), ("pump", "Shotgun Pump")]}
+           "shotgun": [("core", "Shotgun Grenade"), ("pump", "Shotgun Pump")],
+           "sawlauncher": [("magnet", "Sawblade Launcher Magnet"), ("overheat", "Sawblade Launcher Overheat")]}
 BATTERY = (("batteryFull", "battery_full"), ("batteryMid", "battery_mid"), ("batteryLow", "battery_low"))
 # Meshes of ULTRAKILL's effects, packed as models of one fixed part: pack name -> (prefab root, object in it).
 # Each is scaled so that its furthest point is 1 from its middle; the DLL gives it the size the effect has.
@@ -65,8 +69,18 @@ PROPS = {"fx_sphere": ("Explosion", "Sphere_8"),          # the explosion's ball
          "fx_sphere_super": ("Explosion Super", "Sphere_8"),   # the super explosion's, with its own redder picture
          "fx_shock": ("Explosion", "Sphere_8 (1)"),       # the faint shell that runs ahead of it
          "fx_coin": ("Coin", "Model"),                    # the Marksman's coin
-         "fx_core": ("Grenade", "Grenade"),               # the shotgun's ejected core
-         "fx_magnet": ("Harpoon", "Plane002")}            # the Attractor's magnet (a sawblade is a flat picture: tools/uk_assets.py)
+         "fx_core": ("Grenade", "Grenade")}               # the shotgun's ejected core
+# Rigid parts of a weapon that are not skinned to its skeleton: model -> [(prefab root, object in it)]. A part
+# hangs from the model's node of its own name or, where the model has none, from the nearest node above it
+# that the model has by name (the Overheat's second, glowing blade 'Blade (1)' sits on 'Blade', a tenth larger).
+RIGID = {"sawlauncher": [("Sawblade Launcher Magnet", "Blade"), ("Sawblade Launcher Overheat", "Blade (1)")]}
+# Things that fly through the world, each a prefab kept whole: in ULTRAKILL's units about its own root and
+# in the root's axes, so the DLL only has to say where the root is and which way it points. An object with
+# a Spin script keeps a node of its own (the saw's teeth turn on the hub).
+#   a sawblade: a hub ('Cylinder', a ProBuilder mesh whose points are in the prefab itself, not in a mesh
+#   asset) with a flat picture of the teeth on it ('Quad', Unity's own quad), lying in the root's x-z plane
+#   the Attractor's magnet: the harpoon, pointing along the root's z
+FLYERS = {"fx_saw": "NailAltFodder", "fx_saw_overheat": "NailAlt", "fx_saw_heated": "NailAltHeated", "fx_harpoon": "Harpoon"}
 
 
 def find_root(name):
@@ -437,10 +451,14 @@ def build_screens(prefix, root_name, node_rows, textures, tex_index):
         return tex_index[name]
 
     # which Image is which meter, from the weapon's own fields
-    special, weapon = {}, None
+    special, weapon, ammo_text = {}, None, None
     for pid, node in nodes.items():
         for c in node["components"]:
             cls, t = _script(c)
+            if cls == "Nailgun":
+                for i, ref in enumerate(t.get("heatSinkImages", [])):
+                    special[ref["m_PathID"]] = ("sink%d" % i, None)
+                ammo_text = t.get("ammoText", {}).get("m_PathID")
             if cls == "Revolver":
                 weapon = (c, t)
                 for i, ref in enumerate(t.get("coinPanels", [])):
@@ -486,6 +504,8 @@ def build_screens(prefix, root_name, node_rows, textures, tex_index):
                 # ones are not in the bundles and stay plain rectangles)
                 tex = -1
                 sprite = follow(c, t["m_Sprite"]) if t.get("m_Sprite", {}).get("m_PathID") else None
+                if sprite is not None and sprite.peek_name() == "HeatsinkMeter" and name.startswith("bg"):
+                    name = "heatbg"                       # (the launcher's heat slider sits in it: Nailgun's sliderBg)
                 if sprite is not None:
                     try:
                         tex = add_texture(sprite, "ui_" + sprite.peek_name())
@@ -494,6 +514,19 @@ def build_screens(prefix, root_name, node_rows, textures, tex_index):
                 out.append((prefix + "." + name, node_index, tex, kind, [col["r"], col["g"], col["b"], col["a"]], corners))
                 print("    screen %-18s on %-14s %.3g x %.3g units, colour (%.2f %.2f %.2f %.2f), fill kind %d" % (
                     prefix + "." + name, nodes[anchor]["name"], w, h, col["r"], col["g"], col["b"], col["a"], kind))
+            elif cls == "Text" and ammo_text is not None and c.path_id == ammo_text and rect_size(pid):
+                # where the launcher writes how many saws it has: the text's own box, and the size of its letters in it
+                w, h = rect_size(pid)
+                piv = node["local"]["m_Pivot"]
+                x0, y0 = -piv["x"] * w, -piv["y"] * h
+                corners = []
+                for x, y, u, v in [(x0, y0, 0, 0), (x0, y0 + h, 0, 1), (x0 + w, y0 + h, 1, 1), (x0 + w, y0, 1, 0)]:
+                    p = to_anchor @ np.array([x, y, 0.0, 1.0])
+                    corners.append([p[0], p[1], p[2], u, 1.0 - v])
+                col = t["m_Color"]
+                out.append((prefix + ".ammo", node_index, -1, 0, [col["r"], col["g"], col["b"], t["m_FontData"]["m_FontSize"] / h], corners))
+                print("    screen %-18s on %-14s %.3g x %.3g units, letters %d high, colour (%.2f %.2f %.2f)" % (
+                    prefix + ".ammo", nodes[anchor]["name"], w, h, t["m_FontData"]["m_FontSize"], col["r"], col["g"], col["b"]))
             elif c.type.name == "MeshRenderer" and weapon is not None and (c.path_id == weapon[1].get("screenMR", {}).get("m_PathID") or node["name"] == "Monitor"):
                 # (the alternate revolver's is called 'Monitor (1)': the weapon's own screenMR field says which it is)
                 mf = next((m for m in node["components"] if m.type.name == "MeshFilter"), None)
@@ -576,18 +609,187 @@ def build_prop(name, root_name, part_name):
     return name, node_rows, textures, meshes, []
 
 
+def geometry_of(node):
+    """(positions, normals, uvs with v downwards, triangle indices) of the mesh an object is drawn with, or None.
+    The mesh is the MeshFilter's; failing that the object's ProBuilder data; failing that Unity's built-in quad."""
+    from UnityPy.helpers.MeshHelper import MeshHandler
+    mf = next((c for c in node["components"] if c.type.name == "MeshFilter"), None)
+    ref = mf.read_typetree()["m_Mesh"] if mf is not None else None
+    mesh = follow(mf, ref) if mf is not None else None
+    if mesh is not None:
+        h = MeshHandler(mesh.read())
+        h.process()
+        pos = np.array(h.m_Vertices, dtype=np.float64).reshape(-1, 3)
+        nrm = np.array(h.m_Normals, dtype=np.float64).reshape(-1, 3) if h.m_Normals else np.zeros_like(pos)
+        uv = np.array(h.m_UV0, dtype=np.float64).reshape(len(pos), -1)[:, :2].copy() if h.m_UV0 else np.zeros((len(pos), 2))
+        tris = [i for sub in h.get_triangles() for tri in sub for i in tri]
+    else:
+        pb = next((t for cls, t in (_script(c) for c in node["components"]) if cls == "ProBuilderMesh"), None)
+        if pb is not None:
+            pos = np.array([[p["x"], p["y"], p["z"]] for p in pb["m_Positions"]], dtype=np.float64)
+            uv = np.array([[p["x"], p["y"]] for p in pb.get("m_Textures0", [])], dtype=np.float64)
+            if len(uv) != len(pos):
+                uv = np.zeros((len(pos), 2))
+            tris = [i for f in pb["m_Faces"] for i in f["m_Indexes"]]
+            nrm = np.zeros_like(pos)
+            for a, b, c in np.array(tris).reshape(-1, 3):
+                n = np.cross(pos[b] - pos[a], pos[c] - pos[a])
+                ln = np.linalg.norm(n)
+                if ln > 1e-12:
+                    nrm[[a, b, c]] += n / ln
+            ln = np.linalg.norm(nrm, axis=1, keepdims=True)
+            nrm = nrm / np.where(ln > 1e-9, ln, 1.0)
+        elif ref is not None and ref.get("m_PathID") == 10210:      # the quad among Unity's default resources
+            pos = np.array([[-0.5, -0.5, 0], [0.5, -0.5, 0], [-0.5, 0.5, 0], [0.5, 0.5, 0]], dtype=np.float64)
+            uv = np.array([[0, 0], [1, 0], [0, 1], [1, 1]], dtype=np.float64)
+            nrm = np.tile(np.array([0.0, 0.0, -1.0]), (4, 1))
+            tris = [0, 2, 1, 2, 3, 1]
+        else:
+            return None
+    uv = uv.copy()
+    uv[:, 1] = 1.0 - uv[:, 1]
+    return pos, nrm, uv, np.array(tris, dtype="<u4")
+
+
+def add_look(mat, textures, tex_index):
+    """The index, in `textures`, of the picture a material draws with, tinted by the material's colour."""
+    from PIL import Image
+    tex, color = material_texture(mat) if mat is not None else (None, (1, 1, 1, 1))
+    rgb = tuple(int(round(min(max(x, 0.0), 1.0) * 255)) for x in color[:3])
+    tname = (tex.peek_name() if tex else "white") + ("" if rgb == (255, 255, 255) else "_%02x%02x%02x" % rgb)
+    if tname not in tex_index:
+        img = (tex.read().image if tex else Image.new("RGBA", (4, 4), (255, 255, 255, 255))).convert("RGBA")
+        if rgb != (255, 255, 255):
+            r, g, bl, al = img.split()
+            img = Image.merge("RGBA", (r.point(lambda v: v * rgb[0] // 255), g.point(lambda v: v * rgb[1] // 255), bl.point(lambda v: v * rgb[2] // 255), al))
+        tex_index[tname] = len(textures)
+        textures.append((tname, img.width, img.height, img.tobytes()))
+    return tex_index[tname], tname, color
+
+
+def _rigid_mesh(mname, tex, pos, nrm, uv, tris, bone_node):
+    verts = np.concatenate([pos, nrm, uv], axis=1).astype("<f4")
+    slots = np.zeros((len(pos), 4), dtype="<u2")
+    weights = np.zeros((len(pos), 4), dtype="<f4")
+    weights[:, 0] = 1.0
+    return (mname, tex, verts, slots, weights, tris, [(bone_node, np.eye(4)[:3, :].reshape(-1))])
+
+
+def _apply(m, pos, nrm):
+    p = (m @ np.concatenate([pos, np.ones((len(pos), 1))], axis=1).T).T[:, :3]
+    n = (m[:3, :3] @ nrm.T).T
+    ln = np.linalg.norm(n, axis=1, keepdims=True)
+    return p, n / np.where(ln > 1e-9, ln, 1.0)
+
+
+def rigid_parts(name, node_rows, textures, meshes):
+    """Adds a model's RIGID parts to `meshes`, each wholly on one node."""
+    names = [row[0] for row in node_rows]
+    tex_index = {t[0]: i for i, t in enumerate(textures)}
+    for root_name, part_name in RIGID.get(name, []):
+        nodes = prefab_nodes(find_root(root_name))
+        pid = next(p for p, n in nodes.items() if n["name"] == part_name and any(c.type.name == "MeshRenderer" for c in n["components"]))
+        geo = geometry_of(nodes[pid])
+        if geo is None:
+            print("    %s: no mesh; left out" % part_name)
+            continue
+        pos, nrm, uv, tris = geo
+        anchor = pid
+        while anchor is not None and nodes[anchor]["name"] not in names:
+            anchor = nodes[anchor]["parent"]
+        if anchor is None:
+            print("    %s: nothing of the model above it; left out" % part_name)
+            continue
+        pos, nrm = _apply(np.linalg.inv(nodes[anchor]["world"]) @ nodes[pid]["world"], pos, nrm)
+        mr = next(c for c in nodes[pid]["components"] if c.type.name == "MeshRenderer")
+        mat = follow(mr, mr.read_typetree()["m_Materials"][0])
+        tex, tname, color = add_look(mat, textures, tex_index)
+        meshes.append(_rigid_mesh(part_name, tex, pos, nrm, uv, tris, names.index(nodes[anchor]["name"])))
+        print("    rigid part %-10s on %-8s %d vertices, %s, material colour %s, box %s to %s" % (
+            part_name, nodes[anchor]["name"], len(pos), tname, [round(c, 3) for c in color], np.round(pos.min(axis=0), 3), np.round(pos.max(axis=0), 3)))
+
+
+def _quat(r):
+    """x y z w of a rotation matrix."""
+    tr = r[0, 0] + r[1, 1] + r[2, 2]
+    if tr > 0:
+        s = math.sqrt(tr + 1.0) * 2
+        q = [(r[2, 1] - r[1, 2]) / s, (r[0, 2] - r[2, 0]) / s, (r[1, 0] - r[0, 1]) / s, 0.25 * s]
+    elif r[0, 0] > r[1, 1] and r[0, 0] > r[2, 2]:
+        s = math.sqrt(1.0 + r[0, 0] - r[1, 1] - r[2, 2]) * 2
+        q = [0.25 * s, (r[0, 1] + r[1, 0]) / s, (r[0, 2] + r[2, 0]) / s, (r[2, 1] - r[1, 2]) / s]
+    elif r[1, 1] > r[2, 2]:
+        s = math.sqrt(1.0 + r[1, 1] - r[0, 0] - r[2, 2]) * 2
+        q = [(r[0, 1] + r[1, 0]) / s, 0.25 * s, (r[1, 2] + r[2, 1]) / s, (r[0, 2] - r[2, 0]) / s]
+    else:
+        s = math.sqrt(1.0 + r[2, 2] - r[0, 0] - r[1, 1]) * 2
+        q = [(r[0, 2] + r[2, 0]) / s, (r[1, 2] + r[2, 1]) / s, 0.25 * s, (r[1, 0] - r[0, 1]) / s]
+    return q
+
+
+def build_flyer(name, root_name):
+    """A whole prefab of rigid parts as one model, in the game's units about the root and in the root's axes."""
+    nodes = prefab_nodes(find_root(root_name))
+    root = next(p for p, n in nodes.items() if n["parent"] is None)
+    rw = nodes[root]["world"]
+    rot = rw[:3, :3] / np.linalg.norm(rw[:3, :3], axis=0)
+    to_root = np.eye(4)                                      # undoes the root's place and turn, but not its size
+    to_root[:3, :3] = rot.T
+    to_root[:3, 3] = -rot.T @ rw[:3, 3]
+    node_rows = [(name, -1, [0, 0, 0, 0, 0, 0, 1, 1, 1, 1])]
+    textures, tex_index, meshes = [], {}, []
+    for pid, node in nodes.items():
+        p, on = pid, True
+        while p is not None and nodes[p]["parent"] is not None:
+            on = on and nodes[p]["active"]
+            p = nodes[p]["parent"]
+        mr = next((c for c in node["components"] if c.type.name == "MeshRenderer"), None)
+        if not on or mr is None or not mr.read_typetree().get("m_Enabled", 1):
+            continue
+        geo = geometry_of(node)
+        if geo is None:
+            continue
+        pos, nrm, uv, tris = geo
+        m = to_root @ node["world"]
+        mat = follow(mr, mr.read_typetree()["m_Materials"][0])
+        tex, tname, color = add_look(mat, textures, tex_index)
+        spin = next((t for cls, t in (_script(c) for c in node["components"]) if cls == "Spin"), None)
+        bone = 0
+        if spin is not None:
+            # its own node, placed and turned as the object is; its size goes into the points
+            scale = np.linalg.norm(m[:3, :3], axis=0)
+            q = _quat(m[:3, :3] / scale)
+            bone = len(node_rows)
+            node_rows.append((node["name"], 0, [m[0, 3], m[1, 3], m[2, 3], q[0], q[1], q[2], q[3], 1, 1, 1]))
+            pos = pos * scale
+            d = spin["spinDirection"]
+            print("    %s spins about its own (%g, %g, %g) at %g degrees a second" % (node["name"], d["x"], d["y"], d["z"], spin["speed"]))
+        else:
+            pos, nrm = _apply(m, pos, nrm)
+        meshes.append(_rigid_mesh(node["name"], tex, pos, nrm, uv, tris, bone))
+        box = pos if spin is None else _apply(m, pos / scale, nrm)[0]
+        print("    %-10s %-10s %d vertices, %s, material colour %s, box %s to %s" % (
+            name, node["name"], len(pos), tname, [round(c, 3) for c in color], np.round(box.min(axis=0), 3), np.round(box.max(axis=0), 3)))
+    if not meshes:
+        raise SystemExit("nothing to draw in " + root_name)
+    return name, node_rows, textures, meshes, []
+
+
 def _name(s):
     return s.encode("ascii", "replace").ljust(40, b"\0")[:40]
 
 
 def cmd_pack(install=False):
     out = bytearray(b"USMDL002")
-    out += struct.pack("<I", len(MODELS) + len(PROPS))
-    for name, root_name in list(MODELS.items()) + list(PROPS.items()):
+    out += struct.pack("<I", len(MODELS) + len(PROPS) + len(FLYERS))
+    for name, root_name in list(MODELS.items()) + list(PROPS.items()) + list(FLYERS.items()):
         if name in PROPS:
             name, node_rows, textures, meshes, clips = build_prop(name, *root_name)
+        elif name in FLYERS:
+            name, node_rows, textures, meshes, clips = build_flyer(name, root_name)
         else:
             name, node_rows, textures, meshes, clips = build_model(name, root_name)
+            rigid_parts(name, node_rows, textures, meshes)
         tex_index = {t[0]: i for i, t in enumerate(textures)}
         screens = []
         for prefix, prefab in SCREENS.get(name, []):

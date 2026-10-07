@@ -549,11 +549,32 @@ int main(int argc, char **argv) {
         add("cover_%d", k, s, 0.30f, 0.30f, 0.33f);
     }
 
-    // v0.75: the Sawblade Launcher: at rest (both variations), drawing, firing, the heated shot; saws and a magnet in the world
+    // v0.75, v0.76: the Sawblade Launcher: at rest (both variations), drawing, firing, the heated shot, a shot
+    // going over to the idle loop (8 to 11), the hot Overheat held back by the second layer (12); saws and a
+    // magnet in the world, as the DLL lays them out (a model's z along or against a direction, its y as upright as can be)
     {
-        static const struct { const char *clip; float at; int var; const char *note; } saw[] = {
-            {nullptr, 0, 0, "SAWS 10  MAGNETS 3"}, {nullptr, 0, 1, "HEAT 62%  SINK IN"}, {"Equip", 0.15f, 0, ""}, {"Equip", 0.50f, 0, ""},
-            {"Shoot", 0.04f, 0, "SAWS 7  MAGNETS 1"}, {"Shoot", 0.15f, 0, ""}, {"ShootSuper", 0.10f, 1, "HEAT 0%  SINK OUT"}, {"ShootSuper", 0.40f, 1, ""},
+        auto aimed = [](HudState &hs, const char *model, float px, float py, float pz, float dx, float dy, float dz, bool back, float spin) {
+            float len = sqrtf(dx * dx + dy * dy + dz * dz), z[3] = {dx / len, dy / len, dz / len};
+            if (back)
+                for (float &x : z) x = -x;
+            float y[3] = {-z[0] * z[1], 1.0f - z[1] * z[1], -z[2] * z[1]}, yl = sqrtf(y[0] * y[0] + y[1] * y[1] + y[2] * y[2]);
+            for (float &x : y) x /= yl;
+            HudState::WorldMesh &w = hs.world_meshes[hs.world_mesh_count++];
+            w = {model, {px, py, pz}, 0.5f, 0, {0, 0}, {1, 1, 1, 1}, nullptr, 0};
+            w.oriented = true;
+            w.ax[0] = y[1] * z[2] - y[2] * z[1];
+            w.ax[1] = y[2] * z[0] - y[0] * z[2];
+            w.ax[2] = y[0] * z[1] - y[1] * z[0];
+            memcpy(w.ay, y, sizeof(y));
+            memcpy(w.az, z, sizeof(z));
+            w.spin = spin;
+            w.cutout = true;
+        };
+        static const struct { const char *clip; float at; int var; const char *note; float heat, muddle; } saw[] = {
+            {nullptr, 0, 0, "SAWS 10  MAGNETS 3", 0, 0}, {nullptr, 0, 1, "HEAT 62%  SINK IN", 0.62f, 0}, {"Equip", 0.15f, 0, "", 0, 0}, {"Equip", 0.50f, 0, "", 0, 0},
+            {"Shoot", 0.04f, 0, "SAWS 7  MAGNETS 1", 0, 0}, {"Shoot", 0.15f, 0, "", 0, 0}, {"ShootSuper", 0.10f, 1, "HEAT 0%  SINK OUT", 0, 0}, {"ShootSuper", 0.40f, 1, "", 0, 0},
+            {"Shoot", 0.26f, 0, "", 0, 0}, {"Shoot", 0.29f, 0, "", 0, 0}, {"Shoot", 0.32f, 0, "", 0, 0}, {"Shoot", 0.60f, 0, "", 0, 0},
+            {"Shoot", 0.04f, 1, "HEAT 100%  SINK IN", 1.0f, 0.6f},
         };
         int k = 0;
         for (const auto &w : saw) {
@@ -564,14 +585,36 @@ int main(int argc, char **argv) {
             snprintf(s.weapon_note, sizeof(s.weapon_note), "%s", w.note);
             s.revolver_clip = w.clip;
             s.revolver_clip_start = w.clip ? 198.0 - w.at : -100.0;
+            s.blade_spin = 0.4f + 0.9f * k;
+            s.blade_heat = w.heat;
+            s.clip_muddle = w.muddle;
+            s.saw_count = k == 0 ? 10 : 7;
+            s.magnet_charge = k == 0 ? 3.0f : 1.4f;
+            s.heat_sink = k == 6 || k == 7 ? 0.3f : 1.0f;
             s.cam_valid = true;
             s.cam_tan_y = 0.8f;
             s.cam_tan_x = 0.8f * 16.0f / 9.0f;
             if (k < 2) {
-                // a saw 8 m off (2 m across for the Attractor's, 1.5 m for the Overheat's), a heated one further, and a magnet
-                s.fx_sprites[s.fx_sprite_count++] = {"sawblade", -0.25f, 0.2f, (k == 0 ? 2.0f : 1.5f) / (8.0f * 0.8f * 2.0f), 30, k == 0 ? 1.0f : 0.5f, k == 0 ? 1.0f : 0.5f, k == 0 ? 1.0f : 0.5f, 1, 8.0f};
-                s.fx_sprites[s.fx_sprite_count++] = {"sawblade 2", 0.35f, 0.35f, 3.0f / (14.0f * 0.8f * 2.0f), 70, 1.0f, 0.6f, 0.0f, 1, 14.0f};
-                s.world_meshes[s.world_mesh_count++] = {"fx_magnet", {-1.5f, 0.5f, 6.0f}, 0.4857f, 0, {0, 0}, {1, 1, 1, 1}, nullptr, 0};
+                const char *model = k == 0 ? "fx_saw" : "fx_saw_overheat";
+                const float cyan[3] = {0.0f, 0.876f, 1.0f}, white[3] = {1, 1, 1};
+                // a saw flying away level, 1.2 m under the eye; one crossing to the right; one climbing away; a
+                // heated one coming back; and a harpoon in the ground, leaning
+                aimed(s, model, -1.5f, -1.2f, 7.0f, 0, 0, 1, true, 0.5f);
+                aimed(s, model, 0.5f, 0.6f, 9.0f, 1, 0, 0, true, 1.3f);
+                aimed(s, model, -3.5f, 1.2f, 10.0f, 0, 1, 1, true, 2.1f);
+                aimed(s, "fx_saw_heated", 3.5f, 1.8f, 13.0f, -1, -0.3f, -1, true, 0.2f);
+                aimed(s, "fx_harpoon", 2.2f, -0.2f, 7.0f, 0.3f, -1, 0.4f, false, 0);
+                // the level saw's trail, as the DLL gives it: additive, thinning from 1 m to nothing, here round
+                // two thirds of the 4.6 m circle a magnet holds a saw on, a point every ten degrees
+                hud_trail_begin(s, true);
+                for (int i = 0; i <= 24; i++) {
+                    float ang = i * 10.0f * 3.14159265f / 180.0f, left = 1.0f - i / 24.0f;
+                    const float at[3] = {-1.5f - 4.6f + 4.6f * cosf(ang), -1.2f, 7.0f - 4.6f * sinf(ang)};
+                    const float rgb[3] = {(cyan[0] + (white[0] - cyan[0]) * (1 - left)) * 0.5f, (cyan[1] + (white[1] - cyan[1]) * (1 - left)) * 0.5f, (cyan[2] + (white[2] - cyan[2]) * (1 - left)) * 0.5f};
+                    hud_trail_point(s, at, 1.0f * left, rgb, 0.49f * left);
+                }
+                // the magnet's light just after a beep, half loaded
+                s.fx_sprites[s.fx_sprite_count++] = {"muzzleflashnailgun", 2.2f / (7.0f * s.cam_tan_x), -0.2f / (7.0f * 0.8f), 3.2f * 1.5f * 0.6f / (7.0f * 0.8f * 2.0f), 0, 0.5f, 0.5f, 0, 1, 7.0f};
             }
             add("saw_%d", k++, s, 0.33f, 0.34f, 0.37f);
         }

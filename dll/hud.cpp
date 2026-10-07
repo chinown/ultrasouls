@@ -118,6 +118,8 @@ struct UiDraw {
     int tex;      // -1: plain colour
     int sdf;      // 1: distance-field text
     UINT start, count;
+    int add = 0;  // 1: added to the picture instead of laid over it
+    int world = 0;  // 1: something of the game's world (a trail, a beam, a spark), which goes under the HUD's own panels
 };
 
 struct Gfx {
@@ -138,7 +140,7 @@ struct Gfx {
     ID3D11Buffer *ui_cb = nullptr, *mesh_cb = nullptr, *ui_vb = nullptr, *screen_vb = nullptr;
     ID3D11Texture2D *kept = nullptr;         // the frame kept aside during a parry's freeze
     UINT ui_vb_cap = 0;
-    ID3D11BlendState *blend = nullptr, *opaque = nullptr;
+    ID3D11BlendState *blend = nullptr, *opaque = nullptr, *blend_add = nullptr;
     ID3D11RasterizerState *raster = nullptr, *raster_cull = nullptr;
     ID3D11DepthStencilState *depth_off = nullptr, *depth_on = nullptr, *depth_read = nullptr;
     ID3D11SamplerState *linear = nullptr, *point = nullptr, *wrap = nullptr;
@@ -571,6 +573,9 @@ bool create_pipeline(ID3D11Device *dev) {
     bd.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
     bd.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_RED | D3D11_COLOR_WRITE_ENABLE_GREEN | D3D11_COLOR_WRITE_ENABLE_BLUE;
     dev->CreateBlendState(&bd, &g.blend);
+    bd.RenderTarget[0].DestBlend = D3D11_BLEND_ONE;
+    dev->CreateBlendState(&bd, &g.blend_add);
+    bd.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
     bd.RenderTarget[0].BlendEnable = FALSE;
     dev->CreateBlendState(&bd, &g.opaque);
 
@@ -698,6 +703,8 @@ struct Color {
     float r, g, b, a;
 };
 
+int g_ui_add = 0;        // what push_quad marks its quads with: 1 while the additive trails are being built
+int g_ui_world = 0;      // and 1 while what is being built belongs to the world and not to the HUD
 void push_quad(const Surface &sf, const Xf &xf, int tex, int sdf, const float lx[4], const float ly[4], const float u[4], const float v[4], Color c) {
     // corners in order: (0) bottom-left, (1) top-left, (2) top-right, (3) bottom-right
     UiVert q[4];
@@ -716,10 +723,10 @@ void push_quad(const Surface &sf, const Xf &xf, int tex, int sdf, const float lx
     UINT start = (UINT)g.verts.size();
     const int order[6] = {0, 1, 2, 0, 2, 3};
     for (int k : order) g.verts.push_back(q[k]);
-    if (!g.draws.empty() && g.draws.back().tex == tex && g.draws.back().sdf == sdf)
+    if (!g.draws.empty() && g.draws.back().tex == tex && g.draws.back().sdf == sdf && g.draws.back().add == g_ui_add && g.draws.back().world == g_ui_world)
         g.draws.back().count += 6;
     else
-        g.draws.push_back({tex, sdf, start, 6});
+        g.draws.push_back({tex, sdf, start, 6, g_ui_add, g_ui_world});
 }
 
 // Marks the vertices pushed since `first` as being in the game's world, `z` metres along the view.
@@ -860,6 +867,7 @@ bool g_muzzle_known = false;
 float g_whip_hand[2] = {-0.45f, -0.55f}; // the same for the point of the whiplash arm its cable starts at
 bool g_whip_hand_known = false;
 const char *g_skip_mesh = nullptr;       // a mesh draw_model leaves out, by name (the whiplash's hook while it is thrown)
+const char *g_only_mesh = nullptr;       // the one mesh draw_model draws, by name (the Overheat's glowing blade, in a pass of its own)
 
 void build_hud(const HudState &st, float screen_w, float screen_h) {
     if (st.flash_only) {
@@ -1096,6 +1104,71 @@ void build_hud(const HudState &st, float screen_w, float screen_h) {
             image_radial(sc, arc, ring, col, 0.15f * part, false);
         }
     }
+    // From here on, but for the boss's health, it is the world's: trails, beams, coins, sparks, explosions.
+    // They are built after the HUD's panels but drawn before them (hud_draw), so a trail or a blast that
+    // crosses a panel passes behind it, as everything does in ULTRAKILL, whose HUD has a camera of its own.
+    // (Until v0.77 they lay over the panels.)
+    g_ui_world = 1;
+    // Trails: each run of points is one strip. A point's two corners are shared by the piece before it and
+    // the piece after, set across the bend there (the mean of the two pieces' own directions across, made
+    // longer so the strip keeps its width); only at a turn sharper than about 140 degrees, a saw coming back
+    // off a wall, does each piece keep corners of its own. (v0.76 drew every piece as a rectangle of its own:
+    // round a magnet they overlapped on the inside of the curve and gaped on the outside, and looked like
+    // a row of cards.)
+    for (int ri = 0; ri < st.ribbon_count && ri < HudState::MAX_RIBBONS; ri++) {
+        const HudState::Ribbon &rb = st.ribbons[ri];
+        if (rb.count < 2 || rb.first < 0 || rb.first + rb.count > HudState::MAX_RIBBON_POINTS) continue;
+        const HudState::RibbonPoint *pt = st.ribbon_points + rb.first;
+        float hw = screen_w * 0.5f / sc.px_per_unit, hh = screen_h * 0.5f / sc.px_per_unit;
+        g_ui_add = rb.additive ? 1 : 0;
+        // the direction across each piece (zero for one with no length)
+        static float nx[HudState::MAX_RIBBON_POINTS], ny[HudState::MAX_RIBBON_POINTS];
+        for (int i = 0; i + 1 < rb.count; i++) {
+            float dx = (pt[i + 1].x - pt[i].x) * hw, dy = (pt[i + 1].y - pt[i].y) * hh, len = sqrtf(dx * dx + dy * dy);
+            nx[i] = len > 0.01f ? -dy / len : 0.0f;
+            ny[i] = len > 0.01f ? dx / len : 0.0f;
+        }
+        // (a piece with no length borrows its neighbour's)
+        for (int i = 1; i + 1 < rb.count; i++)
+            if (nx[i] == 0 && ny[i] == 0) { nx[i] = nx[i - 1]; ny[i] = ny[i - 1]; }
+        for (int i = rb.count - 3; i >= 0; i--)
+            if (nx[i] == 0 && ny[i] == 0) { nx[i] = nx[i + 1]; ny[i] = ny[i + 1]; }
+        // corner(i, piece): the direction across the strip at point i, as piece `piece` (i - 1 or i) uses it
+        auto corner = [&](int i, int piece, float &ox, float &oy) {
+            int before = i - 1, after = i;
+            ox = nx[piece];
+            oy = ny[piece];
+            if (before < 0 || after > rb.count - 2) return;
+            float mx = nx[before] + nx[after], my = ny[before] + ny[after], ml = sqrtf(mx * mx + my * my);
+            if (ml < 0.7f) return;                        // a sharp turn back: no shared corner
+            mx /= ml;
+            my /= ml;
+            float along = mx * nx[piece] + my * ny[piece], grow = along > 0.5f ? 1.0f / along : 2.0f;
+            ox = mx * grow;
+            oy = my * grow;
+        };
+        for (int i = 0; i + 1 < rb.count; i++) {
+            const HudState::RibbonPoint &a = pt[i], &b = pt[i + 1];
+            if (nx[i] == 0 && ny[i] == 0) continue;
+            float ax = a.x * hw, ay = a.y * hh, bx = b.x * hw, by = b.y * hh, wa = a.w * 2.0f * hh, wb = b.w * 2.0f * hh, oax, oay, obx, oby;
+            corner(i, i, oax, oay);
+            corner(i + 1, i, obx, oby);
+            const float lx[4] = {ax - oax * wa, ax + oax * wa, bx + obx * wb, bx - obx * wb};
+            const float ly[4] = {ay - oay * wa, ay + oay * wa, by + oby * wb, by - oby * wb};
+            const float uv[4] = {0, 0, 0, 0};
+            UINT first = (UINT)g.verts.size();
+            push_quad(sc, screen.xf, -1, 0, lx, ly, uv, uv, {a.r, a.g, a.b, a.a});
+            for (UINT k : {2u, 4u, 5u}) {                 // the quad's vertices 2, 4 and 5 are its far end
+                g.verts[first + k].col[0] = b.r;
+                g.verts[first + k].col[1] = b.g;
+                g.verts[first + k].col[2] = b.b;
+                g.verts[first + k].col[3] = b.a;
+            }
+            if (a.z > 0 && b.z > 0)
+                for (UINT k = 0; k < 6; k++) g.verts[first + k].inv_z = 1.0f / (k == 2 || k == 4 || k == 5 ? b.z : a.z);
+        }
+        g_ui_add = 0;
+    }
     // tracers: a bright core inside a wider, fainter glow, each a quad along the projected line
     for (int i = 0; i < st.tracer_count && i < HudState::MAX_TRACERS; i++) {
         const HudState::TracerLine &t = st.tracers[i];
@@ -1156,6 +1229,7 @@ void build_hud(const HudState &st, float screen_w, float screen_h) {
         image_radial(sc, coin, g.sprite("circlethick"), col, 1.0f, true);
         image_sliced(sc, child(coin, rt(0.5f, 0.5f, 0.5f, 0.5f, 0, 0, d * 0.45f, d * 0.45f)), g.sprite("meter"), col, 1.0f);
     }
+    g_ui_world = 0;
     // boss health ("Boss Healths"): a 1200 x 56 panel 10 under the top edge, the bar inside it, the name
     // over the bar. Behind the red there is a slower orange bar that shows what was just lost.
     {
@@ -1176,6 +1250,7 @@ void build_hud(const HudState &st, float screen_w, float screen_h) {
         }
         for (int i = st.boss_count; i < HudState::MAX_BOSSES; i++) after[i] = 1.0f;
     }
+    g_ui_world = 1;
     // effect sprites (sparks, rings, flashes), where the DLL has projected them
     for (int i = 0; i < st.fx_sprite_count && i < HudState::MAX_FX_SPRITES; i++) {
         const HudState::FxSprite &fx = st.fx_sprites[i];
@@ -1213,6 +1288,7 @@ void build_hud(const HudState &st, float screen_w, float screen_h) {
             image_simple(sc, fl, g.sprite(st.weapon == 1 ? "muzzleflashshotgun" : "muzzleflash"), {1, 1, 1, 1.0f - since * 8.0f});
         }
     }
+    g_ui_world = 0;
     // Blood on the screen ('ScreenBlood', a square half the canvas's height on a side; its material multiplies
     // what is behind it by its dark red, which is drawn here as that red laid over at the picture's alpha).
     {
@@ -1282,9 +1358,11 @@ static_assert(sizeof(MeshConsts) == 224, "must match the shader's cbuffer and th
 //   Below it the capsule sits pushed 0.03 (0.05) out of place; from it on it is back and spins about its
 //   own axis at 2400 degrees a second.
 //   RevolverCylinder: the cylinder is turned about its axis (0, -1, 0) by `cylinder`.
+//   Spin, on the sawblade launcher's 'Blade': the blade in its jaws turns about its own z, as fast as
+//   Nailgun.Update says (the DLL adds the angle up).
 struct ModelLook {
     bool on = false, rail = false, alt = false;
-    float charge = 0, rgb[3] = {1, 1, 1}, time = 0, cylinder = 0;
+    float charge = 0, rgb[3] = {1, 1, 1}, time = 0, cylinder = 0, blade = 0;
     MeshConsts base;
 } g_look;
 // t (position 3, rotation xyzw, scale 3) turned by `angle` about its own y axis
@@ -1295,9 +1373,18 @@ void turn_y(float *t, float angle) {
     t[5] = x * s + z * c;
     t[6] = w * c - y * s;
 }
+void turn_z(float *t, float angle) {
+    float s = sinf(angle * 0.5f), c = cosf(angle * 0.5f), x = t[3], y = t[4], z = t[5], w = t[6];
+    t[3] = x * c + y * s;
+    t[4] = y * c - x * s;
+    t[5] = w * s + z * c;
+    t[6] = w * c - z * s;
+}
 void look_node(const Model &m, int n, float *t) {
     const std::string &nm = m.node_names[n];
-    if (g_look.rail) {
+    if (g_look.blade != 0 && nm == "Blade") {
+        turn_z(t, g_look.blade);
+    } else if (g_look.rail) {
         float level = 0, push = 0;
         if (nm == "Main_Capsule") { level = 5; push = -5; }
         else if (nm.size() == 18 && nm.compare(0, 13, "ProngCapsule_") == 0) { level = (float)(nm[17] - '0'); push = nm[13] == 'L' ? 3.0f : -3.0f; }
@@ -1442,6 +1529,7 @@ void draw_model(ID3D11DeviceContext *ctx, Model &m, const Clip *clip, float time
     for (SkinMesh &sm : m.meshes) {
         if (!sm.vb || !sm.ib) continue;
         if (g_skip_mesh && sm.name == g_skip_mesh) continue;
+        if (g_only_mesh && sm.name != g_only_mesh) continue;
         skin_mesh(ctx, sm, world);
         UINT stride = 32, offset = 0;
         ctx->IASetVertexBuffers(0, 1, &sm.vb, &stride, &offset);
@@ -1487,6 +1575,10 @@ void upload_consts(ID3D11DeviceContext *ctx, const MeshConsts &c) {
 //   Marksman and Sharpshooter: one meter per coin or shot, filled by charge / 100 - index; red (grey on
 //   the Sharpshooter) while filling, the variation's colour when full (Revolver.CheckCoinCharges).
 //   Shotgun: the core meter (Shotgun.UpdateMeter).
+//   Sawblade launcher (Nailgun.Update, RefreshHeatSinkFill). Attractor: the number of saws, and a meter for
+//   each magnet, filled by charge - index, the variation's blue when full and grey (0.33) while it fills.
+//   Overheat: the heat as a bar, in a frame that goes from that grey to orange with it and is not shown
+//   while the heat sink is out and the gun cold; the heat sink's own meter, green when it is in.
 enum { SCREEN_VERTS = 96 };
 bool ensure_screen_vb(ID3D11DeviceContext *ctx) {
     if (g.screen_vb) return true;
@@ -1505,7 +1597,8 @@ bool ensure_screen_vb(ID3D11DeviceContext *ctx) {
 void draw_screens(ID3D11DeviceContext *ctx, Model &m, const HudState &st, const MeshConsts &base) {
     if (m.screens.empty() || g_pose.size() < (size_t)m.nodes * 12) return;
     if (!ensure_screen_vb(ctx)) return;
-    const char *prefix = st.weapon == 1 ? (st.weapon_var == 1 ? "pump." : "core.") : st.variation == 1 ? "marksman." : st.variation == 2 ? "sharp." : "pierce.";
+    const char *prefix = st.weapon == 3 ? (st.weapon_var == 1 ? "overheat." : "magnet.")
+                         : st.weapon == 1 ? (st.weapon_var == 1 ? "pump." : "core.") : st.variation == 1 ? "marksman." : st.variation == 2 ? "sharp." : "pierce.";
     size_t plen = strlen(prefix);
     const float blue[3] = {0.25f, 0.91f, 1.0f}, green[3] = {0.2667f, 1.0f, 0.2706f}, red[3] = {1.0f, 0.2392f, 0.2392f};
     MeshConsts c = base;
@@ -1517,7 +1610,7 @@ void draw_screens(ID3D11DeviceContext *ctx, Model &m, const HudState &st, const 
         const char *what = sc.name.c_str() + plen;
         float fill = 1.0f, rgb[3] = {sc.rgba[0], sc.rgba[1], sc.rgba[2]};
         int tex = sc.tex;
-        bool radial = false;
+        bool radial = false, ammo = false;
         if (!strcmp(what, "monitor")) {
             const char *pic = "battery_full";
             memcpy(rgb, blue, sizeof(rgb));
@@ -1535,6 +1628,24 @@ void draw_screens(ID3D11DeviceContext *ctx, Model &m, const HudState &st, const 
             if (fill >= 1.0f) memcpy(rgb, sharp ? red : green, sizeof(rgb));
             else if (sharp) rgb[0] = rgb[1] = rgb[2] = 0.5f;
             else { rgb[0] = 1; rgb[1] = 0; rgb[2] = 0; }
+        } else if (st.weapon == 3) {
+            const float grey[3] = {0.33f, 0.33f, 0.33f}, orange[3] = {1.0f, 0.5f, 0.0f};
+            float heat = fminf(fmaxf(st.blade_heat, 0.0f), 1.0f);
+            if (!strncmp(what, "sink", 4)) {
+                float charge = st.weapon_var == 1 ? st.heat_sink : st.magnet_charge;
+                fill = fminf(fmaxf(charge - (what[4] - '0'), 0.0f), 1.0f);
+                memcpy(rgb, fill >= 1.0f ? (st.weapon_var == 1 ? green : blue) : grey, sizeof(rgb));
+            } else if (!strcmp(what, "fill")) {
+                fill = heat;
+            } else if (!strcmp(what, "heatbg")) {
+                if (st.heat_sink < 1.0f && heat <= 0) fill = 0;
+                for (int k = 0; k < 3; k++) rgb[k] = grey[k] + (orange[k] - grey[k]) * heat;
+            } else if (!strcmp(what, "ammo")) {
+                ammo = true;
+                memcpy(rgb, blue, sizeof(rgb));
+            } else if (sc.rgba[3] < 0.3f) {
+                fill = 0;                                 // a faint wash over the display, which a solid panel is not
+            }
         } else if (!strcmp(what, "fill")) {
             fill = fminf(fmaxf(st.core_meter, 0.0f), 1.0f);
             float k = fminf(fmaxf(st.core_meter_red, 0.0f), 1.0f);
@@ -1581,7 +1692,41 @@ void draw_screens(ID3D11DeviceContext *ctx, Model &m, const HudState &st, const 
             }
             for (int i = 0; i < 2; i++) o[6 + i] = uv[0][i] + (uv[3][i] - uv[0][i]) * a + (uv[1][i] - uv[0][i]) * b;
         };
-        if (radial && fill < 1.0f) {
+        ID3D11ShaderResourceView *letters = nullptr;
+        if (ammo) {
+            // The number of saws, in the middle of its box, in the HUD's own font (the game writes it in the same
+            // one). The box's height is 1 here; sc.rgba[3] is how high the letters are in it.
+            char num[8];
+            snprintf(num, sizeof(num), "%d", st.saw_count < 0 ? 0 : st.saw_count > 99 ? 99 : st.saw_count);
+            if (g.fonts.empty() || g.fonts[0].tex < 0) continue;
+            const Font &f = g.fonts[0];
+            letters = g.textures[f.tex].srv;
+            float w_box = sqrtf((q[3][0] - q[0][0]) * (q[3][0] - q[0][0]) + (q[3][1] - q[0][1]) * (q[3][1] - q[0][1]) + (q[3][2] - q[0][2]) * (q[3][2] - q[0][2]));
+            float h_box = sqrtf(e1[0] * e1[0] + e1[1] * e1[1] + e1[2] * e1[2]);
+            if (h_box < 1e-9f || w_box < 1e-9f) continue;
+            float s = sc.rgba[3] / f.point, sx = s * h_box / w_box, width = 0, top = -1e9f, bottom = 1e9f;
+            for (const char *ch = num; *ch; ch++) {
+                const Glyph *gl = f.find((uint8_t)*ch);
+                if (!gl) continue;
+                width += gl->adv * sx;
+                top = fmaxf(top, gl->by * s);
+                bottom = fminf(bottom, (gl->by - gl->h) * s);
+            }
+            float pen = 0.5f - width * 0.5f, base_y = 0.5f - (top + bottom) * 0.5f;
+            for (const char *ch = num; *ch && count + 6 <= SCREEN_VERTS; ch++) {
+                const Glyph *gl = f.find((uint8_t)*ch);
+                if (!gl) continue;
+                float a0 = pen + gl->bx * sx, a1 = a0 + gl->w * sx, b1 = base_y + gl->by * s, b0 = b1 - gl->h * s;
+                float u0 = gl->x / f.aw, u1 = (gl->x + gl->w) / f.aw, v0 = gl->y / f.ah, v1 = (gl->y + gl->h) / f.ah;
+                const float ab[6][4] = {{a0, b0, u0, v1}, {a0, b1, u0, v0}, {a1, b1, u1, v0}, {a0, b0, u0, v1}, {a1, b1, u1, v0}, {a1, b0, u1, v1}};
+                for (const float *k : ab) {
+                    put(k[0], k[1]);
+                    verts[count - 1][6] = k[2];
+                    verts[count - 1][7] = k[3];
+                }
+                pen += gl->adv * sx;
+            }
+        } else if (radial && fill < 1.0f) {
             // A pie from twelve o'clock, clockwise, as it is seen: the panel may be mounted turned or
             // flipped on the gun (the Marksman's is upside down), so each clock direction on the screen
             // is first put into the panel's own two directions. The picture's transparency rounds it off.
@@ -1624,10 +1769,11 @@ void draw_screens(ID3D11DeviceContext *ctx, Model &m, const HudState &st, const 
         c.tint[0] = rgb[0];
         c.tint[1] = rgb[1];
         c.tint[2] = rgb[2];
+        c.mode[2] = letters ? 1.0f : 0.0f;                // letters: the tint alone, cut out where the font's picture says
         upload_consts(ctx, c);
         UINT stride = 32, offset = 0;
         ctx->IASetVertexBuffers(0, 1, &g.screen_vb, &stride, &offset);
-        ID3D11ShaderResourceView *srv = tex >= 0 && tex < (int)m.tex_srvs.size() && m.tex_srvs[tex] ? m.tex_srvs[tex] : g.white;
+        ID3D11ShaderResourceView *srv = letters ? letters : tex >= 0 && tex < (int)m.tex_srvs.size() && m.tex_srvs[tex] ? m.tex_srvs[tex] : g.white;
         ctx->PSSetShaderResources(0, 1, &srv);
         ctx->Draw((UINT)count, 0);
     }
@@ -1780,14 +1926,25 @@ void draw_world(ID3D11DeviceContext *ctx, const HudState &st, bool srgb) {
         }
         // size, the flip about the camera's right axis, then into place
         float sc[16], rx[16], ry[16], tr[16], world[16];
-        identity(sc);
-        sc[0] = sc[5] = sc[10] = wm.radius;
-        rotate_x(rx, wm.flip);
-        rotate_y(ry, cam_yaw);
-        translate(tr, wm.p[0], wm.p[1], wm.p[2]);
-        mul44(sc, rx, world);
-        mul44(world, ry, world);
-        mul44(world, tr, world);
+        if (wm.oriented) {
+            // (a point is a row here: the rows of the matrix are where the model's axes go)
+            identity(world);
+            for (int k = 0; k < 3; k++) {
+                world[k] = wm.ax[k] * wm.radius;
+                world[4 + k] = wm.ay[k] * wm.radius;
+                world[8 + k] = wm.az[k] * wm.radius;
+                world[12 + k] = wm.p[k];
+            }
+        } else {
+            identity(sc);
+            sc[0] = sc[5] = sc[10] = wm.radius;
+            rotate_x(rx, wm.flip);
+            rotate_y(ry, cam_yaw);
+            translate(tr, wm.p[0], wm.p[1], wm.p[2]);
+            mul44(sc, rx, world);
+            mul44(world, ry, world);
+            mul44(world, tr, world);
+        }
         MeshConsts c{};
         c.dpar[0] = g.depth_a;
         c.dpar[1] = g.depth_b;
@@ -1796,13 +1953,14 @@ void draw_world(ID3D11DeviceContext *ctx, const HudState &st, bool srgb) {
         memcpy(c.world, world, sizeof(c.world));
         c.light[1] = 1.0f;
         c.light[3] = 1.0f;
+        c.mode[0] = wm.cutout ? 1.0f : 0.0f;
         c.mode[1] = srgb ? 1.0f : 0.0f;
         c.mode[3] = 1.0f;
         memcpy(c.tint, wm.rgba, sizeof(c.tint));
         c.uvoff[0] = wm.uv[0] - floorf(wm.uv[0]);
         c.uvoff[1] = wm.uv[1] - floorf(wm.uv[1]);
         upload_consts(ctx, c);
-        draw_model(ctx, *m, nullptr, 0, false);
+        draw_model(ctx, *m, nullptr, 0, false, nullptr, 0, 1.0f, wm.spin != 0 && m->nodes > 1 ? 1 : -1, wm.spin);
     }
     ctx->OMSetBlendState(g.opaque, nullptr, 0xFFFFFFFF);
     ctx->PSSetSamplers(0, 1, &g.point);
@@ -1987,6 +2145,49 @@ void draw_viewmodel(ID3D11DeviceContext *ctx, const HudState &st, float aspect, 
             shot = true;                                  // blended from the idle pose, like a shot clip
             blend_weight = fminf(st.twirl_blend, 1.0f);
         }
+        const Clip *base = shot ? idle : nullptr;
+        float base_time = (float)st.time;
+        if (saw && idle && idle->frames > 1) {
+            // The sawblade launcher is played the way its Animator ('Nailgun2') plays it, which the plain
+            // rule above (the clip, then the idle loop wherever the clock has it) is not:
+            //   a clip goes over to Idle before its end, at a set share of its length, in a short blend
+            //   (Shoot at 91.4% over 0.057 s, Equip at 94.9% over 0.051 s, ShootSuper at 93.2% over 0.032 s);
+            //   Idle starts from its beginning as that blend starts, and plays at half speed;
+            //   a second layer, whose weight Nailgun.UpdateAnimationWeight sets at every shot (heat x 0.6 on
+            //   the Overheat, 0.9 with its heat sink out, nothing on the Attractor), holds the Idle clip's
+            //   first frame over all of it: that much of every motion is taken away.
+            // Until v0.76 the gun jumped from the end of a shot into the middle of an idle loop that ran at
+            // twice its speed, and the Overheat kicked at full strength however hot it was.
+            static const struct { const char *clip; float at, fade; } exits[] = {{"Shoot", 0.9143f, 0.0571f}, {"Equip", 0.9486f, 0.0514f}, {"ShootSuper", 0.9318f, 0.0318f}};
+            const Clip *named = weapon->clip(st.revolver_clip);
+            double since_start = (st.time - st.revolver_clip_start) * st.revolver_clip_speed;
+            float muddle = fminf(fmaxf(st.clip_muddle, 0.0f), 1.0f), idle_len = (idle->frames - 1) / idle->fps;
+            clip = idle;
+            loop = true;
+            t = (float)fmod(st.time * 0.5, idle_len);
+            base = muddle > 0 ? idle : nullptr;
+            base_time = 0;
+            blend_weight = 1.0f - muddle;
+            if (named && named != idle && since_start >= 0) {
+                float len = (named->frames - 1) / named->fps, at = len, fade = 0.05f, nt = (float)fmin(since_start, 1.0e6);
+                for (const auto &e : exits)
+                    if (named->name == e.clip) { at = e.at * len; fade = e.fade; }
+                if (nt < at) {
+                    clip = named;
+                    loop = false;
+                    t = nt;
+                } else if (nt < at + fade) {
+                    clip = named;
+                    loop = false;
+                    t = fminf(nt, len);
+                    base = idle;
+                    base_time = (nt - at) * 0.5f;
+                    blend_weight = (1.0f - (nt - at) / fade) * (1.0f - muddle);
+                } else {
+                    t = (float)fmod((since_start - at) * 0.5, idle_len);
+                }
+            }
+        }
         float muzzle[3] = {0, 0, 0};
         int muzzle_node = weapon->node(shotgun ? "ShootPoint L" : rail || saw ? "Shootpoint" : "ShootPoint");
         if (muzzle_node < 0 && slab) muzzle_node = weapon->node("ShootPoint (1)");
@@ -2001,12 +2202,32 @@ void draw_viewmodel(ID3D11DeviceContext *ctx, const HudState &st, float aspect, 
             g_look.charge = st.rail_charge;
             g_look.time = (float)st.time;
             g_look.cylinder = is_revolver ? st.cylinder : 0.0f;
+            g_look.blade = saw ? st.blade_spin : 0.0f;
             g_look.base = c;
             memcpy(g_look.rgb, var_rgb[var], sizeof(g_look.rgb));
         }
-        draw_model(ctx, *weapon, clip, t, loop, shot ? idle : nullptr, (float)st.time, blend_weight,
+        if (saw) g_skip_mesh = "Blade (1)";
+        draw_model(ctx, *weapon, clip, t, loop, base, base_time, blend_weight,
                    is_revolver ? weapon->node("Revolver_Bone") : -1, st.twirl, muzzle_node, muzzle, slab ? 1 : 0);
+        g_skip_mesh = nullptr;
+        if (saw && st.weapon_var == 1 && st.blade_heat > 0.01f) {
+            // The Overheat's 'Blade (1)': the blade again, a tenth larger, in plain orange and as strong as
+            // the gun is hot (Nailgun.SetHeat puts the heat in its material's alpha).
+            MeshConsts k = c;
+            k.mode[3] = 1.0f;
+            k.tint[3] = fminf(st.blade_heat, 1.0f);
+            upload_consts(ctx, k);
+            ctx->OMSetBlendState(g.blend, nullptr, 0xFFFFFFFF);
+            ctx->OMSetDepthStencilState(g.depth_read, 0);
+            g_only_mesh = "Blade (1)";
+            draw_model(ctx, *weapon, clip, t, loop, base, base_time, blend_weight, -1, 0, -1, nullptr, 0);
+            g_only_mesh = nullptr;
+            ctx->OMSetBlendState(g.opaque, nullptr, 0xFFFFFFFF);
+            ctx->OMSetDepthStencilState(g.depth_on, 0);
+            upload_consts(ctx, c);
+        }
         g_look.on = false;
+        g_look.blade = 0;
         ctx->RSSetState(g.raster);
         draw_screens(ctx, *weapon, st, c);
         if (rail && st.rail_charge >= 5.0f) draw_rail_arcs(ctx, st, *weapon, c);
@@ -2249,6 +2470,64 @@ void hud_strip(HudState &st, const float *pa, const float *pb, float width, cons
     ln.z1 = v[1][2];
 }
 
+void hud_trail_begin(HudState &st, bool additive) {
+    st.trail_open = false;
+    st.trail_has_prev = false;
+    st.trail_additive = additive;
+}
+
+void hud_trail_point(HudState &st, const float *p, float width, const float *rgb, float alpha) {
+    if (!st.cam_valid) return;
+    const float NEAR_Z = 0.1f, WMAX = 0.12f;
+    float d[3] = {p[0] - st.cam_eye[0], p[1] - st.cam_eye[1], p[2] - st.cam_eye[2]};
+    float cur[8] = {d[0] * st.cam_right[0] + d[1] * st.cam_right[1] + d[2] * st.cam_right[2], d[0] * st.cam_up[0] + d[1] * st.cam_up[1] + d[2] * st.cam_up[2],
+                    d[0] * st.cam_fwd[0] + d[1] * st.cam_fwd[1] + d[2] * st.cam_fwd[2], width, rgb[0], rgb[1], rgb[2], alpha};
+    auto emit = [&](const float *v) {
+        if (!st.trail_open) {
+            if (st.ribbon_count >= HudState::MAX_RIBBONS) return;
+            st.ribbons[st.ribbon_count++] = {st.ribbon_point_count, 0, st.trail_additive};
+            st.trail_open = true;
+        }
+        if (st.ribbon_point_count >= HudState::MAX_RIBBON_POINTS) return;
+        HudState::RibbonPoint &o = st.ribbon_points[st.ribbon_point_count++];
+        o.x = v[0] / (v[2] * st.cam_tan_x);
+        o.y = v[1] / (v[2] * st.cam_tan_y);
+        float w = v[3] * 0.5f / (v[2] * st.cam_tan_y * 2.0f);
+        o.w = w > WMAX ? WMAX : w;
+        o.r = v[4]; o.g = v[5]; o.b = v[6]; o.a = v[7];
+        o.z = v[2];
+        st.ribbons[st.ribbon_count - 1].count++;
+    };
+    // where the line from the last point to this one comes through the plane just in front of the eye
+    auto cut = [&](float *out) {
+        const float *q = st.trail_prev;
+        float k = (NEAR_Z - q[2]) / (cur[2] - q[2]);
+        for (int i = 0; i < 8; i++) out[i] = q[i] + (cur[i] - q[i]) * k;
+        out[2] = NEAR_Z;
+    };
+    bool in = cur[2] >= NEAR_Z;
+    if (!st.trail_has_prev) {
+        if (in) emit(cur);
+    } else {
+        bool was_in = st.trail_prev[2] >= NEAR_Z;
+        float edge[8];
+        if (was_in && in) {
+            emit(cur);
+        } else if (was_in) {                              // it goes behind the eye: the strip ends at the plane
+            cut(edge);
+            emit(edge);
+            st.trail_open = false;
+        } else if (in) {                                  // and comes back: a new strip from the plane
+            cut(edge);
+            st.trail_open = false;
+            emit(edge);
+            emit(cur);
+        }
+    }
+    memcpy(st.trail_prev, cur, sizeof(cur));
+    st.trail_has_prev = true;
+}
+
 void hud_beam(HudState &st, const float *a, const float *b, int kind, float width, float unit, unsigned seen, int seed) {
     static const char *const ARCS[10] = {"arc0", "arc1", "arc2", "arc3", "arc4", "arc5", "arc6", "arc7", "arc8", "arc9"};
     if (kind <= BEAM_NONE || kind >= BEAM_KINDS) return;
@@ -2471,7 +2750,9 @@ void hud_draw(ID3D11Device *dev, ID3D11DeviceContext *ctx, ID3D11Texture2D *targ
             ctx->PSSetConstantBuffers(0, 1, &g.ui_cb);
             ctx->PSSetSamplers(0, 1, &g.linear);
             ctx->PSSetShaderResources(2, 1, &g.scene_depth);
+            for (int pass = 1; pass >= 0; pass--)            // the world's first, then the HUD's own over it
             for (const UiDraw &d : g.draws) {
+                if (d.world != pass) continue;
                 float mode[8] = {(float)d.sdf, srgb ? 1.0f : 0.0f, 0, 0, g.depth_a, g.depth_b, g.scene_depth ? 1.0f : 0.0f, 0};
                 if (SUCCEEDED(ctx->Map(g.ui_cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &ms))) {
                     memcpy(ms.pData, mode, sizeof(mode));
@@ -2479,6 +2760,7 @@ void hud_draw(ID3D11Device *dev, ID3D11DeviceContext *ctx, ID3D11Texture2D *targ
                 }
                 ID3D11ShaderResourceView *srv = d.tex >= 0 ? g.textures[d.tex].srv : g.white;
                 ctx->PSSetShaderResources(0, 1, &srv);
+                ctx->OMSetBlendState(d.add && g.blend_add ? g.blend_add : g.blend, nullptr, 0xFFFFFFFF);
                 ctx->Draw(d.count, d.start);
             }
         }

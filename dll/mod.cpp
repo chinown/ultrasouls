@@ -19,6 +19,7 @@
 #include <cstring>
 #include <cmath>
 #include <vector>
+#include <new>
 
 // Verified against the probe log (exe 1.0.0.0, WorldChrBase at exe+1C77E50)
 static const uintptr_t OFF_PLAYER = 0x68;       // WorldChr -> player
@@ -2458,11 +2459,138 @@ static bool ray_cast(const float *a, const float *b, RayHit &out) {
 
 struct Coin;
 static bool coin_hits_core(const Coin &c);
+// ---- A beam that hits more than once (RevolverBeam.PiercingShotCheck). ULTRAKILL's piercing beams strike
+// what is on their line one hit at a time. Every hit on a living enemy stops time for 0.05 s
+// (TimeController.HitStop: the picture stands still, with no flash) and the next hit comes 0.05 s after
+// that (0.025 s for a railcannon's beam); one enemy takes up to maxHitsPerTarget of them and the beam has
+// hitAmount in all; what is left when an enemy is dead or has had its share goes to the next enemy
+// further along the same line. A row of hits on one enemy is therefore a stutter of the whole game, a
+// tenth of a second a hit: the "slowing down" of a Slab shot sent on by coins. This is how a beam that a
+// coin sends on is delivered here. (Until v0.77 its hits were added up and landed as one, at once.)
+struct BeamChain {
+    bool live;
+    float from[3], dir[3], at[3];                // the coin, the beam's line, and where the last hit landed
+    uintptr_t chr;                               // the enemy being hit
+    int row, look, hits_left, per_target, on_target, count, power;
+    float gap, reach;                            // seconds between hits; how far along the line the enemy being hit is
+    double next_at;
+};
+enum { MAX_BEAM_CHAINS = 4 };
+static BeamChain g_beam_chains[MAX_BEAM_CHAINS];
+static volatile float g_hitstop_request = 0;     // seconds; carried out when the frame is presented, like a parry's freeze
+static volatile LONG g_chain_hits = 0, g_hitstops = 0;
+// A short burst of light at a point of the world: where a coin sends a beam on, where a beam's hit lands.
+struct Flash { float p[3], size, life, rgb[3]; double born; };
+enum { MAX_FLASHES = 12 };
+static Flash g_flashes[MAX_FLASHES];
+static int g_flash_next = 0;
+static void add_flash(const float *p, float size, float life, const float *rgb) {
+    Flash &f = g_flashes[g_flash_next++ % MAX_FLASHES];
+    memcpy(f.p, p, sizeof(f.p));
+    memcpy(f.rgb, rgb, sizeof(f.rgb));
+    f.size = size;
+    f.life = life;
+    f.born = now_s();
+}
+static bool chr_alive(uintptr_t chr);
+static bool whip_target_point(uintptr_t chr, float *out);
+// What a hit of such a beam looks like: the beam's own hit particles (60 drops, as at the end of any revolver
+// shot), a ring of sparks in the beam's colour flung out at 30 to 80 u/s, and a burst of light. The sparks
+// and the light are ours: ULTRAKILL has its camera shake and the enemy's own blood for the rest.
+static void fx_chain_hit(const float *at, const float *back, int look) {
+    const BeamLook &k = BEAM_LOOKS[look];
+    fx_beam_hit(at, back);
+    add_flash(at, 3.0f * UK_UNIT, 0.12f, k.c1);
+    if (!in_sight(at)) return;
+    for (int i = 0; i < 16; i++) {
+        float d[3], v[3], speed = frand(30.0f, 80.0f) * UK_UNIT;
+        rand_unit(d);
+        for (int j = 0; j < 3; j++) v[j] = d[j] * speed;
+        Particle &p = new_particle(at, v, 0.2f, 0.3f * UK_UNIT, 0.0f, "spark");
+        p.r = k.c1[0] * 0.5f + 0.5f;
+        p.g = k.c1[1] * 0.5f + 0.5f;
+        p.b = k.c1[2] * 0.5f + 0.5f;
+    }
+}
+static void beam_chain_hit(BeamChain &b, double t) {
+    if (!b.chr || !chr_alive(b.chr) || b.on_target >= b.per_target) {
+        // on to the next enemy along the line (within three quarters of a metre of it, and in sight of the coin)
+        Target cand[12];
+        int n = find_targets(b.from, cand, 12, COIN_RANGE);
+        uintptr_t next = 0;
+        float best = COIN_RANGE, pt[3] = {0, 0, 0};
+        for (int i = 0; i < n; i++) {
+            if (cand[i].chr == b.chr) continue;
+            float d[3] = {cand[i].p[0] - b.from[0], cand[i].p[1] - b.from[1], cand[i].p[2] - b.from[2]};
+            float along = d[0] * b.dir[0] + d[1] * b.dir[1] + d[2] * b.dir[2], off2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2] - along * along;
+            if (along <= b.reach + 0.1f || along >= best || off2 > 0.75f * 0.75f || ray_blocked(b.from, cand[i].p) == 1) continue;
+            best = along;
+            next = cand[i].chr;
+            memcpy(pt, cand[i].p, sizeof(pt));
+        }
+        if (!next) {
+            logf("  beam from a coin: %d hits landed, %d left with no one further along its line\n", b.count, b.hits_left);
+            b.live = false;
+            return;
+        }
+        b.chr = next;
+        b.on_target = 0;
+        b.reach = best;
+        memcpy(b.at, pt, sizeof(pt));
+    } else {
+        float pt[3];
+        if (whip_target_point(b.chr, pt)) memcpy(b.at, pt, sizeof(pt));      // (it may have been knocked about)
+    }
+    float d[3] = {b.at[0] - b.from[0], b.at[1] - b.from[1], b.at[2] - b.from[2]}, len = sqrtf(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+    if (len < 0.01f) { b.live = false; return; }
+    float dir[3] = {d[0] / len, d[1] / len, d[2] / len}, back[3] = {-dir[0], -dir[1], -dir[2]};
+    bool ok = shoot(b.row, b.from, dir);
+    b.on_target++;
+    b.hits_left--;
+    b.count++;
+    add_beam(b.from, b.at, b.look);
+    fx_chain_hit(b.at, back, b.look);
+    // (each hit a little higher than the last: ours, on the coin's own ring, whose pitch ULTRAKILL raises with the chain's power)
+    sound_play("coin_hit", 0.22f, (b.power > 2 ? 1.0f + (b.power - 2) / 5.0f : 1.0f) + 0.06f * (b.count - 1));
+    g_hitstop_request = 0.05f;
+    note_attack(HIT_COIN);
+    InterlockedIncrement(&g_chain_hits);
+    if (ok) InterlockedIncrement(&g_coin_shots);
+    if (b.hits_left <= 0) b.live = false;
+    else b.next_at = t + b.gap;
+}
+static void start_beam_chain(const float *from, const Target &tg, int row, int look, int hits, int per_target, float gap, int power, double t) {
+    BeamChain *slot = &g_beam_chains[0];
+    for (BeamChain &b : g_beam_chains)
+        if (!b.live) { slot = &b; break; }
+    BeamChain &b = *slot;
+    b = BeamChain{};
+    b.live = true;
+    memcpy(b.from, from, sizeof(b.from));
+    memcpy(b.at, tg.p, sizeof(b.at));
+    float d[3] = {tg.p[0] - from[0], tg.p[1] - from[1], tg.p[2] - from[2]}, len = sqrtf(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+    if (len < 0.01f) { b.live = false; return; }
+    for (int i = 0; i < 3; i++) b.dir[i] = d[i] / len;
+    b.reach = len;
+    b.chr = tg.chr;
+    b.row = row;
+    b.look = look;
+    b.hits_left = hits;
+    b.per_target = per_target;
+    b.gap = gap;
+    b.power = power;
+    beam_chain_hit(b, t);                        // the first hit at once
+}
+static void update_beam_chains(double t) {
+    for (BeamChain &b : g_beam_chains)
+        if (b.live && t >= b.next_at) beam_chain_hit(b, t);
+}
 static uintptr_t g_watch_chr = 0;                // debug: the last ricochet's target, to log its health a second later
 static int g_watch_hp = 0;
 static double g_watch_at = 0;
 // The look of the beam a coin sends on: the one that hit it.
 static int coin_beam(const Coin &c) {
+    if (c.carry == BEHAVIOR_SLAB) return BEAM_SLAB;
     if (c.carry == BEHAVIOR_RAIL) return BEAM_RAIL;
     if (c.carry == BEHAVIOR_RAIL_MALICIOUS) return BEAM_MALICIOUS;
     if (c.carry == BEHAVIOR_SLAB_SHARP) return BEAM_SHARP;
@@ -2470,7 +2598,13 @@ static int coin_beam(const Coin &c) {
 }
 static void reflect_coin(Coin &c, double t) {
     c.alive = false;
-    sound_play("coin_hit", 0.35f, 0.65f);        // the reflected beam has the same ricochet sound
+    // the reflected beam has the same ricochet sound; from the second coin of a chain on, higher with every coin
+    // ("SetPitch(1 + (power - 2) / 5)")
+    sound_play("coin_hit", 0.35f, c.power > 2 ? 1.0f + (c.power - 2) / 5.0f : 0.65f);
+    if (c.carry || c.charged) {
+        // (ours: a burst of light at a coin that sends another weapon's beam on)
+        add_flash(c.p, 2.5f * UK_UNIT, 0.12f, BEAM_LOOKS[coin_beam(c)].c1);
+    }
     Coin *next = nullptr;
     float best = COIN_RANGE * COIN_RANGE;
     for (Coin &o : g_coins) {
@@ -2484,10 +2618,12 @@ static void reflect_coin(Coin &c, double t) {
         next->power = c.power + 1;
         next->charged = c.charged;
         next->carry = c.carry;
-        // Coin.ReflectRevolver, strongAlt: each coin of the chain that is caught in its flash gives the beam one more hit
-        next->more_hits = c.more_hits + (c.hit_times > 1 && (c.carry == BEHAVIOR_SLAB_CHARGED || c.carry == BEHAVIOR_SLAB_SHARP) ? 1 : 0);
+        // Coin.ReflectRevolver, strongAlt: each coin of the chain that is caught in its flash gives the beam one more
+        // hit (a beam with fewer than 99: the Slab's plain and charged shots, not its Sharpshooter's)
+        next->more_hits = c.more_hits + (c.hit_times > 1 && (c.carry == BEHAVIOR_SLAB_CHARGED || c.carry == BEHAVIOR_SLAB) ? 1 : 0);
         add_beam(c.p, next->p, coin_beam(c));
-        if (c.hit_times > next->hit_times) next->hit_times = c.hit_times;
+        // (a plain shot's split is the coin's own and goes with it down the chain; another weapon's beam is one beam)
+        if (!c.carry && !c.charged && c.hit_times > next->hit_times) next->hit_times = c.hit_times;
         InterlockedIncrement(&g_coin_chains);
         return;
     }
@@ -2505,33 +2641,51 @@ static void reflect_coin(Coin &c, double t) {
     }
     logf("coin shot: power %d, x%d, %d in range, %d in sight\n", c.power, c.hit_times, in_range, n);
     int power = c.power > 5 ? 5 : c.power;
-    // A beam other than the plain revolver's is not replaced by the coin's own shot: ULTRAKILL sends that very
-    // beam on from the coin, stronger (Coin.ReflectRevolver, "altBeam"). Each of its hits gains a quarter of
-    // the coin's power, times the beam's coinDamageBonusMultiplier (0.5 for the Piercer's charged beam, 1 for
-    // the rest), and the coin's power is 2 plus one for every coin before it in the chain. What the beams
-    // are (damage a hit x hits on one target): Piercer charged 1 x 3, Slab charged 1.25 x 4, Sharpshooter
-    // 1 x 1, Slab Sharpshooter 1.25 x 2, Electric Railcannon 2 x 4, Malicious 2 x 1. Only the Piercer's is
-    // "splitcoinable": caught in the coin's flash it leaves as two beams. A Slab beam ("strongAlt") caught
-    // in the flash leaves as one, with one more hit and all its hits spent on the first target: the Slab
-    // Piercer's charged shot through one flashing coin is 7 hits of 1.75, 12.25 revolver shots' worth
-    // against the 5 it is fired with. The total is sent as one hit of a row made for it (9000300 + four
-    // times the total, in quarters; through enemies, not stopped by shields).
-    int carried = c.carry ? c.carry : c.charged ? BEHAVIOR_PIERCER : 0, alt_row = 0, shots = c.hit_times;
+    // A beam that goes through things (hitAmount above 1: every beam but the standard revolver's plain shot
+    // and the Malicious Railcannon's) is not replaced by the coin's own shot: RevolverBeam hands the coin a
+    // copy of itself and Coin.ReflectRevolver ("altBeam") sends that on, stronger, at the enemy's head. Each
+    // of its hits gains a quarter of the coin's power, times the beam's coinDamageBonusMultiplier, and the
+    // coin's power is 2 plus one for every coin before it in the chain. The beams, from their prefabs
+    // (damage a hit, hitAmount, maxHitsPerTarget, bonus):
+    //   Slab plain          1.25   2    2   1      strongAlt
+    //   Slab charged        1.25   6    4   1      strongAlt
+    //   Slab Sharpshooter   1.25   999  2   1      strongAlt
+    //   Piercer charged     1      3    3   0.5    splitcoinable
+    //   Sharpshooter        1      999  1   1
+    //   Electric Railcannon 2      999  4   1
+    // Only the Piercer's charged beam is "splitcoinable": caught in the coin's flash it leaves as two beams.
+    // A Slab beam with fewer than 99 hits caught in the flash is not split: it leaves as one beam with one hit
+    // more, all of whose hits may land on one enemy (hitAmount++, maxHitsPerTarget = hitAmount). So the Slab's
+    // plain shot off a coin is one beam of 2 hits of 1.75 into the nearest enemy's head, 3 off a flashing
+    // coin, and its charged shot through one flashing coin 7 hits of 1.75. (Until v0.77 a Slab's plain shot
+    // was given the standard revolver's rule, the coin's own shot, split in two off a flashing coin.) The hits
+    // are dealt one at a time: see BeamChain. Each is one shot of the row for its damage (9000300 + quarters
+    // of a revolver shot; through enemies, not stopped by shields).
+    int carried = c.carry ? c.carry : c.charged ? BEHAVIOR_PIERCER : 0, hit_row = 0, hits = 1, per_target = 1, shots = c.hit_times;
+    float gap = 0.05f;
     if (carried) {
-        float each = carried == BEHAVIOR_SLAB_CHARGED || carried == BEHAVIOR_SLAB_SHARP ? 1.25f : carried == BEHAVIOR_RAIL || carried == BEHAVIOR_RAIL_MALICIOUS ? 2.0f : 1.0f;
-        int hits = carried == BEHAVIOR_PIERCER ? 3 : carried == BEHAVIOR_SLAB_CHARGED ? 4 : carried == BEHAVIOR_SLAB_SHARP ? 2 : carried == BEHAVIOR_RAIL ? 4 : 1;
-        float bonus = carried == BEHAVIOR_PIERCER ? 0.5f : 1.0f;
-        bool strong = carried == BEHAVIOR_SLAB_CHARGED || carried == BEHAVIOR_SLAB_SHARP;
-        if (strong) {
+        bool slab = carried == BEHAVIOR_SLAB || carried == BEHAVIOR_SLAB_CHARGED || carried == BEHAVIOR_SLAB_SHARP;
+        bool rail = carried == BEHAVIOR_RAIL || carried == BEHAVIOR_RAIL_MALICIOUS;
+        float each = slab ? 1.25f : rail ? 2.0f : 1.0f, bonus = carried == BEHAVIOR_PIERCER ? 0.5f : 1.0f;
+        const int NO_LIMIT = 12;                 // (a beam of 999 hits: as many as three enemies in a row can take)
+        if (carried == BEHAVIOR_SLAB) { hits = 2; per_target = 2; }
+        else if (carried == BEHAVIOR_SLAB_CHARGED) { hits = 6; per_target = 4; }
+        else if (carried == BEHAVIOR_SLAB_SHARP) { hits = NO_LIMIT; per_target = 2; }
+        else if (carried == BEHAVIOR_PIERCER) { hits = 3; per_target = 3; }
+        else if (carried == BEHAVIOR_RAIL) { hits = NO_LIMIT; per_target = 4; }
+        if (carried == BEHAVIOR_SLAB || carried == BEHAVIOR_SLAB_CHARGED) {
             int more = c.more_hits + (c.hit_times > 1 ? 1 : 0);
-            if (more > 0) hits = (carried == BEHAVIOR_SLAB_CHARGED ? 6 : 2) + more;     // hitAmount + 1 for each, all on one target
+            if (more > 0) {
+                hits += more;
+                per_target = hits;
+            }
         }
-        float total = (each + power / 4.0f * bonus) * hits;
-        int quarters = (int)lroundf(total * 4.0f);
-        alt_row = BEHAVIOR_COIN_ALT + (quarters < 4 ? 4 : quarters > COIN_ALT_MAX ? COIN_ALT_MAX : quarters);
+        float one = each + power / 4.0f * bonus;
+        int quarters = (int)lroundf(one * 4.0f);
+        hit_row = BEHAVIOR_COIN_ALT + (quarters < 4 ? 4 : quarters > COIN_ALT_MAX ? COIN_ALT_MAX : quarters);
+        if (rail) gap = 0.025f;
         if (carried != BEHAVIOR_PIERCER) shots = 1;
-        logf("  the beam goes on from the coin: %.2f a hit x %d hits = %.2f revolver shots' worth%s\n", each + power / 4.0f * bonus, hits, total,
-             shots > 1 ? ", split in two" : "");
+        logf("  the beam goes on from the coin: %.2f a hit, %d hits (%d on one enemy)%s\n", one, hits, per_target, shots > 1 ? ", split in two" : "");
     }
     if (!n) {
         // Coin.ReflectRevolver with nothing to aim at: the shot leaves in a random direction
@@ -2541,7 +2695,7 @@ static void reflect_coin(Coin &c, double t) {
             len = sqrtf(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
         } while (len < 0.1f || len > 1.0f);
         for (float &v : d) v /= len;
-        shoot(BEHAVIOR_COIN + power - 2, c.p, d);
+        shoot(hit_row ? hit_row : BEHAVIOR_COIN + power - 2, c.p, d);
         {
             float far_end[3] = {c.p[0] + d[0] * 60.0f, c.p[1] + d[1] * 60.0f, c.p[2] + d[2] * 60.0f};
             RayHit h;
@@ -2560,20 +2714,28 @@ static void reflect_coin(Coin &c, double t) {
         // block by where the attacker stands, so a coin tossed past a shield bearer still had its shot
         // blocked from the back; such a shot is fired with a row that ignores guards (9000180 on).
         bool from_behind = dir[0] * -sinf(tg.yaw) + dir[2] * -cosf(tg.yaw) > 0.3f;
-        bool ok = shoot(alt_row ? alt_row : (from_behind ? BEHAVIOR_COIN_BACK : BEHAVIOR_COIN) + power - 2, c.p, dir);
+        bool ok = true;
+        if (hit_row && hits > 1) {
+            start_beam_chain(c.p, tg, hit_row, coin_beam(c), hits, per_target, gap, power, t);
+        } else {
+            ok = shoot(hit_row ? hit_row : (from_behind ? BEHAVIOR_COIN_BACK : BEHAVIOR_COIN) + power - 2, c.p, dir);
+            add_beam(c.p, tg.p, coin_beam(c));
+            if (ok) InterlockedIncrement(&g_coin_shots);
+        }
         if (from_behind) logf("  (from behind: the target faces %.2f rad)\n", tg.yaw);
         if (c.carry == BEHAVIOR_RAIL_MALICIOUS) explode(tg.p, EXPLODE_MALICIOUS);   // the Malicious beam goes off where the coin sends it
-        add_beam(c.p, tg.p, coin_beam(c));
-        if (ok) InterlockedIncrement(&g_coin_shots);
         logf("  ricochet from (%.1f %.1f %.1f) to chr %p team %d hp %d at (%.1f %.1f %.1f), %.1f m: %s\n", c.p[0], c.p[1], c.p[2],
              (void *)tg.chr, tg.team, tg.hp, tg.p[0], tg.p[1], tg.p[2], tg.dist, ok ? "accepted" : "REFUSED");
         g_watch_chr = tg.chr;
         g_watch_hp = tg.hp;
         g_watch_at = t + 1.0;
         if (ok && i == 0) {
-            // Coin.RicoshotPointsCheck: 50, plus 15 per coin when more than one was chained
+            // Coin.RicoshotPointsCheck: 50, plus 15 per coin when more than one was chained, and 50 more with
+            // "ULTRA" in orange before it for a beam marked ultraRicocheter (every one a coin sends on but the
+            // Slab's plain shot)
             int coins = c.power - 1;
-            style_add(50 + (coins > 1 ? coins * 15 : 0), "RICOSHOT", STYLE_CYAN, coins);
+            bool ultra = carried && carried != BEHAVIOR_SLAB;
+            style_add(50 + (ultra ? 50 : 0) + (coins > 1 ? coins * 15 : 0), ultra ? "ULTRARICOSHOT" : "RICOSHOT", ultra ? STYLE_ORANGE : STYLE_CYAN, coins);
             // Coin.ReflectRevolver: a ricochet that breaks an enemy's attack is an INTERRUPTION, 100 points
             // and the parry's flash. ULTRAKILL has that for attacks with a breakable weak point; here it
             // is any enemy caught in the middle of an attack animation.
@@ -2587,6 +2749,7 @@ static void reflect_coin(Coin &c, double t) {
     }
 }
 static void update_coins(double t, float dt) {
+    update_beam_chains(t);
     if (g_watch_chr && t >= g_watch_at) {
         int hp = -1;
         safe_read(g_watch_chr + OFF_CHR_HP, &hp, 4);
@@ -2837,9 +3000,11 @@ static bool blast_player(const float *origin, float max_size_u, int damage, floa
         g_launch_pending = true;
     }
     int hp = 0, max_hp = 0, lost = 0;
-    if (damage > 0 && !g_no_cooldown && chr && safe_read(chr + 0x3E8, &hp, 4) && safe_read(chr + 0x3EC, &max_hp, 4) && max_hp > 0 && hp > 1) {
+    // (Until v0.77 this stopped at 1 health: V1's own explosions could not kill. In ULTRAKILL they do. At 0
+    // the thread that holds the game's no-death flag lets it go, and the game kills.)
+    if (damage > 0 && !g_no_cooldown && chr && safe_read(chr + 0x3E8, &hp, 4) && safe_read(chr + 0x3EC, &max_hp, 4) && max_hp > 0 && hp > 0) {
         lost = (int)(damage / 100.0f * (float)max_hp + 0.5f);
-        if (lost > hp - 1) lost = hp - 1;
+        if (lost > hp) lost = hp;
         hp -= lost;
         safe_write(chr + 0x3E8, &hp, 4);
     }
@@ -3047,6 +3212,11 @@ static void throw_core(float force) {
         return;
     }
 }
+// (the Attractor's magnets, further down: a shot along the view breaks the one it passes through)
+struct MagnetObj;
+static MagnetObj *magnet_on_line();
+static void break_magnet(MagnetObj &m, double t, const char *why);
+static float g_magnet_hit[3];                    // where on its harpoon magnet_on_line found the line of fire
 // The core the line of fire from the eye passes closest to, if any is within reach.
 static Core *core_on_line() {
     float right[3], up[3], fwd[3], eye[3];
@@ -3621,6 +3791,9 @@ static void fire_railcannon(double t) {
         explode(k->p, malicious ? EXPLODE_ULTRA : EXPLODE_SUPER);
         k->alive = false;
         logf("railcannon: %s, into a core\n", malicious ? "Malicious" : "Electric");
+    } else if (MagnetObj *mg = magnet_on_line()) {
+        shot_beam(g_magnet_hit, beam);
+        break_magnet(*mg, t, "shot");
     } else if (malicious) {
         float end[3], normal[3], at[3];
         shot_end(true, end, normal);
@@ -3952,9 +4125,18 @@ static void update_whiplash(bool armed, double t, float dt) {
 //   Attractor: ten saws, coming back at one in two seconds while fire is up. A saw is 4 u across, does 0.75
 //              and has 3.9 hits. The alt fire throws a magnet (three; they come back as fast as there is
 //              room for them): it flies at 100 u/s, falls, sticks where it lands or in the enemy it meets,
-//              and lasts 12 s. Any saw within 25 u of a magnet is steered every physics step to 85 degrees
-//              off the line to it, to one side: it circles the magnet, closing in. A bounce while it does
-//              costs a tenth of a hit and turns it to circle the other way.
+//              and lasts 12 s from then (5 s if it never lands). Any saw within 25 u of a magnet is steered
+//              every physics step (8 ms) to 85 degrees off the line to it, on the side that keeps it going
+//              the way it was: it circles the magnet. The step is what sets the circle: a saw covers 1.6 u in
+//              one, and 1.6 / (2 cos 85) = 9.2 u is the distance at which a step at that angle neither gains
+//              nor loses any. (Until v0.76 a frame was cut into equal steps of whatever length fitted, so the
+//              circle was anything from 4.6 u to 9.2 u and changed with the frame rate, and the side was picked
+//              at random when the saw was fired, so half of them turned right round on meeting a magnet.)
+//              A bounce while it circles costs a tenth of a hit. A magnet holds 15 of weight (an Attractor saw
+//              weighs 1, an Overheat one 0.5, the heated one 3; as much again for every other magnet within
+//              50 u) and breaks under more. However it goes (its time, the weight, a shot: the harpoon is a
+//              'Breakable' for the revolvers and the railcannon unless it sits in a living enemy), its saws
+//              are all sent at the spot it was in, at the speed they had (Magnet.Launch).
 //   Overheat:  every shot heats the gun by an eighth. Up to half heat it fires at the base rate, beyond that
 //              slower (24 + (heat - 0.5) x 65) and wider (up to 45 degrees of spread past a quarter heat);
 //              a saw is 3 u across, does 0.6 and has between 3 hits (cold) and 1 (hot). The alt fire, with any
@@ -3962,37 +4144,72 @@ static void update_whiplash(bool armed, double t, float dt) {
 //              walls along their own normal, and it stops in an enemy to cut it heat x 3 times at 0.15 s
 //              apart before going on. The heat sink is then out (the gun fires slow and wild) and comes
 //              back in 8 s of not firing.
-// Not in: punching saws, the nailgun itself, the third variation, the displays on the gun (the count and
-// the heat are written under the weapon's picture instead).
+// The gun (v0.76): the blade in its jaws turns at 250 + heat x 2250 degrees a second while fire is held and
+// runs down at 1000 a second; on the Overheat a second blade round it glows orange as strongly as the gun
+// is hot; the display on its back shows the saws and the three magnets, or the heat and the heat sink.
+// Sounds (v0.77): the heated saw's looping noise, the blade's whirr on the gun, a saw breaking, the harpoon
+// landing, the magnet's beep.
+// Not in: punching saws, the nailgun itself, the third variation.
 enum { SAW_ATTRACTOR = 0, SAW_OVERHEAT = 1, SAW_HEATED = 2 };
 static volatile int g_saw_var = SAW_ATTRACTOR;
 static float g_saw_ammo = 10.0f, g_magnet_charge = 3.0f, g_saw_heat = 0.0f, g_saw_sinks = 1.0f, g_saw_cooldown = 0.0f;
 static double g_saw_ready_at = 0;                // the Equip clip's CanShoot event
 static bool g_saw_shot_ok = false, g_prev_saw_rmb = false;
+// The blade in the gun's jaws (Nailgun.Update's spinSpeed, in degrees a second, and the angle it adds up to),
+// and the weight of the Animator's second layer, which UpdateAnimationWeight sets at every shot.
+static float g_saw_spin = 0, g_saw_blade = 0, g_saw_muddle = 0;
 static volatile LONG g_saw_shots = 0, g_saw_hits = 0, g_saw_bounces = 0;
 static const int BEHAVIOR_SAW = 9000191;         // + SAW_ATTRACTOR, SAW_OVERHEAT, SAW_HEATED
 static const float SAW_SPEED = 200.0f * UK_UNIT, SAW_FIRE_RATE = 24.0f, MAGNET_SPEED = 100.0f * UK_UNIT, MAGNET_RANGE = 25.0f * UK_UNIT;
 static const double MAGNET_LIFE = 12.0, SAW_LIFE = 15.0;
-enum { MAX_SAWS = 32, SAW_TRAIL = 6, MAX_MAGNETS = 3 };
+static const float MAGNET_MAX_WEIGHT = 15.0f;    // the Harpoon prefab's Magnet.maxWeight (the script's own default is 10)
+static const float SAW_MASS[3] = {1.0f, 0.5f, 3.0f};     // the three Nail prefabs' rigid bodies
+// The harpoon, from its prefab: the magnet ('Sphere') sits 1.35 u up it from its tail; the box that stops
+// it at a wall reaches 4 u ahead of the tail; the box a shot breaks ('Cube') runs from 0.2 u behind the
+// tail to 4.3 u ahead and is 0.6 u across.
+static const float HARPOON_MAGNET = 1.35f * UK_UNIT, HARPOON_LENGTH = 4.0f * UK_UNIT;
+enum { MAX_SAWS = 32, SAW_TRAIL = 64, MAX_MAGNETS = 3, MAGNET_TRAIL = 12 };
 struct Saw {
-    bool alive, stopped, hidden, caught;
-    int kind, multi, multi_left, turn;           // turn: which way round a magnet it goes (+1, -1)
+    bool alive, stopped, hidden;
+    int kind, multi, multi_left, magnet;         // magnet: the one it is going round (-1: none)
     float p[3], v[3], kept_v[3], hits, same_cd, multi_cd;
     uintptr_t last_chr;
     double born, remove_at;
-    float trail[SAW_TRAIL][3];
-    int trail_n;
-    double trail_at;
+    float trail[SAW_TRAIL][3];                   // where it has been, newest first, and when
+    double trail_t[SAW_TRAIL];
+    int trail_n, trail_steps;
 };
-struct MagnetObj { bool alive, stuck; float p[3], v[3], offset[3]; uintptr_t chr; double die_at; };
+struct MagnetObj {
+    bool alive, stuck;
+    float o[3], p[3], v[3], fwd[3];              // o: the harpoon's tail; p: the magnet on it, which the saws go round
+    uintptr_t chr;
+    double born, die_at, beep_at, beeped;        // beeped: when its light last flashed
+    float load;                                  // 0..1 of the weight it can hold
+    float trail[MAGNET_TRAIL][3];
+    double trail_t[MAGNET_TRAIL];
+    int trail_n, trail_steps;
+};
 static Saw g_saws[MAX_SAWS];
 static MagnetObj g_magnets[MAX_MAGNETS];
+static float g_saw_owed = 0;                     // time the saws have not been stepped through yet (less than one step)
 
+static void trail_push(float (*trail)[3], double *when, int &n, int cap, const float *p, double t) {
+    int keep = n < cap ? n : cap - 1;
+    if (keep > 0) {
+        memmove(trail[1], trail[0], sizeof(float) * 3 * keep);
+        memmove(when + 1, when, sizeof(double) * keep);
+    }
+    memcpy(trail[0], p, sizeof(float) * 3);
+    when[0] = t;
+    if (n < cap) n++;
+}
 static void saw_break(Saw &s) {
     const float up[3] = {0, 1, 0};
     s.alive = false;
     if (!s.hidden) fx_pellet_hit(s.p, up);
-    sound_play("saw_bounce", 0.3f, frand(0.6f, 0.7f));
+    // 'BreakParticleMetalSaw': the saw's own breaking sound (0.45) over the ricochet's (0.25)
+    if (!sound_play("saw_break", 0.45f, 1.0f)) sound_play("saw_bounce", 0.3f, frand(0.6f, 0.7f));
+    else sound_play("saw_bounce", 0.25f, 1.0f);
 }
 static void saw_reflect(Saw &s, const RayHit &h) {
     float speed = sqrtf(s.v[0] * s.v[0] + s.v[1] * s.v[1] + s.v[2] * s.v[2]);
@@ -4006,7 +4223,7 @@ static void saw_reflect(Saw &s, const RayHit &h) {
 }
 // Nail.ForceCheckSawbladeRicochet, and the same loop after a bounce: up to three walls within 5 u ahead are
 // taken at once (a saw fired into a corner comes straight back out of it)
-static void saw_corner_check(Saw &s, float cost) {
+static void saw_corner_check(Saw &s, float cost, double t) {
     for (int k = 0; k < 3; k++) {
         float speed = sqrtf(s.v[0] * s.v[0] + s.v[1] * s.v[1] + s.v[2] * s.v[2]);
         if (speed < 1e-3f) return;
@@ -4014,6 +4231,7 @@ static void saw_corner_check(Saw &s, float cost) {
         RayHit h;
         if (!ray_cast(s.p, ahead, h) || !h.hit) return;
         saw_reflect(s, h);
+        trail_push(s.trail, s.trail_t, s.trail_n, SAW_TRAIL, s.p, t);
         s.hits -= cost;
         if (!s.hidden) fx_pellet_hit(h.point, h.normal);
     }
@@ -4037,24 +4255,28 @@ static bool chr_alive(uintptr_t chr) {
 static void spawn_saw(int kind, const float *dir, float hits, int multi) {
     float eye[3];
     if (!eye_pos(eye)) return;
+    // a free place, or the oldest saw's (until v0.76 a shot with 32 saws out was simply lost)
+    Saw *slot = nullptr;
     for (Saw &s : g_saws) {
-        if (s.alive) continue;
-        s = Saw{};
-        s.alive = true;
-        s.kind = kind;
-        s.hits = hits;
-        s.multi = multi;
-        s.turn = rand() % 2 ? 1 : -1;
-        s.born = now_s();
-        s.remove_at = s.born + SAW_LIFE;
-        for (int i = 0; i < 3; i++) {
-            s.p[i] = eye[i] + dir[i] * 1.0f * UK_UNIT;
-            s.v[i] = dir[i] * SAW_SPEED;
-        }
-        saw_corner_check(s, 0.125f);
-        InterlockedIncrement(&g_saw_shots);
-        return;
+        if (!s.alive) { slot = &s; break; }
+        if (!slot || s.born < slot->born) slot = &s;
     }
+    Saw &s = *slot;
+    s = Saw{};
+    s.alive = true;
+    s.kind = kind;
+    s.hits = hits;
+    s.multi = multi;
+    s.magnet = -1;
+    s.born = now_s();
+    s.remove_at = s.born + SAW_LIFE;
+    for (int i = 0; i < 3; i++) {
+        s.p[i] = eye[i] + dir[i] * 1.0f * UK_UNIT;
+        s.v[i] = dir[i] * SAW_SPEED;
+    }
+    trail_push(s.trail, s.trail_t, s.trail_n, SAW_TRAIL, s.p, s.born);
+    saw_corner_check(s, 0.125f, s.born);
+    InterlockedIncrement(&g_saw_shots);
 }
 static void spawn_magnet(const float *dir) {
     float eye[3];
@@ -4063,11 +4285,15 @@ static void spawn_magnet(const float *dir) {
         if (m.alive) continue;
         m = MagnetObj{};
         m.alive = true;
-        m.die_at = now_s() + MAGNET_LIFE;
+        m.born = now_s();
+        m.die_at = m.born + 5.0;                 // Harpoon.DestroyIfNotHit; its 12 s start when it lands
         for (int i = 0; i < 3; i++) {
-            m.p[i] = eye[i] + dir[i] * 1.0f * UK_UNIT;
+            m.o[i] = eye[i] + dir[i] * 1.0f * UK_UNIT;
+            m.fwd[i] = dir[i];
+            m.p[i] = m.o[i] + dir[i] * HARPOON_MAGNET;
             m.v[i] = dir[i] * MAGNET_SPEED;
         }
+        trail_push(m.trail, m.trail_t, m.trail_n, MAGNET_TRAIL, m.o, m.born);
         return;
     }
 }
@@ -4076,159 +4302,304 @@ static int magnets_out() {
     for (const MagnetObj &m : g_magnets) n += m.alive ? 1 : 0;
     return n;
 }
+// Magnet.OnDestroy -> Launch: every saw the magnet had goes for the spot it was in, at the speed it has.
+static void break_magnet(MagnetObj &m, double t, const char *why) {
+    if (!m.alive) return;
+    m.alive = false;
+    int sent = 0;
+    for (Saw &s : g_saws) {
+        if (!s.alive || s.stopped) continue;
+        float to[3] = {m.p[0] - s.p[0], m.p[1] - s.p[1], m.p[2] - s.p[2]}, len = sqrtf(to[0] * to[0] + to[1] * to[1] + to[2] * to[2]);
+        if (len > MAGNET_RANGE || len < 1e-3f) continue;
+        float speed = sqrtf(s.v[0] * s.v[0] + s.v[1] * s.v[1] + s.v[2] * s.v[2]);
+        for (int i = 0; i < 3; i++) s.v[i] = to[i] / len * speed;
+        trail_push(s.trail, s.trail_t, s.trail_n, SAW_TRAIL, s.p, t);
+        s.trail_steps = 0;
+        s.magnet = -1;
+        s.remove_at = t + SAW_LIFE;              // Nail.MagnetRelease (another magnet in reach takes it again at the next step)
+        sent++;
+    }
+    const float up[3] = {0, 1, 0};
+    if (in_sight(m.p)) {
+        fx_pellet_hit(m.p, up);
+        fx_pellet_hit(m.o, up);
+    }
+    sound_play("saw_bounce", 0.5f, 0.6f);
+    logf("sawblade launcher: magnet gone (%s), %d saws sent at it\n", why, sent);
+}
+// The magnet whose harpoon the line of fire from the eye passes through, nearest first. One that sits in a
+// living enemy has no 'Breakable' left (Harpoon.OnTriggerEnter destroys it) and cannot be shot off.
+static MagnetObj *magnet_on_line() {
+    float right[3], up[3], fwd[3], eye[3];
+    if (!eye_pos(eye)) return nullptr;
+    view_axes(right, up, fwd);
+    MagnetObj *best = nullptr;
+    float best_along = COIN_RANGE;
+    const float reach = 0.3f * UK_UNIT + 0.1f;   // half the box, and a little for the aim (ours)
+    for (MagnetObj &m : g_magnets) {
+        if (!m.alive || (m.stuck && m.chr && chr_alive(m.chr))) continue;
+        // where the line of fire and the harpoon's axis come closest
+        float a[3], e[3], w[3];
+        for (int i = 0; i < 3; i++) {
+            a[i] = m.o[i] - m.fwd[i] * 0.2f * UK_UNIT;
+            e[i] = m.fwd[i] * 4.5f * UK_UNIT;
+            w[i] = eye[i] - a[i];
+        }
+        float B = fwd[0] * e[0] + fwd[1] * e[1] + fwd[2] * e[2], C = e[0] * e[0] + e[1] * e[1] + e[2] * e[2];
+        float D = fwd[0] * w[0] + fwd[1] * w[1] + fwd[2] * w[2], E = e[0] * w[0] + e[1] * w[1] + e[2] * w[2], den = C - B * B;
+        float u = den > 1e-6f ? (E - B * D) / den : 0.0f;
+        u = u < 0 ? 0 : u > 1 ? 1 : u;
+        float along = u * B - D;
+        if (along <= 0 || along >= best_along) continue;
+        float off2 = 0, at[3];
+        for (int i = 0; i < 3; i++) {
+            at[i] = a[i] + e[i] * u;
+            float d = eye[i] + fwd[i] * along - at[i];
+            off2 += d * d;
+        }
+        if (off2 > reach * reach) continue;
+        if (g_center_dist > 0 && along > g_center_dist + 0.5f) continue;     // behind a wall
+        best = &m;
+        best_along = along;
+        memcpy(g_magnet_hit, at, sizeof(at));
+    }
+    return best;
+}
+// One 8 ms physics step of a saw (Nail.FixedUpdate, and what Nail.Update counts down)
+static void saw_step(Saw &s, double t, const Target *near_by, int n) {
+    const float h_dt = V1_STEP;
+    if (s.same_cd > 0 && !s.stopped) {
+        s.same_cd -= h_dt;
+        if (s.same_cd <= 0) s.last_chr = 0;
+    }
+    if (s.stopped) {
+        // Nail.Update, multiHitAmount > 1: in the enemy, a cut every 0.15 s
+        if (s.multi_cd > 0) { s.multi_cd -= h_dt; return; }
+        bool live = chr_alive(s.last_chr);
+        if (live && s.multi_left > 0) {
+            Target tg{};
+            if (whip_target_point(s.last_chr, tg.p)) {
+                s.multi_left--;
+                s.hits -= 1.0f;
+                saw_cut(s, tg);
+            } else {
+                live = false;
+            }
+        }
+        if (!live || s.multi_left <= 0) {
+            s.stopped = false;
+            memcpy(s.v, s.kept_v, sizeof(s.v));
+            if (s.hits <= 0) saw_break(s);
+            return;
+        }
+        s.multi_cd = 0.15f;
+        return;
+    }
+    // The nearest magnet in reach steers it (Nail.GetTargetMagnet, then FixedUpdate): its velocity becomes
+    // the direction to the magnet turned 85 degrees about the upright axis, towards the side the saw is
+    // already passing the magnet on, at the speed it had.
+    int mi = -1;
+    float best = MAGNET_RANGE;
+    for (int k = 0; k < MAX_MAGNETS; k++) {
+        if (!g_magnets[k].alive) continue;
+        float d = dist3(g_magnets[k].p, s.p);
+        if (d < best) { best = d; mi = k; }
+    }
+    if (mi >= 0) {
+        const MagnetObj &mag = g_magnets[mi];
+        s.remove_at = t + SAW_LIFE;              // (Nail.MagnetCaught: its time to live stops; MagnetRelease starts it again)
+        float to[3] = {mag.p[0] - s.p[0], mag.p[1] - s.p[1], mag.p[2] - s.p[2]}, len = sqrtf(to[0] * to[0] + to[1] * to[1] + to[2] * to[2]);
+        if (len > 1e-3f) {
+            // "new Vector3(velocity.z, velocity.y, -velocity.x)": the velocity turned a quarter about the upright axis
+            float side = to[0] * s.v[2] + to[1] * s.v[1] - to[2] * s.v[0];
+            float a = 85.0f * 3.14159265f / 180.0f * (side > 0 ? -1.0f : 1.0f), ca = cosf(a), sa = sinf(a);
+            float speed = sqrtf(s.v[0] * s.v[0] + s.v[1] * s.v[1] + s.v[2] * s.v[2]);
+            for (float &x : to) x /= len;
+            // Quaternion.Euler(0, 85 x side, 0) * the direction to the magnet
+            s.v[0] = (to[0] * ca + to[2] * sa) * speed;
+            s.v[1] = to[1] * speed;
+            s.v[2] = (-to[0] * sa + to[2] * ca) * speed;
+        }
+    }
+    s.magnet = mi;
+    // enemies within half a unit of it (a body: 0.45 m about its aim point, 1.2 m under to 0.7 m over)
+    for (int k = 0; k < n && s.alive && !s.stopped; k++) {
+        const Target &tg = near_by[k];
+        float dx = tg.p[0] - s.p[0], dz = tg.p[2] - s.p[2], dy = s.p[1] - tg.p[1], reach = 0.45f + 0.5f * UK_UNIT;
+        if (dx * dx + dz * dz > reach * reach || dy < -1.2f - 0.25f || dy > 0.7f + 0.25f) continue;
+        if (s.same_cd > 0 && s.last_chr == tg.chr) continue;
+        if (s.multi > 1) {                       // Nail.TouchEnemy: the heated saw stops in it
+            s.stopped = true;
+            s.multi_left = s.multi;
+            s.multi_cd = 0;
+            s.last_chr = tg.chr;
+            memcpy(s.kept_v, s.v, sizeof(s.v));
+            s.same_cd = 0.15f;
+        } else {                                 // Nail.HitEnemy
+            s.same_cd = 0.15f;
+            s.last_chr = tg.chr;
+            s.hits -= 1.0f;
+            saw_cut(s, tg);
+            if (s.hits < 1.0f) saw_break(s);
+        }
+    }
+    if (!s.alive || s.stopped) return;
+    float next[3] = {s.p[0] + s.v[0] * h_dt, s.p[1] + s.v[1] * h_dt, s.p[2] + s.v[2] * h_dt};
+    RayHit h;
+    if (ray_cast(s.p, next, h) && h.hit) {
+        if (s.hits <= 0) { saw_break(s); return; }
+        saw_reflect(s, h);
+        trail_push(s.trail, s.trail_t, s.trail_n, SAW_TRAIL, s.p, t);
+        s.trail_steps = 0;
+        InterlockedIncrement(&g_saw_bounces);
+        if (!s.hidden) fx_pellet_hit(h.point, h.normal);
+        sound_play("saw_bounce", 0.25f, frand(0.9f, 1.1f));
+        s.same_cd = 0;
+        s.last_chr = 0;
+        s.hits -= mi >= 0 ? 0.1f : 0.25f;
+        saw_corner_check(s, 0.0f, t);
+    } else {
+        memcpy(s.p, next, sizeof(next));
+        // A point of its trail at every step while a magnet turns it (8 ms: ten degrees of the circle), so the
+        // trail bends smoothly; flying straight, one in six will do. (Unity's own trail takes a point every 0.1 u.)
+        if (++s.trail_steps >= (mi >= 0 ? 1 : 6)) {
+            s.trail_steps = 0;
+            trail_push(s.trail, s.trail_t, s.trail_n, SAW_TRAIL, s.p, t);
+        }
+    }
+}
 static void update_saws(double t, float dt) {
-    // the magnets: in flight until they land in something, then for what is left of their 12 s
+    // the magnets: in flight until they land in something, then for their 12 s
     for (MagnetObj &m : g_magnets) {
         if (!m.alive) continue;
+        if (g_no_cooldown && m.stuck) {          // TimeBomb.freezeOnNoCooldown
+            m.die_at += dt;
+            m.beep_at += dt;
+        }
         if (t >= m.die_at) {
-            const float up[3] = {0, 1, 0};
-            fx_pellet_hit(m.p, up);
-            m.alive = false;
+            break_magnet(m, t, m.stuck ? "its time was up" : "it never landed");
             continue;
         }
         if (m.stuck) {
             if (m.chr) {
                 float pt[3];
-                if (whip_target_point(m.chr, pt)) memcpy(m.p, pt, sizeof(m.p));
-                else m.chr = 0;                  // its enemy is dead: it stays where it was
+                if (whip_target_point(m.chr, pt)) {
+                    for (int i = 0; i < 3; i++) {
+                        m.p[i] = pt[i];
+                        m.o[i] = pt[i] - m.fwd[i] * HARPOON_MAGNET;
+                    }
+                } else {
+                    m.chr = 0;                   // its enemy is dead: it stays where it was
+                }
             }
+        } else {
+            m.v[1] -= 40.0f * UK_UNIT * dt;
+            float speed = sqrtf(m.v[0] * m.v[0] + m.v[1] * m.v[1] + m.v[2] * m.v[2]);
+            if (speed > 1.0f * UK_UNIT)          // Harpoon.Update: it points the way it flies
+                for (int i = 0; i < 3; i++) m.fwd[i] = m.v[i] / speed;
+            float next[3], tip[3];
+            for (int i = 0; i < 3; i++) {
+                next[i] = m.o[i] + m.v[i] * dt;
+                tip[i] = next[i] + m.fwd[i] * HARPOON_LENGTH;
+            }
+            Target near_by[4];
+            int n = find_targets(m.p, near_by, 4, 3.0f);
+            bool landed = false;
+            for (int k = 0; k < n && !landed; k++) {
+                float dx = near_by[k].p[0] - m.p[0], dz = near_by[k].p[2] - m.p[2], dy = m.p[1] - near_by[k].p[1];
+                if (dx * dx + dz * dz > 0.6f * 0.6f || dy < -1.3f || dy > 0.8f) continue;
+                landed = true;
+                m.chr = near_by[k].chr;
+                sound_play("harpoon_pierce", 0.5f, 1.0f);
+                for (int i = 0; i < 3; i++) {    // "magnet.transform.position = other.bounds.center"
+                    m.p[i] = near_by[k].p[i];
+                    m.o[i] = m.p[i] - m.fwd[i] * HARPOON_MAGNET;
+                }
+                logf("sawblade launcher: magnet stuck in chr %p\n", (void *)m.chr);
+            }
+            RayHit h;
+            if (!landed && ray_cast(m.o, tip, h) && h.hit) {
+                // its point is in the wall, the rest of it stands out
+                for (int i = 0; i < 3; i++) {
+                    m.o[i] = h.point[i] - m.fwd[i] * (HARPOON_LENGTH - 0.4f * UK_UNIT);
+                    m.p[i] = m.o[i] + m.fwd[i] * HARPOON_MAGNET;
+                }
+                landed = true;
+                if (!sound_play("harpoon_stop", 0.5f, 1.0f)) sound_play("saw_bounce", 0.4f, 0.8f);
+            }
+            if (landed) {
+                m.stuck = true;
+                m.die_at = t + MAGNET_LIFE;      // TimeBomb.StartCountdown
+                m.beep_at = t;
+                trail_push(m.trail, m.trail_t, m.trail_n, MAGNET_TRAIL, m.o, t);
+            } else {
+                for (int i = 0; i < 3; i++) {
+                    m.o[i] = next[i];
+                    m.p[i] = m.o[i] + m.fwd[i] * HARPOON_MAGNET;
+                }
+                if (++m.trail_steps >= 3) {
+                    m.trail_steps = 0;
+                    trail_push(m.trail, m.trail_t, m.trail_n, MAGNET_TRAIL, m.o, t);
+                }
+            }
+        }
+        // TimeBomb: its light flashes as it lands and then each time a sixth of what is left has gone by
+        if (m.stuck && t >= m.beep_at) {
+            m.beeped = t;
+            m.beep_at = t + (m.die_at - t) / 6.0;
+            // the 'Beeper' (0.2), as high as the magnet is loaded: Magnet.Update's "beeperPitch = load / 2 + 0.25"
+            float eye[3], away = eye_pos(eye) ? dist3(eye, m.p) / UK_UNIT : 0.0f, gain = away < 1.0f ? 1.0f : away > 80.0f ? 0.0f : 1.0f - (away - 1.0f) / 79.0f;
+            if (gain > 0.01f) sound_play("magnet_beep", 0.2f * gain, m.load / 2.0f + 0.25f);
+        }
+        // Magnet.Update: what it holds against what it can
+        float load = 0;
+        int linked = 0;
+        for (const Saw &s : g_saws)
+            if (s.alive && dist3(s.p, m.p) < MAGNET_RANGE) load += SAW_MASS[s.kind];
+        for (const MagnetObj &o : g_magnets)
+            if (o.alive && &o != &m && dist3(o.p, m.p) < MAGNET_RANGE * 2.0f) linked++;
+        float limit = MAGNET_MAX_WEIGHT * (linked + 1);
+        if (load > limit) {
+            break_magnet(m, t, "more saws than it can hold");
             continue;
         }
-        m.v[1] -= 40.0f * UK_UNIT * dt;
-        float next[3] = {m.p[0] + m.v[0] * dt, m.p[1] + m.v[1] * dt, m.p[2] + m.v[2] * dt};
-        Target near_by[4];
-        int n = find_targets(m.p, near_by, 4, 3.0f);
-        bool landed = false;
-        for (int k = 0; k < n && !landed; k++) {
-            float dx = near_by[k].p[0] - m.p[0], dz = near_by[k].p[2] - m.p[2], dy = m.p[1] - near_by[k].p[1];
-            if (dx * dx + dz * dz > 0.6f * 0.6f || dy < -1.3f || dy > 0.8f) continue;
-            m.stuck = landed = true;
-            m.chr = near_by[k].chr;
-            memcpy(m.p, near_by[k].p, sizeof(m.p));
-            logf("sawblade launcher: magnet stuck in chr %p\n", (void *)m.chr);
-        }
-        if (landed) continue;
-        RayHit h;
-        if (ray_cast(m.p, next, h) && h.hit) {
-            for (int i = 0; i < 3; i++) m.p[i] = h.point[i] + h.normal[i] * 0.05f;
-            m.stuck = true;
-            sound_play("saw_bounce", 0.4f, 0.8f);
-            continue;
-        }
-        memcpy(m.p, next, sizeof(next));
+        m.load = load / limit;
     }
+    // The saws, in ULTRAKILL's own physics steps of 8 ms, as many as have come due: what is left over is
+    // kept for the next frame, and the saws are drawn that much further along their way.
+    g_saw_owed += dt;
+    int steps = (int)(g_saw_owed / V1_STEP);
+    if (steps > 12) {                            // a long frame: the saws fall behind sooner than run through walls of time
+        steps = 12;
+        g_saw_owed = steps * V1_STEP;
+    }
+    g_saw_owed -= steps * V1_STEP;
     for (Saw &s : g_saws) {
         if (!s.alive) continue;
         if (t >= s.remove_at || t - s.born > 60.0) { s.alive = false; continue; }
-        // ULTRAKILL moves them in physics steps of 8 ms; so here, however long the frame was
-        int steps = (int)ceilf(dt / V1_STEP);
-        if (steps < 1) steps = 1;
-        if (steps > 12) steps = 12;
-        float h_dt = dt / steps;
+        if (steps <= 0) continue;
         // (who is near it is looked up once a frame, not once a step: the list is a walk over every character)
         Target near_by[4];
-        int n = find_targets(s.p, near_by, 4, 2.5f + SAW_SPEED * dt);
-        for (int step = 0; step < steps && s.alive; step++) {
-            if (s.same_cd > 0 && !s.stopped) {
-                s.same_cd -= h_dt;
-                if (s.same_cd <= 0) s.last_chr = 0;
-            }
-            if (s.stopped) {
-                // Nail.Update, multiHitAmount > 1: in the enemy, a cut every 0.15 s
-                if (s.multi_cd > 0) { s.multi_cd -= h_dt; continue; }
-                bool live = chr_alive(s.last_chr);
-                if (live && s.multi_left > 0) {
-                    Target tg{};
-                    if (whip_target_point(s.last_chr, tg.p)) {
-                        s.multi_left--;
-                        s.hits -= 1.0f;
-                        saw_cut(s, tg);
-                    } else {
-                        live = false;
-                    }
-                }
-                if (!live || s.multi_left <= 0) {
-                    s.stopped = false;
-                    memcpy(s.v, s.kept_v, sizeof(s.v));
-                    if (s.hits <= 0) saw_break(s);
-                    continue;
-                }
-                s.multi_cd = 0.15f;
-                continue;
-            }
-            // the nearest magnet in range steers it
-            const MagnetObj *mag = nullptr;
-            float best = MAGNET_RANGE;
-            for (const MagnetObj &m : g_magnets) {
-                if (!m.alive) continue;
-                float d = dist3(m.p, s.p);
-                if (d < best) { best = d; mag = &m; }
-            }
-            if (mag) {
-                if (!s.caught) s.caught = true;
-                s.remove_at = t + SAW_LIFE;      // (Nail.MagnetCaught: its time to live stops; MagnetRelease starts it again)
-                float to[3] = {mag->p[0] - s.p[0], mag->p[1] - s.p[1], mag->p[2] - s.p[2]}, len = sqrtf(to[0] * to[0] + to[1] * to[1] + to[2] * to[2]);
-                if (len > 1e-3f) {
-                    float a = 85.0f * 3.14159265f / 180.0f * s.turn, ca = cosf(a), sa = sinf(a), speed = sqrtf(s.v[0] * s.v[0] + s.v[1] * s.v[1] + s.v[2] * s.v[2]);
-                    for (float &x : to) x /= len;
-                    // Quaternion.Euler(0, 85 x turn, 0) * the direction to the magnet
-                    s.v[0] = (to[0] * ca + to[2] * sa) * speed;
-                    s.v[1] = to[1] * speed;
-                    s.v[2] = (-to[0] * sa + to[2] * ca) * speed;
-                }
-            } else {
-                s.caught = false;
-            }
-            // enemies within half a unit of it (a body: 0.45 m about its aim point, 1.2 m under to 0.7 m over)
-            for (int k = 0; k < n && s.alive && !s.stopped; k++) {
-                const Target &tg = near_by[k];
-                float dx = tg.p[0] - s.p[0], dz = tg.p[2] - s.p[2], dy = s.p[1] - tg.p[1], reach = 0.45f + 0.5f * UK_UNIT;
-                if (dx * dx + dz * dz > reach * reach || dy < -1.2f - 0.25f || dy > 0.7f + 0.25f) continue;
-                if (s.same_cd > 0 && s.last_chr == tg.chr) continue;
-                if (s.multi > 1) {               // Nail.TouchEnemy: the heated saw stops in it
-                    s.stopped = true;
-                    s.multi_left = s.multi;
-                    s.multi_cd = 0;
-                    s.last_chr = tg.chr;
-                    memcpy(s.kept_v, s.v, sizeof(s.v));
-                    s.same_cd = 0.15f;
-                } else {                         // Nail.HitEnemy
-                    s.same_cd = 0.15f;
-                    s.last_chr = tg.chr;
-                    s.hits -= 1.0f;
-                    saw_cut(s, tg);
-                    if (s.hits < 1.0f) saw_break(s);
-                }
-            }
-            if (!s.alive || s.stopped) continue;
-            float next[3] = {s.p[0] + s.v[0] * h_dt, s.p[1] + s.v[1] * h_dt, s.p[2] + s.v[2] * h_dt};
-            RayHit h;
-            if (ray_cast(s.p, next, h) && h.hit) {
-                if (s.hits <= 0) { saw_break(s); continue; }
-                saw_reflect(s, h);
-                InterlockedIncrement(&g_saw_bounces);
-                if (!s.hidden) fx_pellet_hit(h.point, h.normal);
-                sound_play("saw_bounce", 0.25f, frand(0.9f, 1.1f));
-                s.same_cd = 0;
-                s.last_chr = 0;
-                if (s.caught) {
-                    s.turn = -s.turn;
-                    s.hits -= 0.1f;
-                } else {
-                    s.hits -= 0.25f;
-                }
-                saw_corner_check(s, 0.0f);
-            } else {
-                memcpy(s.p, next, sizeof(next));
-            }
-        }
-        if (!s.alive) continue;
-        s.hidden = !in_sight(s.p);
-        if (t >= s.trail_at) {
-            s.trail_at = t + 0.5 / SAW_TRAIL;
-            memmove(s.trail[1], s.trail[0], sizeof(float) * 3 * (SAW_TRAIL - 1));
-            memcpy(s.trail[0], s.p, sizeof(s.p));
-            if (s.trail_n < SAW_TRAIL) s.trail_n++;
+        int n = find_targets(s.p, near_by, 4, 2.5f + SAW_SPEED * steps * V1_STEP);
+        for (int step = 0; step < steps && s.alive; step++) saw_step(s, t - g_saw_owed - (steps - 1 - step) * V1_STEP, near_by, n);
+        if (s.alive) s.hidden = !in_sight(s.p);
+    }
+    // The heated saw's own noise ('chainsawThrown', the looping source on its hub): 0.25 while it flies and, by
+    // Nail.Update, louder and an octave up while it is stopped in an enemy, cutting. It is a sound in the
+    // world: full within 1 u of the ear, falling off in a straight line to nothing at 50 u.
+    static int voices[MAX_SAWS];
+    float eye[3];
+    bool have_eye = eye_pos(eye);
+    for (int i = 0; i < MAX_SAWS; i++) {
+        const Saw &s = g_saws[i];
+        if (s.alive && s.kind == SAW_HEATED) {
+            float away = have_eye ? dist3(eye, s.p) / UK_UNIT : 0.0f, gain = away < 1.0f ? 1.0f : away > 50.0f ? 0.0f : 1.0f - (away - 1.0f) / 49.0f;
+            float volume = (s.stopped ? 0.5f : 0.25f) * gain, pitch = s.stopped ? 2.0f : 1.0f;
+            if (!voices[i]) voices[i] = sound_play("saw_chainsaw", volume, pitch, true);
+            else sound_set(voices[i], volume, pitch);
+        } else if (voices[i]) {
+            sound_stop(voices[i]);
+            voices[i] = 0;
         }
     }
 }
@@ -4261,7 +4632,27 @@ static void update_saw_launcher(double t, float dt, bool lmb, bool rmb) {
     } else if (g_saw_heat > 0 && !firing) {
         g_saw_heat = move_towards(g_saw_heat, 0.0f, dt * (g_saw_cooldown <= 0 ? 0.2f : 0.03f));
     }
-    if (!held) return;
+    // "spinSpeed = 250 + heatUp * 2250" while fire is held and the gun is up, otherwise it runs down at 1000 a second
+    if (firing) g_saw_spin = 250.0f + g_saw_heat * 2250.0f;
+    else g_saw_spin = move_towards(g_saw_spin, 0.0f, dt * 1000.0f);
+    g_saw_blade = fmodf(g_saw_blade + g_saw_spin * dt, 360.0f);
+    {
+        // the blade's own whirr ('MachineGunSpin', the looping source on the gun's Blade): 0.2, at a pitch of
+        // spinSpeed / 1500 x 2, so it climbs to 3.3 while firing and runs down with the blade
+        static int spin_voice = 0;
+        if (held && g_saw_spin > 1.0f) {
+            float pitch = g_saw_spin / 1500.0f * 2.0f;
+            if (!spin_voice) spin_voice = sound_play("saw_spin", 0.2f, pitch, true);
+            else sound_set(spin_voice, 0.2f, pitch);
+        } else if (spin_voice) {
+            sound_stop(spin_voice);
+            spin_voice = 0;
+        }
+    }
+    if (!held) {
+        g_saw_muddle = 0;                        // (OnEnable: SetLayerWeight(1, 0))
+        return;
+    }
     float rate;
     if (!overheat) rate = SAW_FIRE_RATE + 3.5f - g_saw_heat * 3.5f;
     else if (g_saw_sinks >= 1.0f) rate = g_saw_heat < 0.5f ? SAW_FIRE_RATE : SAW_FIRE_RATE + (g_saw_heat - 0.5f) * 65.0f;
@@ -4273,6 +4664,7 @@ static void update_saw_launcher(double t, float dt, bool lmb, bool rmb) {
             if (g_magnet_charge >= 1.0f) {
                 g_magnet_charge -= 1.0f;
                 spawn_magnet(fwd);
+                g_saw_muddle = 0;
                 if (can_shoot) play_revolver("Shoot");
                 sound_play("saw_magnet", 0.6f, 1.0f);
                 logf("sawblade launcher: magnet thrown (%.0f left)\n", g_magnet_charge);
@@ -4284,8 +4676,10 @@ static void update_saw_launcher(double t, float dt, bool lmb, bool rmb) {
             int multi = (int)lroundf(g_saw_heat * 3.0f);
             g_saw_cooldown = rate;
             g_saw_shot_ok = true;
+            g_saw_muddle = 0;
             play_revolver("ShootSuper");
             sound_play("saw_shot_super", 0.7f, 1.0f, false, CH_GUN);
+            sound_play("saw_magnet", 0.25f, 1.0f);         // 'NailgunMuzzleFlash 4' has the harpoon's shot under the saw's own
             g_muzzle_flash = t;
             spawn_saw(SAW_HEATED, fwd, 20.9f, multi);
             logf("sawblade launcher: heated saw, heat %.2f (%d cuts an enemy)\n", g_saw_heat, multi);
@@ -4308,6 +4702,7 @@ static void update_saw_launcher(double t, float dt, bool lmb, bool rmb) {
     // Nailgun.Shoot
     g_saw_cooldown = rate;
     g_saw_shot_ok = true;
+    g_saw_muddle = !overheat ? 0.0f : g_saw_sinks < 1.0f ? 0.9f : g_saw_heat * 0.6f;
     float dir[3] = {fwd[0], fwd[1], fwd[2]}, hits = 3.9f;
     if (!overheat) {
         g_saw_ammo -= 1.0f;
@@ -4779,6 +5174,9 @@ static void try_instant_fire() {
                 shot_beam(k->p, BEAM_SHARP);
                 explode(k->p, EXPLODE_SUPER);
                 k->alive = false;
+            } else if (MagnetObj *mg = magnet_on_line()) {
+                shot_beam(g_magnet_hit, BEAM_SHARP);
+                break_magnet(*mg, t, "shot");
             } else {
                 float right[3], up[3], fwd[3], eye[3];
                 if (eye_pos(eye)) {
@@ -4810,6 +5208,9 @@ static void try_instant_fire() {
             shot_beam(k->p, BEAM_SUPER);
             explode(k->p, EXPLODE_SUPER);
             k->alive = false;
+        } else if (MagnetObj *mg = magnet_on_line()) {
+            shot_beam(g_magnet_hit, BEAM_SUPER);
+            break_magnet(*mg, t, "shot");
         } else if (shoot(slab ? BEHAVIOR_SLAB_CHARGED : BEHAVIOR_PIERCER)) {
             shot_beam(nullptr, BEAM_SUPER);
             InterlockedIncrement(&g_pierce_shots);
@@ -4931,6 +5332,8 @@ static void try_instant_fire() {
             play_revolver_shot();
             shot_beam(c->p, beam);
             hit_coin(*c, t);                     // the shot stops at the coin
+            c->charged = false;
+            c->carry = slab ? BEHAVIOR_SLAB : 0; // (the Slab's beam goes through things, so the coin sends that beam on: see reflect_coin)
             g_last_shot_time = t;
             if (slab && c->hit_times > 1) {
                 // RevolverBeam: the alternate revolver's shot on a coin in its split window reloads the
@@ -4950,6 +5353,13 @@ static void try_instant_fire() {
             shot_beam(k->p, beam);
             explode(k->p, EXPLODE_SUPER);
             k->alive = false;
+            g_last_shot_time = t;
+        } else if (MagnetObj *mg = magnet_on_line()) {
+            // the Attractor's harpoon breaks under a shot, and lets its saws go
+            sound_play(shot_sound, 0.55f, frand(0.9f, 1.1f), false, CH_GUN);
+            play_revolver_shot();
+            shot_beam(g_magnet_hit, beam);
+            break_magnet(*mg, t, "shot");
             g_last_shot_time = t;
         } else if (shoot(slab ? BEHAVIOR_SLAB : BEHAVIOR_REVOLVER)) {
             sound_play(shot_sound, 0.55f, frand(0.9f, 1.1f), false, CH_GUN);
@@ -5067,7 +5477,9 @@ static bool draw_full_hud(IDXGISwapChain *sc) {
             ok = hud_init(dev, pack);
             g_hud_status = ok ? 1 : 2;
             if (ok) {
-                HudState st;
+                // (kept off the stack: with the saws' trails it is about 140 KB; made afresh every frame)
+                static HudState st_store;
+                HudState &st = *new (&st_store) HudState();
                 st.health = g_hud_health;
                 st.stamina = g_boost;
                 st.pierce_charge = g_pierce_charge;
@@ -5081,10 +5493,22 @@ static bool draw_full_hud(IDXGISwapChain *sc) {
                 st.alt = slab_held();
                 st.weapon_var = g_weapon == WEAPON_SHOTGUN ? (int)g_shotgun_var : g_weapon == WEAPON_RAILCANNON ? (int)g_rail_var
                                 : g_weapon == WEAPON_SAWLAUNCHER ? (int)g_saw_var : 0;
+                // (v0.75 wrote the launcher's saws, magnets and heat under the weapon's picture; from v0.76 they are
+                // on the gun's own display, as in ULTRAKILL, unless the model pack is an older one without it)
                 st.weapon_note[0] = 0;
-                if (g_weapon == WEAPON_SAWLAUNCHER) {
+                static int have_saw_display = -1;
+                if (have_saw_display < 0) have_saw_display = hud_has_model("fx_saw") ? 1 : 0;
+                if (g_weapon == WEAPON_SAWLAUNCHER && have_saw_display == 0) {
                     if (g_saw_var == SAW_ATTRACTOR) snprintf(st.weapon_note, sizeof(st.weapon_note), "SAWS %d  MAGNETS %d", (int)lroundf(g_saw_ammo), (int)g_magnet_charge);
                     else snprintf(st.weapon_note, sizeof(st.weapon_note), "HEAT %d%%  %s", (int)lroundf(g_saw_heat * 100.0f), g_saw_sinks >= 1.0f ? "SINK IN" : "SINK OUT");
+                }
+                if (g_weapon == WEAPON_SAWLAUNCHER) {
+                    st.clip_muddle = g_saw_muddle;
+                    st.blade_spin = g_saw_blade * 3.14159265f / 180.0f;
+                    st.blade_heat = g_saw_var == SAW_OVERHEAT ? g_saw_heat : 0.0f;
+                    st.saw_count = (int)lroundf(g_saw_ammo);
+                    st.magnet_charge = g_magnet_charge;
+                    st.heat_sink = g_saw_sinks;
                 }
                 st.rail_charge = g_rail_charge;
                 st.twirl = g_twirl_angle * 3.14159265f / 180.0f;
@@ -5296,35 +5720,114 @@ static bool draw_full_hud(IDXGISwapChain *sc) {
                             seg(tail, g_whip_hook, 0.3f * UK_UNIT, claw, claw, 1.0f, nullptr, 0, 0, 0.03f);
                         }
                     }
-                    // Sawblades: the flat spinning picture they are in ULTRAKILL (a quad 4 u across for the
-                    // Attractor's, 3 u and grey for the Overheat's, 6 u and orange for the heated one; 1440
-                    // degrees a second), each with its trail (half a second; 2 u wide, 3 u for the heated
-                    // one; cyan, grey or orange from alpha 0.49). Magnets: the Harpoon's own mesh.
+                    // A model in the world with its z along `dir` (or against it) and its y as near to straight up
+                    // as that leaves it: Unity's LookAt. One unit of the model is one of ULTRAKILL's.
+                    auto aimed = [&](const char *model, const float *p, const float *dir, bool backwards, float spin) {
+                        if (st.world_mesh_count >= HudState::MAX_WORLD_MESHES) return;
+                        float z[3] = {dir[0], dir[1], dir[2]}, len = sqrtf(z[0] * z[0] + z[1] * z[1] + z[2] * z[2]);
+                        if (len < 1e-4f) { z[0] = fwd[0]; z[1] = fwd[1]; z[2] = fwd[2]; len = 1.0f; }
+                        for (float &x : z) x = x / len * (backwards ? -1.0f : 1.0f);
+                        float y[3] = {-z[0] * z[1], 1.0f - z[1] * z[1], -z[2] * z[1]}, yl = sqrtf(y[0] * y[0] + y[1] * y[1] + y[2] * y[2]);
+                        if (yl < 1e-3f) {                              // straight up or down: the eye's own "up" stands in
+                            float d = up[0] * z[0] + up[1] * z[1] + up[2] * z[2];
+                            for (int i = 0; i < 3; i++) y[i] = up[i] - z[i] * d;
+                            yl = sqrtf(y[0] * y[0] + y[1] * y[1] + y[2] * y[2]);
+                            if (yl < 1e-3f) return;
+                        }
+                        for (float &x : y) x /= yl;
+                        HudState::WorldMesh &w = st.world_meshes[st.world_mesh_count++];
+                        w.model = model;
+                        memcpy(w.p, p, sizeof(w.p));
+                        w.radius = UK_UNIT;
+                        w.flip = 0;
+                        w.uv[0] = w.uv[1] = 0;
+                        w.rgba[0] = w.rgba[1] = w.rgba[2] = w.rgba[3] = 1.0f;
+                        w.limits = nullptr;
+                        w.limit_count = 0;
+                        w.oriented = true;
+                        w.ax[0] = y[1] * z[2] - y[2] * z[1];
+                        w.ax[1] = y[2] * z[0] - y[0] * z[2];
+                        w.ax[2] = y[0] * z[1] - y[1] * z[0];
+                        memcpy(w.ay, y, sizeof(y));
+                        memcpy(w.az, z, sizeof(z));
+                        w.spin = spin;
+                        w.cutout = true;
+                    };
+                    // A trail as Unity's TrailRenderer leaves it behind something: from `head` back through the
+                    // points it has been at (newest first, with their times), `life` seconds long, `width` wide
+                    // at the head and nothing at the tail, from `rgb` at `alpha` to white at none.
+                    auto trail = [&](const float *head, const float (*pts)[3], const double *when, int count, float life, float width, const float *rgb, float alpha) {
+                        // The trails' material is 'Additive' (the legacy particle shader, tint 0.25): what is
+                        // drawn is added to the picture, at twice the tint times the trail's colour, so half
+                        // of it. A faint streak of light, then, and not a strip of paint, which is how
+                        // v0.76 laid it on.
+                        float fa = 1.0f, pa[3] = {head[0], head[1], head[2]}, ca[3] = {rgb[0] * 0.5f, rgb[1] * 0.5f, rgb[2] * 0.5f};
+                        hud_trail_begin(st, true);
+                        hud_trail_point(st, pa, width, ca, alpha);
+                        for (int k = 0; k < count && fa > 0; k++) {
+                            float fb = 1.0f - (float)(st.time - when[k]) / life, pb[3] = {pts[k][0], pts[k][1], pts[k][2]}, cb[3];
+                            if (fb > fa) fb = fa;
+                            if (fb < 0) {                              // the trail ends inside this piece
+                                float cut = fa / (fa - fb);
+                                for (int i = 0; i < 3; i++) pb[i] = pa[i] + (pb[i] - pa[i]) * cut;
+                                fb = 0;
+                            }
+                            for (int i = 0; i < 3; i++) cb[i] = (rgb[i] + (1.0f - rgb[i]) * (1.0f - fb)) * 0.5f;
+                            hud_trail_point(st, pb, width * fb, cb, alpha * fb);
+                            memcpy(pa, pb, sizeof(pa));
+                            fa = fb;
+                        }
+                    };
+                    // Sawblades, as their prefabs have them: a hub with the flat picture of the teeth on it (4 u
+                    // across for the Attractor's, 3 u and grey for the Overheat's, 6 u and orange for the heated
+                    // one), the teeth turning at 1440 degrees a second. Nail.Update keeps the saw's back to the
+                    // way it flies ("LookAt(position - velocity)"), so the disc lies flat along its path, like a
+                    // thrown plate, and banks as the path climbs or dives. (Until v0.76 it was a picture that
+                    // always faced the eye: a wheel rolling away, in Davi's words.) Behind it its trail: half a
+                    // second long, 2 u wide at the saw (3 u for the heated one) down to nothing, cyan, grey
+                    // or orange from alpha 0.49.
+                    static int have_saw = -1;
+                    if (have_saw < 0) have_saw = hud_has_model("fx_saw") && hud_has_model("fx_saw_overheat") && hud_has_model("fx_saw_heated") ? 1 : 0;
                     for (const Saw &sw : g_saws) {
-                        if (!sw.alive || sw.hidden) continue;
+                        if (!sw.alive) continue;
                         static const float sizes[3] = {4.0f, 3.0f, 6.0f}, widths[3] = {2.0f, 2.0f, 3.0f};
                         static const float trail_rgb[3][3] = {{0.0f, 0.876f, 1.0f}, {0.5f, 0.5f, 0.5f}, {1.0f, 0.592f, 0.0f}};
                         static const float tint[3][3] = {{1, 1, 1}, {0.5f, 0.5f, 0.5f}, {1.0f, 0.6f, 0.0f}};
-                        const float *from = sw.p;
-                        for (int k = 0; k < sw.trail_n; k++) {
-                            float fade = 1.0f - (k + 0.5f) / SAW_TRAIL;
-                            thin_line(from, sw.trail[k], widths[sw.kind] * UK_UNIT * 0.25f * fade, trail_rgb[sw.kind][0], trail_rgb[sw.kind][1], trail_rgb[sw.kind][2], 0.49f * fade);
-                            from = sw.trail[k];
-                        }
-                        float dx = sw.p[0] - eye[0], dy = sw.p[1] - eye[1], dz = sw.p[2] - eye[2];
+                        static const char *const models[3] = {"fx_saw", "fx_saw_overheat", "fx_saw_heated"};
+                        // (drawn as far past its last physics step as the clock is)
+                        float at[3];
+                        for (int i = 0; i < 3; i++) at[i] = sw.p[i] + (sw.stopped ? 0.0f : sw.v[i] * g_saw_owed);
+                        trail(at, sw.trail, sw.trail_t, sw.trail_n, 0.5f, widths[sw.kind] * UK_UNIT, trail_rgb[sw.kind], 0.49f);
+                        float dx = at[0] - eye[0], dy = at[1] - eye[1], dz = at[2] - eye[2];
                         if (dx * dx + dy * dy + dz * dz < 1.0f) continue;        // (not in the player's face as it leaves)
-                        sprite(sw.kind == SAW_HEATED ? "sawblade 2" : "sawblade", sw.p, sizes[sw.kind] * UK_UNIT, (float)fmod((st.time - sw.born) * 1440.0, 360.0),
-                               tint[sw.kind][0], tint[sw.kind][1], tint[sw.kind][2], 1.0f);
+                        float turn = (float)fmod((st.time - sw.born) * 1440.0, 360.0);
+                        if (have_saw == 1) aimed(models[sw.kind], at, sw.stopped ? sw.kept_v : sw.v, true, turn * 3.14159265f / 180.0f + 0.001f);
+                        else sprite(sw.kind == SAW_HEATED ? "sawblade 2" : "sawblade", at, sizes[sw.kind] * UK_UNIT, turn, tint[sw.kind][0], tint[sw.kind][1], tint[sw.kind][2], 1.0f);
                     }
-                    static int have_magnet = -1;
-                    if (have_magnet < 0) have_magnet = hud_has_model("fx_magnet") ? 1 : 0;
+                    // the bursts of light where coins send beams on and where those beams land
+                    for (const Flash &f : g_flashes) {
+                        float age = (float)(st.time - f.born);
+                        if (f.life <= 0 || age < 0 || age >= f.life) continue;
+                        float k = age / f.life;
+                        ball(f.p, f.size * (0.6f + 0.8f * k), 0, f.rgb[0] * 0.5f + 0.5f, f.rgb[1] * 0.5f + 0.5f, f.rgb[2] * 0.5f + 0.5f, 1.0f - k);
+                    }
+                    // Magnets: the harpoon's own mesh, pointing the way it flew, with its trail (a second
+                    // long, 0.5 u wide, cyan to white). Its TimeBomb's light flashes where the harpoon's tail
+                    // is each time it beeps: 6.4 u across, half as much again for a full load, shrinking away
+                    // at five times its size a second; green with nothing on the magnet, red with all it can hold.
+                    static int have_harpoon = -1;
+                    if (have_harpoon < 0) have_harpoon = hud_has_model("fx_harpoon") ? 1 : 0;
                     for (const MagnetObj &mg : g_magnets) {
-                        if (!mg.alive || !in_sight(mg.p)) continue;
-                        if (have_magnet == 1) mesh("fx_magnet", mg.p, 1.9428f * UK_UNIT * 0.5f, 0, 0, 0, 1.0f);
+                        if (!mg.alive) continue;
+                        const float cyan[3] = {0.0f, 0.876f, 1.0f};
+                        trail(mg.o, mg.trail, mg.trail_t, mg.trail_n, 1.0f, 0.5f * UK_UNIT, cyan, 1.0f);
+                        float dx = mg.o[0] - eye[0], dy = mg.o[1] - eye[1], dz = mg.o[2] - eye[2];
+                        if (dx * dx + dy * dy + dz * dz < 1.0f) continue;
+                        if (have_harpoon == 1) aimed("fx_harpoon", mg.o, mg.fwd, false, 0);
                         else ball(mg.p, 0.3f, 0, 0.3f, 0.8f, 1.0f, 1.0f);
-                        // the last two seconds it blinks (its TimeBomb's beeper)
-                        float left = (float)(mg.die_at - st.time);
-                        if (left < 2.0f && fmodf(left, 0.25f) > 0.125f) sprite("softglow", mg.p, 1.0f, 0, 1, 1, 1, 0.8f);
+                        float since = (float)(st.time - mg.beeped);
+                        if (mg.stuck && since >= 0 && since < 1.0f)
+                            sprite("muzzleflashnailgun", mg.o, 6.4f * UK_UNIT * (1.0f + mg.load) * expf(-5.0f * since), 0, mg.load, 1.0f - mg.load, 0.0f, 1.0f);
                     }
                     // Pellets in flight ("Shotgun Projectile"): a small yellow ball 0.2 u across, with no
                     // trail (v0.66 and before drew one). A punched one is orange and four times the size.
@@ -5494,7 +5997,8 @@ static bool draw_full_hud(IDXGISwapChain *sc) {
 static volatile LONG g_freezes = 0;
 static HRESULT WINAPI my_present(IDXGISwapChain *sc, UINT sync, UINT flags) {
     InterlockedIncrement(&g_presents);
-    float freeze = g_freeze_request;
+    float freeze = g_freeze_request, stop = g_hitstop_request;
+    g_hitstop_request = 0;
     if (freeze > 0 && !g_parry_freeze) {
         g_freeze_request = freeze = 0;
         g_flash_until = now_s() + 0.1;
@@ -5504,7 +6008,18 @@ static HRESULT WINAPI my_present(IDXGISwapChain *sc, UINT sync, UINT flags) {
     bool full = g_ctrl && draw_full_hud(sc);
     if (g_ctrl && !full) draw_hud(sc);
     g_in_hud_draw = false;
-    if (!(freeze > 0)) return g_orig_present(sc, sync, flags);
+    if (!(freeze > 0)) {
+        if (!(stop > 0) || !g_parry_freeze || !full) return g_orig_present(sc, sync, flags);
+        // TimeController.HitStop: the frame of the hit stays up for the length of the stop, with no flash,
+        // and the mod's clock leaves the stop out, as with the parry's freeze below
+        double t0 = real_s();
+        g_frozen_s = g_frozen_s + stop;
+        HRESULT hr = g_orig_present(sc, sync, flags);
+        while (real_s() - t0 < (double)stop - 0.002) Sleep(1);
+        g_frozen_s = g_frozen_s + (real_s() - t0) - stop;
+        InterlockedIncrement(&g_hitstops);
+        return hr;
+    }
     g_freeze_request = 0;
     if (!full) return g_orig_present(sc, sync, flags);
     ID3D11Device *dev = nullptr;
@@ -5514,7 +6029,8 @@ static HRESULT WINAPI my_present(IDXGISwapChain *sc, UINT sync, UINT flags) {
         dev->GetImmediateContext(&ctx);
         sc->GetBuffer(0, __uuidof(ID3D11Texture2D), (void **)&back);
         if (ctx && back) {
-            HudState white;
+            static HudState white_store;                 // (kept off the stack, like the frame's own)
+            HudState &white = *new (&white_store) HudState();
             white.flash_only = true;
             white.flash = 0.4902f;
             hud_draw(dev, ctx, back, white);
@@ -6101,7 +6617,7 @@ static DWORD WINAPI mod_thread(LPVOID) {
     char *slash = strrchr(path, '\\');
     strcpy(slash ? slash + 1 : path, "ultrasouls.log");
     g_log = fopen(path, "w");
-    logf("ultrasouls v0.75 loaded\n");
+    logf("ultrasouls v0.77 loaded\n");
     logf("settings: %s (sensitivity %.5f, fov scale %.1f, eye height %.2f, volume %.2f)\n", load_settings() ? "read from ultrasouls.ini" : "defaults, no ultrasouls.ini yet",
          (float)g_sens, (float)g_fov_scale, (float)g_eye_height, (float)g_volume);
     // Patching the code at startup made the game exit before showing a window (v0.7), so the hook
@@ -6160,6 +6676,32 @@ static DWORD WINAPI mod_thread(LPVOID) {
         {
             int hp = 0, hp_max = 0;
             if (rd(player + OFF_HP, hp) && rd(player + OFF_HP + 4, hp_max) && hp_max > 0) g_hud_health = 100.0f * (float)hp / (float)hp_max;
+            // With the no-death flag (below) set, the game stops a killing blow at 1 health instead of 0: the
+            // log of Davi's play on 2026-10-07 has 365 -> 1, 271 -> 1 and 304 -> 1. "Has no health left"
+            // then never came true, the flag was never let go, and the player could not die in first person
+            // (the earlier trial had written the 0 itself). So a drop to exactly 1 is taken for the blow that
+            // would have killed: the health is written to 0, which lets the flag go below, and the game
+            // kills. Unless it comes while falling well under where the player last stood, or with nothing
+            // below at all: that is a kill box, which the flag is there to stop, and what it took is given back.
+            {
+                static int seen_hp = -1;
+                static uintptr_t seen_player = 0;
+                if (player != seen_player) {
+                    seen_player = player;
+                    seen_hp = -1;
+                }
+                if (g_ctrl && hp == 1 && seen_hp > 1) {
+                    float feet[3] = {0, 0, 0};
+                    bool have_feet = pos && safe_read(pos + OFF_POS_X, feet, 12);
+                    bool kill_box = g_void_below || (g_air && g_have_safe && have_feet && feet[1] < g_safe_pos[1] - 3.0f);
+                    int put = kill_box ? seen_hp : 0;
+                    wr(player + OFF_HP, put);
+                    logf("health %d -> 1 with the no-death flag set: %s\n", seen_hp,
+                         kill_box ? "a kill box (falling under the last place stood on); the health is given back" : "a killing blow; health written to 0 so that the game kills");
+                    hp = put;
+                }
+                seen_hp = hp;
+            }
             // Kill boxes. Parts of the maps kill whoever touches them: the floors under places a player
             // was never meant to reach, which V1's jumps and an explosion's throw reach all the time.
             // The game's own "no death" flag (bit 0x20 of the second flag word, +0x524) switches them

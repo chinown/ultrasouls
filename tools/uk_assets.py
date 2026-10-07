@@ -130,7 +130,9 @@ EXTRA_SPRITES = ["RankD", "RankC", "RankB", "RankA", "RankS", "RankSS", "RankSSS
                  # the blood that splashes the screen after a heal ('ScreenBlood')
                  "Bloodsplatter6", "Bloodsplatter7", "Bloodsplatter8", "Bloodsplatter9", "Bloodsplatter10",
                  # the Sawblade Launcher's pictures for the weapon panel
-                 "SawbladeLauncher", "SawbladeLauncherGlow", "SawbladeLauncherOverheat", "SawbladeLauncherOverheatGlow"]
+                 "SawbladeLauncher", "SawbladeLauncherGlow", "SawbladeLauncherOverheat", "SawbladeLauncherOverheatGlow",
+                 # the light on the Attractor's magnet, which flashes with each beep of its TimeBomb
+                 "muzzleflashnailgun"]
 
 
 # Plain textures the effects use as sprites (they are not Sprite objects in the game's files)

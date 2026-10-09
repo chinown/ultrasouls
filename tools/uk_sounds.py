@@ -269,6 +269,25 @@ def decode(clip):
         return w.getframerate(), w.getnchannels(), w.readframes(w.getnframes())
 
 
+def made_sounds():
+    """Sounds that are neither game's: made here from sines and noise. {name: (rate, 16-bit mono PCM)}
+    parry_clang: the ring of a parry that opens an enemy to the visceral attack (a struck-metal clang over a
+    low thump: a handful of partials that are not multiples of each other, each dying away at its own rate)."""
+    import numpy as np
+    rate = 48000
+    t = np.arange(int(rate * 1.1)) / rate
+    rng = np.random.default_rng(7)
+    clang = sum(a * np.sin(2 * np.pi * f * t + p) * np.exp(-d * t)
+                for f, a, d, p in ((523, 0.50, 5.0, 0.0), (1244, 0.42, 6.5, 1.0), (1987, 0.34, 8.0, 2.1), (2890, 0.26, 10.0, 0.4),
+                                   (4310, 0.18, 13.0, 1.7), (6120, 0.10, 17.0, 2.9)))
+    strike = rng.standard_normal(len(t)) * np.exp(-90.0 * t) * 0.9
+    thump = np.sin(2 * np.pi * (95.0 * t - 60.0 * t * t).clip(0)) * np.exp(-14.0 * t) * 0.8
+    x = clang + strike + thump
+    x *= np.minimum(1.0, t / 0.002)
+    x = x / np.abs(x).max() * 0.9
+    return {"parry_clang": (rate, (x * 32767).astype("<i2").tobytes())}
+
+
 def cmd_pack(install=False):
     found = scan(bundles_for_refs())
     out = os.path.join(BUILD, "ultrasouls_sounds.bin")
@@ -287,6 +306,9 @@ def cmd_pack(install=False):
         frames = len(pcm) // (2 * channels)
         entries.append((name, rate, channels, frames, pcm))
         print("%-18s %6d Hz, %d ch, %.2f s" % (name, rate, channels, frames / rate))
+    for name, (rate, pcm) in made_sounds().items():
+        entries.append((name, rate, 1, len(pcm) // 2, pcm))
+        print("%-18s %6d Hz, 1 ch, %.2f s (made here)" % (name, rate, len(pcm) / 2 / rate))
     with open(out, "wb") as f:
         f.write(b"USSND001" + struct.pack("<I", len(entries)))
         for name, rate, channels, frames, pcm in entries:

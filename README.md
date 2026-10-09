@@ -73,6 +73,6 @@ The addresses in the DLL are for one build of the Steam exe; [docs/DETAILS.md](d
 
 ## Status
 
-Work in progress, built and tested on one machine. The newest changes (v0.83 to v0.85) have not all been run in the game yet. Version by version notes, how each part works and what is still missing: [docs/DETAILS.md](docs/DETAILS.md).
+Work in progress, built and tested on one machine. The newest changes (v0.83 to v0.89) have not all been run in the game yet. Version by version notes, how each part works and what is still missing: [docs/DETAILS.md](docs/DETAILS.md).
 
 Not affiliated with FromSoftware, Bandai Namco, Arsi "Hakita" Patala or New Blood Interactive.

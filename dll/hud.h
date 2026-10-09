@@ -63,6 +63,9 @@ struct HudState {
     enum { MAX_BOSSES = 2, BOSS_NAME_CHARS = 48 };
     int boss_count = 0;
     struct Boss { char name[BOSS_NAME_CHARS]; float hp; } bosses[MAX_BOSSES];
+    float red_tint = 0;                    // 0..1: the whole picture washed in red (the visceral attack)
+    float arm_roll = 0;                    // and turned by this much about the line of sight, at the middle of the view
+    float arm_push[3] = {0, 0, 0};         // the Feedbacker moved from its place by this much (right, up, forward): the visceral attack's thrust
     const char *arm_clip = nullptr;
     double arm_clip_start = -100.0;
     const char *arm2_clip = nullptr;       // the Knuckleblaster
@@ -79,7 +82,7 @@ struct HudState {
     // in the canvas's units, which of the five pictures it is, and its alpha now.
     enum { MAX_SCREEN_BLOOD = 12 };
     int screen_blood_count = 0;
-    struct ScreenBloodMark { float x, y; int sprite; float alpha; } screen_blood[MAX_SCREEN_BLOOD];
+    struct ScreenBloodMark { float x, y; int sprite; float alpha; float scale = 1.0f; } screen_blood[MAX_SCREEN_BLOOD];   // scale: of its usual size (half the canvas's height)
     float punch_stamina = 2.0f;    // 0..2; a punch needs 1
     int arm = 0;                   // the arm last used, for the fist icon: 0 Feedbacker, 1 Knuckleblaster
     // Style meter. Rank -1 hides it; 0..7 are D C B A S SS SSS ULTRAKILL. Lines are the bonus list, oldest first.

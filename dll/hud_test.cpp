@@ -715,6 +715,27 @@ int main(int argc, char **argv) {
             }
             add("rocket_%d", k++, s, 0.33f, 0.34f, 0.37f);
         }
+        // v0.86: the visceral attack's arm: drawn back, halfway in, in (with the splash over the hand), coming out
+        static const struct { float pose, right, up, fwd; bool gore; } visc[] = {
+            {0.0f, 0, -0.03f, 0.0f, false}, {0.05f, 0.12f, 0.015f, 0.30f, false}, {0.10f, 0.24f, 0.06f, 0.60f, true}, {0.2f, 0.12f, 0.03f, 0.2f, false}};
+        k = 0;
+        for (const auto &v : visc) {
+            s = HudState();
+            s.time = 198.0;
+            s.weapon = 0;
+            s.variation = 1;
+            s.arm_clip = "Jab";
+            s.arm_clip_start = 198.0 - v.pose;
+            s.arm_push[0] = v.right;
+            s.arm_push[1] = v.up;
+            s.arm_push[2] = v.fwd;
+            s.arm_roll = v.gore ? 0.34f : 0.0f;
+            if (v.gore) {
+                s.screen_blood[s.screen_blood_count++] = {-12.0f, 34.0f, 1, 0.62f, 0.50f};
+                s.screen_blood[s.screen_blood_count++] = {-4.0f, 44.0f, 3, 0.55f, 0.32f};
+            }
+            add("visc_%d", k++, s, 0.33f, 0.34f, 0.37f);
+        }
     }
 
     // v0.78, v0.79: ULTRAKILL's death: lines in the corner (0.8 s and 1.9 s in) over an empty picture and over a

@@ -1729,9 +1729,10 @@ void build_hud(const HudState &st, float screen_w, float screen_h) {
             const HudState::ScreenBloodMark &b = st.screen_blood[i];
             int spr = g.sprite(SPLATS[b.sprite < 0 ? 0 : b.sprite > 4 ? 4 : b.sprite]);
             if (spr < 0) continue;
-            image_simple(sc, child(screen, rt(0.5f, 0.5f, 0.5f, 0.5f, b.x, b.y, side, side)), spr, {0.6765f * 0.6f, 0, 0, fminf(b.alpha * 1.6f, 1.0f)});
+            image_simple(sc, child(screen, rt(0.5f, 0.5f, 0.5f, 0.5f, b.x, b.y, side * (b.scale > 0 ? b.scale : 1.0f), side * (b.scale > 0 ? b.scale : 1.0f))), spr, {0.6765f * 0.6f, 0, 0, fminf(b.alpha * 1.6f, 1.0f)});
         }
     }
+    if (st.red_tint > 0.001f) rect_quad(sc, screen.xf, -1, screen.x0, screen.y0, screen.x1, screen.y1, 0, 0, 1, 1, {0.55f, 0.0f, 0.0f, fminf(st.red_tint, 1.0f) * 0.42f});
     if (st.flash > 0.001f) rect_quad(sc, screen.xf, -1, screen.x0, screen.y0, screen.x1, screen.y1, 0, 0, 1, 1, {1, 1, 1, fminf(st.flash, 1.0f) * 0.4902f});
 }
 
@@ -2757,7 +2758,34 @@ void draw_viewmodel(ID3D11DeviceContext *ctx, const HudState &st, float aspect, 
         if (g.raster_cull) ctx->RSSetState(g.raster_cull);
         const Clip *ac = arm ? arm->clip(st.arm_clip) : nullptr;
         float at = (float)(st.time - st.arm_clip_start);
-        if (ac && at >= 0 && at <= (ac->frames - 1) / ac->fps) draw_model(ctx, *arm, ac, at, false);
+        if (ac && at >= 0 && at <= (ac->frames - 1) / ac->fps) {
+            if (st.arm_push[0] != 0 || st.arm_push[1] != 0 || st.arm_push[2] != 0 || st.arm_roll != 0) {
+                // (the visceral attack: the whole arm goes forward into what is in front, and comes back)
+                MeshConsts cp = ca;
+                float pushed[16];
+                memcpy(pushed, arm_world, sizeof(pushed));
+                pushed[12] += st.arm_push[0];
+                pushed[13] += st.arm_push[1];
+                pushed[14] += st.arm_push[2];
+                if (st.arm_roll != 0) {
+                    // turned about the line of sight through where the hand is (a little above the middle of the view)
+                    float to_pivot[16], turn[16], back[16];
+                    translate(to_pivot, 0.0f, -0.05f, 0.0f);
+                    rotate_z(turn, st.arm_roll);
+                    translate(back, 0.0f, 0.05f, 0.0f);
+                    mul44(pushed, to_pivot, pushed);
+                    mul44(pushed, turn, pushed);
+                    mul44(pushed, back, pushed);
+                }
+                mul44(pushed, proj, cp.mvp);
+                memcpy(cp.world, pushed, sizeof(cp.world));
+                upload_consts(ctx, cp);
+                draw_model(ctx, *arm, ac, at, false);
+                upload_consts(ctx, ca);
+            } else {
+                draw_model(ctx, *arm, ac, at, false);
+            }
+        }
         Model *arm2 = find_model("knuckleblaster");
         const Clip *bc = arm2 ? arm2->clip(st.arm2_clip) : nullptr;
         float bt = (float)(st.time - st.arm2_clip_start) * st.arm2_clip_speed;

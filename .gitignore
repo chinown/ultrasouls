@@ -3,3 +3,4 @@ backup/
 build/
 __pycache__/
 *.log
+reference/

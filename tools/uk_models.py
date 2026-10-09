@@ -3,6 +3,8 @@
 
   python tools/uk_models.py pack [--install]   write build/ultrasouls_models.bin (--install copies it next to the exe)
   python tools/uk_models.py info               list nodes, meshes and clips
+  python tools/uk_models.py text [--install]   write build/ultrasouls_text.txt: what ULTRAKILL writes on the screen
+                                               when the player dies (pack does this too)
 
 Nothing from ULTRAKILL is stored in this repository: the pack is built on your machine from your install.
 
@@ -54,14 +56,20 @@ CAB = uk_assets.REVOLVER_PREFAB[0]
 MODELS = {"revolver": "Revolver Pierce", "feedbacker": "Arm Blue", "knuckleblaster": "Arm Red",
           "shotgun": "Shotgun Grenade", "revolver_alt": "Alternative Revolver Pierce",
           "railcannon": "Railcannon Electric", "whiplash": "Hook Arm",
-          "sawlauncher": "Sawblade Launcher Magnet"}     # pack name -> prefab root object
+          "sawlauncher": "Sawblade Launcher Magnet",
+          "rocketlauncher": "Rocket Launcher Freeze"}    # pack name -> prefab root object
 # The displays on each weapon: model -> [(name prefix, the prefab they are read from)]. The three
 # revolvers share one rig, so the Marksman's and the Sharpshooter's displays are fixed to the same bone of
 # the one revolver model that is packed.
 SCREENS = {"revolver": [("pierce", "Revolver Pierce"), ("marksman", "Revolver Ricochet"), ("sharp", "Revolver Twirl")],
            "revolver_alt": [("pierce", "Alternative Revolver Pierce"), ("marksman", "Alternative Revolver Ricochet"), ("sharp", "Alternative Revolver Twirl")],
            "shotgun": [("core", "Shotgun Grenade"), ("pump", "Shotgun Pump")],
-           "sawlauncher": [("magnet", "Sawblade Launcher Magnet"), ("overheat", "Sawblade Launcher Overheat")]}
+           "sawlauncher": [("magnet", "Sawblade Launcher Magnet"), ("overheat", "Sawblade Launcher Overheat")],
+           "rocketlauncher": [("clock", "Rocket Launcher Freeze")]}
+# The rocket launcher's display is a clock hung in the air over the gun (the same on both of its variations
+# here): its panels are named after what the DLL does with each.
+CLOCK_NAMES = {"Fade": "fade", "Outer Ring": "outer", "Inner Ring": "ring", "Clock Center": "hub", "Clock Arm": "arm",
+               "1": "q1", "2": "q2", "3": "q3", "4": "q4"}
 BATTERY = (("batteryFull", "battery_full"), ("batteryMid", "battery_mid"), ("batteryLow", "battery_low"))
 # Meshes of ULTRAKILL's effects, packed as models of one fixed part: pack name -> (prefab root, object in it).
 # Each is scaled so that its furthest point is 1 from its middle; the DLL gives it the size the effect has.
@@ -69,7 +77,8 @@ PROPS = {"fx_sphere": ("Explosion", "Sphere_8"),          # the explosion's ball
          "fx_sphere_super": ("Explosion Super", "Sphere_8"),   # the super explosion's, with its own redder picture
          "fx_shock": ("Explosion", "Sphere_8 (1)"),       # the faint shell that runs ahead of it
          "fx_coin": ("Coin", "Model"),                    # the Marksman's coin
-         "fx_core": ("Grenade", "Grenade")}               # the shotgun's ejected core
+         "fx_core": ("Grenade", "Grenade"),               # the shotgun's ejected core
+         "fx_cannonball": ("Cannonball", "Cannonball")}   # the S.R.S. Cannon's ball
 # Rigid parts of a weapon that are not skinned to its skeleton: model -> [(prefab root, object in it)]. A part
 # hangs from the model's node of its own name or, where the model has none, from the nearest node above it
 # that the model has by name (the Overheat's second, glowing blade 'Blade (1)' sits on 'Blade', a tenth larger).
@@ -80,7 +89,9 @@ RIGID = {"sawlauncher": [("Sawblade Launcher Magnet", "Blade"), ("Sawblade Launc
 #   a sawblade: a hub ('Cylinder', a ProBuilder mesh whose points are in the prefab itself, not in a mesh
 #   asset) with a flat picture of the teeth on it ('Quad', Unity's own quad), lying in the root's x-z plane
 #   the Attractor's magnet: the harpoon, pointing along the root's z
-FLYERS = {"fx_saw": "NailAltFodder", "fx_saw_overheat": "NailAlt", "fx_saw_heated": "NailAltHeated", "fx_harpoon": "Harpoon"}
+#   a rocket: its 'Model', pointing along the root's z
+FLYERS = {"fx_saw": "NailAltFodder", "fx_saw_overheat": "NailAlt", "fx_saw_heated": "NailAltHeated", "fx_harpoon": "Harpoon",
+          "fx_rocket": "Rocket"}
 
 
 def find_root(name):
@@ -363,7 +374,7 @@ def build_model(name, root_name):
             clips.append((cname, fps, frames.astype("<f4")))
             # the clip's events are where ULTRAKILL's code is called from mid-animation (a gun being ready
             # again, a sound); the DLL's timings are copied from this list
-            events = ["%s %.2fs" % (e["functionName"], e["time"]) for e in tree.get("m_Events", [])]
+            events = ["%s%s %.2fs" % (e["functionName"], "(%g)" % e["floatParameter"] if e.get("floatParameter") else "", e["time"]) for e in tree.get("m_Events", [])]
             if events:
                 print("    %s events: %s" % (cname, ", ".join(events)))
     return name, node_rows, textures, meshes, clips
@@ -451,10 +462,12 @@ def build_screens(prefix, root_name, node_rows, textures, tex_index):
         return tex_index[name]
 
     # which Image is which meter, from the weapon's own fields
-    special, weapon, ammo_text = {}, None, None
+    special, weapon, ammo_text, clock = {}, None, None, False
     for pid, node in nodes.items():
         for c in node["components"]:
             cls, t = _script(c)
+            if cls == "RocketLauncher":
+                clock = True
             if cls == "Nailgun":
                 for i, ref in enumerate(t.get("heatSinkImages", [])):
                     special[ref["m_PathID"]] = ("sink%d" % i, None)
@@ -490,6 +503,8 @@ def build_screens(prefix, root_name, node_rows, textures, tex_index):
                 local = [(x0, y0, 0, 0), (x0, y0 + h, 0, 1), (x0 + w, y0 + h, 1, 1), (x0 + w, y0, 1, 0)]
                 col = t["m_Color"]
                 name, kind = special.get(c.path_id, (None, None))
+                if name is None and clock and node["name"] in CLOCK_NAMES:
+                    name = CLOCK_NAMES[node["name"]]
                 if name is None:
                     name, plain = "bg%d" % plain, plain + 1
                 if kind is None:
@@ -775,6 +790,55 @@ def build_flyer(name, root_name):
     return name, node_rows, textures, meshes, []
 
 
+TEXT = os.path.join(BUILD, "ultrasouls_text.txt")
+
+
+def cmd_text(install=False):
+    """The words of ULTRAKILL's death sequence, for the DLL to show: the lines 'DeathSequence' lets appear one by
+    one (its 'Text (TMP)'; a line TextMeshPro colours orange keeps its <color=orange> tag) and the two lines of the
+    black screen after them ('BlackScreen/YouDiedText'). A plain text file, in sections headed [death] and [dead]."""
+    env = load_bundle(cab_index()[CAB])
+    seq = None
+    for o in env.objects:
+        if o.type.name != "MonoBehaviour":
+            continue
+        try:
+            t = o.read_typetree()
+            s = follow(o, t.get("m_Script"))
+            if s is not None and s.read_typetree().get("m_ClassName") == "DeathSequence":
+                seq = (o, t)
+                break
+        except Exception:
+            pass
+    if seq is None:
+        raise SystemExit("the DeathSequence object was not found")
+    o, t = seq
+    go = follow(o, t["m_GameObject"])
+    lines = None
+    for n in prefab_nodes((go.assets_file.name.lower(), go.path_id)).values():
+        for c in n["components"]:
+            cls, tt = _script(c)
+            if cls == "TextMeshProUGUI":
+                lines = tt["m_text"]
+    screen = None
+    black = follow(o, t["deathScreen"])
+    for n in prefab_nodes((black.assets_file.name.lower(), black.path_id)).values():
+        for c in n["components"]:
+            cls, tt = _script(c)
+            if cls == "Text" and screen is None:
+                screen = tt["m_Text"]
+    if lines is None or screen is None:
+        raise SystemExit("the death sequence's texts were not found")
+    os.makedirs(BUILD, exist_ok=True)
+    with open(TEXT, "w", encoding="utf-8", newline="\n") as f:
+        f.write("[death]\n" + lines.replace("\r", "") + "\n[dead]\n" + screen.replace("\r", "") + "\n")
+    print("wrote", os.path.normpath(TEXT), "(%d lines of the death sequence, %d of the screen after it)" % (lines.count("\n") + 1, screen.count("\n") + 1))
+    if install:
+        import shutil
+        shutil.copy(TEXT, os.path.join(GAME_DIR, "ultrasouls_text.txt"))
+        print("installed next to the exe")
+
+
 def _name(s):
     return s.encode("ascii", "replace").ljust(40, b"\0")[:40]
 
@@ -825,12 +889,15 @@ def cmd_pack(install=False):
         import shutil
         shutil.copy(PACK, os.path.join(GAME_DIR, "ultrasouls_models.bin"))
         print("installed next to the exe")
+    cmd_text(install)
 
 
 if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else ""
     if cmd == "pack":
         cmd_pack("--install" in sys.argv[2:])
+    elif cmd == "text":
+        cmd_text("--install" in sys.argv[2:])
     elif cmd == "info":
         for name, root_name in MODELS.items():
             name, node_rows, textures, meshes, clips = build_model(name, root_name)

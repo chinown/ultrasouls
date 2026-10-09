@@ -58,6 +58,8 @@ int g_next_id = 1;
 // The clips are mastered to full scale (shots average -12 dBFS); at 0.6 the mix averaged -16 dBFS
 // with peaks at -9, far above Dark Souls' own audio.
 float g_master = 0.2f;
+float g_all_pitch = 1.0f;                // sound_all_pitch
+int g_all_exempt = 1 << 30;
 volatile long g_underruns = 0;
 
 // what was sent to the device lately, and which sounds were started, for sound_dump
@@ -81,7 +83,9 @@ void mix(int16_t *out, int frames) {
     for (Voice &v : g_voices) {
         if (!v.id) continue;
         const Clip &c = *v.clip;
-        double step = (double)v.pitch * c.rate / OUT_RATE;
+        float all = v.channel >= g_all_exempt ? 1.0f : g_all_pitch;
+        if (all < 0.02f) continue;                        // slowed to a stop: it waits where it is, silent
+        double step = (double)v.pitch * all * c.rate / OUT_RATE;
         if (step < 0.0005) step = 0.0005;                 // a pitch of zero would never finish
         float vol = v.volume * g_master;
         for (int i = 0; i < frames; i++) {
@@ -334,6 +338,11 @@ void sound_stop(int voice) {
 }
 
 void sound_master(float volume) { g_master = volume < 0 ? 0 : volume > 1 ? 1 : volume; }
+
+void sound_all_pitch(float pitch, int exempt_from) {
+    g_all_exempt = exempt_from;
+    g_all_pitch = pitch < 0 ? 0 : pitch;
+}
 
 int sound_underruns() { return (int)g_underruns; }
 

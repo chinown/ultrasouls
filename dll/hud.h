@@ -28,7 +28,14 @@ struct HudState {
     int weapon = 0;                        // 0 revolver, 1 shotgun, 2 railcannon, 3 sawblade launcher
     char weapon_note[40] = "";             // a line written under the weapon's picture (the launcher's saws, magnets and heat)
     bool alt = false;                      // the revolver is the alternate ("Slab") one
-    int weapon_var = 0;                    // the shotgun's variation (0 Core Eject, 1 Pump Charge), the railcannon's (0 Electric, 1 Malicious) or the launcher's (0 Attractor, 1 Overheat)
+    int weapon_var = 0;                    // the shotgun's variation (0 Core Eject, 1 Pump Charge), the railcannon's (0 Electric, 1 Malicious), the launcher's (0 Attractor, 1 Overheat) or the rocket launcher's (0 Freezeframe, 1 S.R.S. Cannon)
+    // the rocket launcher (weapon 4): the clock on it (how much of its ring is filled, where its hand points,
+    // its colour and how strongly it is drawn) and how far the cannon is wound up, which shakes the gun
+    float clock_fill = 1.0f, clock_alpha = 1.0f, clock_rgb[3] = {0.251f, 0.906f, 1.0f}, srs_charge = 0.0f;
+    // Dark Souls' title screen: nothing of the HUD is drawn; the picture is looked at and, if it is the title
+    // screen, dressed as ULTRAKILL's main menu. title_note: a line written under the logo.
+    bool title = false;
+    char title_note[64] = "";
     float rail_charge = 5.0f;              // 0..5: the railcannon's charge, which lights its pips one by one
     bool meter_rgb_set = false;            // the shotgun's meter in this colour instead of the Core Eject's (the Pump Charge's)
     float meter_rgb[3] = {1, 1, 1};
@@ -46,6 +53,12 @@ struct HudState {
     float core_meter = 1.0f;               // the shotgun's own meter: 0..1 filled
     float core_meter_red = 0.0f;           // 0..1: how far its colour has gone from the variation's to red
     bool flash_only = false;               // draw nothing but the white flash (the parry's frozen frame)
+    // ULTRAKILL's death sequence ('DeathSequence'): seconds since the player died, negative while alive. For
+    // its first two seconds there is no HUD and no weapon, and the sequence's lines appear in the corner, one
+    // every 0.05 s; after them the black screen with its own two lines. death_prompt: whether the second of
+    // those, the key to restart with, is shown. The words come from ultrasouls_text.txt beside the packs.
+    float death_time = -1.0f;
+    bool death_prompt = true;
     // boss health bars across the top: name, health 0..1
     enum { MAX_BOSSES = 2, BOSS_NAME_CHARS = 48 };
     int boss_count = 0;
@@ -183,6 +196,11 @@ void hud_beam(HudState &st, const float *a, const float *b, int kind, float widt
 // it off. The view is kept (with a reference) until the next call.
 void hud_set_depth(ID3D11ShaderResourceView *srv, float a, float b);
 
+// How many lines the death sequence has (0 if the text file is not there), and whether line `i` is one of
+// the orange ones (a warning; the rest are errors): the DLL plays a sound as each appears.
+int hud_death_lines();
+bool hud_death_line_warning(int i);
+
 // Whether the model pack has a model of this name (the effect meshes are optional).
 bool hud_has_model(const char *name);
 
@@ -201,6 +219,18 @@ bool hud_init(ID3D11Device *device, const wchar_t *pack_path);
 
 // Draws onto `target` (the back buffer). Saves and restores every piece of pipeline state it touches.
 void hud_draw(ID3D11Device *device, ID3D11DeviceContext *ctx, ID3D11Texture2D *target, const HudState &state);
+
+// The title menu drawn as ULTRAKILL's column of buttons (HudState.title). Dark Souls still runs the menu and
+// goes by where the pointer is, so while the column is up the pointer's place is translated for it: on button
+// i it is given as on Dark Souls' row i, on one of the two arrow marks as on Dark Souls' arrow, and over the
+// rows that are blacked out as beside them. x, y: the pointer in the window (pixels, y down), w, h: the
+// window's size. Returns false, changing nothing, when the column was not on the last picture or the pointer
+// is nowhere that matters.
+bool hud_title_cursor(float w, float h, float *x, float *y);
+// Whether the title menu is drawn that way at all (the ini's title_column; off, the rows are dressed where they are).
+void hud_title_column(bool on);
+// The column as last drawn, for the log: its buttons' words, the chosen one in brackets ("" with no column).
+const char *hud_title_state();
 
 // The parry's freeze: keep a copy of what is on `target` now, and put it back later.
 bool hud_keep_frame(ID3D11Device *device, ID3D11DeviceContext *ctx, ID3D11Texture2D *target);

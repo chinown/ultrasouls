@@ -1,6 +1,8 @@
 """Drive Dark Souls Remastered to test the mod without a person at the keyboard.
 
   python tools/game.py start                 launch through Steam and load the last save
+  python tools/game.py start --menu          launch and stop at the title menu (to test the menu itself); a plain
+                                             `start` afterwards goes on and loads the save
   python tools/game.py shot NAME [SCALE]     screenshot -> build/shots/NAME.png and NAME_small.png
   python tools/game.py do CMD [CMD ...]      input commands, e.g. "key 0x74" "rel 300 0" "mdown 960 540" "wait 1.5" "mup"
   python tools/game.py clip NAME CMD [...]   the same input commands, recorded: frames -> build/shots/NAME_000.png ...
@@ -78,6 +80,7 @@ def restore_save():
 OFFLINE_OK = (960, 660)
 UNCLEAN_OK = (960, 770)        # "Last time, the game may not have been closed using Quit Game..." 
 MENU_CONTINUE = (960, 788)
+COLUMN_CONTINUE = (442, 487)   # the same entry where the mod's title menu puts it (v0.83): ULTRAKILL's first button
 TAB_SYSTEM = (1621, 130)
 SYSTEM_QUIT = (567, 488)
 QUIT_OK = (758, 660)
@@ -107,8 +110,34 @@ def shot(name, scale=0.5):
 def _highlighted(path, point):
     """True if the menu's orange highlight bar is at `point` (it is about (99, 47, 14))."""
     from PIL import Image
-    r, g, b = Image.open(path).convert("RGB").getpixel(point)
-    return 80 <= r <= 135 and 30 <= g <= 70 and b <= 35
+    im = Image.open(path).convert("RGB")
+    r, g, b = im.getpixel(point)
+    if 80 <= r <= 135 and 30 <= g <= 70 and b <= 35:
+        return True
+    # or white on black: the mod's title menu redraws the chosen row as ULTRAKILL's chosen button (the point 70
+    # pixels above it is black there, which it is not on the publisher's white logo screen)
+    return min(r, g, b) >= 235 and point[1] > 700 and max(im.getpixel((point[0], point[1] - 70))) < 40
+
+
+def _column_continue(path):
+    """True if the mod's title menu is up as ULTRAKILL's column of buttons with CONTINUE the chosen one: the
+    first button is filled white on the picture (black beside and above it), and the mod's log, which names the
+    buttons whenever they change, has CONTINUE as the chosen one."""
+    from PIL import Image
+    im = Image.open(path).convert("RGB")
+    y = COLUMN_CONTINUE[1]
+    if not all(min(im.getpixel((x, y))) >= 235 for x in (160, 720)):
+        return False
+    if not all(max(im.getpixel(point)) < 40 for point in ((100, y), (160, y - 70))):
+        return False
+    return _menu_line().startswith("[CONTINUE]")
+
+
+def _menu_line():
+    """The mod's title menu as its log last gave it: the buttons' words with the chosen one in brackets, "-"
+    while the menu is not up as the column, "" if the log has no such line."""
+    menus = [l for l in log_lines() if l.startswith("title menu: ")]
+    return menus[-1][len("title menu: "):].strip() if menus else ""
 
 
 def log_lines():
@@ -146,7 +175,19 @@ def clip(name, commands, fps=20, width=960):
     return frames
 
 
-def start():
+def _offline_seen(note=False):
+    """Whether the offline notice was seen in this run of the game (`start --menu` notes it, for the `start`
+    that follows it and comes in with the notice long gone)."""
+    path = os.path.join(BACKUPS, "offline_seen.txt")
+    if note:
+        open(path, "w").write(str(running()))
+    try:
+        return open(path).read().strip() == str(running())
+    except OSError:
+        return False
+
+
+def start(menu_only=False):
     if not running():
         backup_save()
         win.launch(STEAM_APP, [], steam=True)
@@ -158,19 +199,29 @@ def start():
             sys.exit("the game window did not appear")
         time.sleep(8)
     d = win.Drive(PROC)
-    saw_offline = False
+    saw_offline = _offline_seen()
     for step in range(40):
         path = shot("_start", scale=None)
+        shutil.copy(path, os.path.join(SHOTS, "_start_step%02d.png" % step))     # (kept: what the title screens look like)
         if _highlighted(path, (OFFLINE_OK[0] - 110, OFFLINE_OK[1])):
             saw_offline = True
             do(d, ["focus", "click %d %d" % OFFLINE_OK])
-        elif _highlighted(path, (MENU_CONTINUE[0] - 110, MENU_CONTINUE[1])):
+        elif _highlighted(path, (MENU_CONTINUE[0] - 110, MENU_CONTINUE[1])) or _column_continue(path):
             if not saw_offline:
                 sys.exit("reached the main menu without the offline notice: not continuing")
-            do(d, ["focus", "click %d %d" % MENU_CONTINUE])
+            if menu_only:
+                _offline_seen(note=True)
+                print("at the title menu")
+                return
+            do(d, ["focus", "click %d %d" % (COLUMN_CONTINUE if _column_continue(path) else MENU_CONTINUE)])
             break
         elif _highlighted(path, (UNCLEAN_OK[0] - 110, UNCLEAN_OK[1])):
             do(d, ["focus", "click %d %d" % UNCLEAN_OK])   # checked last, so it can never stand in for the offline notice
+        elif _menu_line() not in ("", "-"):
+            # the column is up with another entry chosen: Enter would start that one (never "Log In": offline only)
+            if not _menu_line().startswith("CONTINUE"):
+                sys.exit("the title menu is up without Continue as its first button (%s): not pressing anything" % _menu_line())
+            do(d, ["focus", "move %d %d" % COLUMN_CONTINUE])
         else:
             do(d, ["focus", "scanmode on", "key 0x0D"])   # logos and "press any button"
         time.sleep(3)
@@ -285,7 +336,7 @@ def quit_game(keep=False):
 if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else ""
     if cmd == "start":
-        start()
+        start(menu_only="--menu" in sys.argv[2:])
     elif cmd == "shot" and len(sys.argv) >= 3:
         print(shot(sys.argv[2], float(sys.argv[3]) if len(sys.argv) > 3 else 0.5))
     elif cmd == "do":

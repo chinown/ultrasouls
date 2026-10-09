@@ -48,16 +48,24 @@ ARM_ROWS = {
     "blast":   (9000133, 1.0,                         1.5,   6.0,    4,        400,   5.0),   # its blast wave ('Explosion Wave Knuckleblaster': 12 u): wide, mostly a shove
     # the shotgun fired into an attacking enemy at arm's length (Shotgun.Shoot's 4-unit "shotgunzone": 4 x 1.5)
     "shotgun_parry": (9000141, 6.0,                   2.0,   0.5,    4,        400,   3.0),
+    # Explosions (v0.82). Until then an explosion was one projectile as wide as the explosion, set off at its
+    # middle and sent 0.6 m upwards. Measured in the game on 2026-10-08 with the DLL's "boom" test command,
+    # that hurt an enemy standing in it only now and then: the game counts a projectile's hit on a body it
+    # already overlaps only if it is moving towards that body, and one sphere cannot be moving towards
+    # everybody round it (a rocket going off a metre from a hollow did nothing to it, time after time). So the
+    # DLL now sends one of these rows at each enemy inside the explosion, from 0.9 m short of its aim point:
+    # every row here is 1.5 m of reach and half a metre of radius, and how wide each explosion is is the
+    # DLL's business (EXPLOSIONS in mod.cpp).
     # Explosion: a core or a punched pellet going off is 6 units across at damage 3.5; a core shot in the
     # air is the "super" one, 12 units and twice the damage
-    "explosion": (9000142, 3.5,                       0.6,   3.0,    4,        400,   4.0),
-    "explosion_super": (9000143, 7.0,                 0.6,   6.0,    4,        600,   6.0),
+    "explosion": (9000142, 3.5,                       1.5,   0.5,    4,        400,   4.0),
+    "explosion_super": (9000143, 7.0,                 1.5,   0.5,    4,        600,   6.0),
     # the Pump Charge shotgun fired at three pumps: the same explosion half again as large, at damage 50 against 35
-    "explosion_pump": (9000144, 5.0,                  0.6,   4.5,    4,        400,   4.0),
+    "explosion_pump": (9000144, 5.0,                  1.5,   0.5,    4,        400,   4.0),
     # 'Explosion Malicious Railcannon': 13.5 units, damage 50 with enemyDamageMultiplier 1.25
-    "explosion_malicious": (9000172, 6.25,            0.6,   6.75,   4,        600,   6.0),
+    "explosion_malicious": (9000172, 6.25,            1.5,   0.5,   4,        600,   6.0),
     # a core set off by the Malicious Railcannon's beam, the "ultraboost": the super explosion at twice the size
-    "explosion_ultra": (9000174, 7.0,                 0.6,   12.0,   4,        600,   6.0),
+    "explosion_ultra": (9000174, 7.0,                 1.5,   0.5,   4,        600,   6.0),
     # the whiplash's hook going in: HookArm deals 0.2. Half a revolver shot's attack value is what lands a
     # fifth of its damage on the hollow the pellets were measured on (see PELLET_DAMAGE); a light flinch, no shove.
     "whiplash": (9000190, 0.5,                        1.5,   0.5,    1,        20,    0.0),
@@ -67,6 +75,19 @@ ARM_ROWS = {
     "saw_attractor": (9000191, 0.86,                  1.2,   0.5,    1,        20,    0.0),
     "saw_overheat":  (9000192, 0.79,                  1.2,   0.5,    1,        20,    0.0),
     "saw_heated":    (9000193, 1.0,                   1.2,   0.5,    2,        60,    0.0),
+    # The rocket launcher. A rocket that reaches an enemy goes off as the plain explosion, or the super one; one
+    # that does so while the rockets are frozen, or is shot in the air, is half again as large (Grenade.Explode).
+    "explosion_big": (9000145, 3.5,                   1.5,   0.5,    4,        400,   4.0),
+    "explosion_super_big": (9000146, 7.0,             1.5,   0.5,    4,        600,   6.0),
+    # The S.R.S. Cannon's ball (Cannonball): damage 5, or its speed x 0.15 where that is less, and 7 for one
+    # punched on after it has bounced off an enemy. Four rows: 2, 3.5, 5 and 7.
+    "cannonball_2":  (9000200, 2.0,                   1.2,   0.5,    4,        400,   4.0),
+    "cannonball_3":  (9000201, 3.5,                   1.2,   0.5,    4,        400,   4.0),
+    "cannonball_5":  (9000202, 5.0,                   1.2,   0.5,    4,        600,   6.0),
+    "cannonball_7":  (9000203, 7.0,                   1.2,   0.5,    4,        600,   6.0),
+    # the wave where the ball lands ('PhysicalShockwavePlayer': 12 u, damage 0): it throws what it reaches
+    # and does not hurt (the least an attack row can do here)
+    "shockwave":     (9000204, 0.05,                  1.5,   0.5,    4,        400,   6.0),
 }
 PELLET_ID = 9000140         # one shotgun pellet. Shotgun.Shoot sends twelve; Projectile deals damage / 4 = a quarter of a revolver shot
 # Dark Souls takes a flat defence off every hit, which punishes many small hits. Measured on a hollow that
@@ -97,6 +118,7 @@ COIN_ALT_ID, COIN_ALT_MAX = 9000300, 96
 MORE_SHOTS += [(COIN_ALT_ID + q, q / 4.0, 20133, 1, 0.3, "coin_alt") for q in range(4, COIN_ALT_MAX + 1)]
 PUNCH_SPEED = 30.0          # m/s: slow enough to exist for four frames. At the revolver's 300 m/s the punch
                             # lived 7 ms, less than a frame, and never hit anything (v0.49: 11 punches in reach, no damage)
+WIDE_LIFE = 0.1             # seconds a wide row is there for: six frames at 60 a second
 PUNCH_RADIUS = 0.5          # the 1-unit sphere ULTRAKILL sweeps when the straight line misses
 BEAM_SPEED = 300.0          # m/s, as close to hitscan as a projectile gets
 BEAM_RANGE = 150.0
@@ -205,10 +227,14 @@ for rid, mult, reach, radius, level, poise, knock in ARM_ROWS.values():
     # The hit effect: the game's large burst (20236) suits the wide rows, which are explosions; on the
     # arm's-length ones it whited out the whole view for a third of a second (seen in a v0.59 recording),
     # so those use the small spark the plain punch has.
+    # How long a row is there for: the arm's-length ones go their reach at the punch's speed; a wide one (the
+    # Knuckleblaster's wave) takes WIDE_LIFE over its reach, so that it is there for several frames.
+    life = WIDE_LIFE if radius > 1.0 else reach / PUNCH_SPEED
+    speed = reach / life
     for k, v in (("atkId_Bullet", rid), ("sfxId_Bullet", -1), ("sfxId_Hit", 20236 if radius > 1.0 else 20230), ("sfxId_Flick", -1),
-                 ("initVellocity", PUNCH_SPEED), ("maxVellocity", PUNCH_SPEED), ("minVellocity", PUNCH_SPEED),
+                 ("initVellocity", speed), ("maxVellocity", speed), ("minVellocity", speed),
                  ("accelInRange", 0.0), ("accelOutRange", 0.0), ("gravityInRange", 0.0), ("gravityOutRange", 0.0),
-                 ("dist", reach), ("life", reach / PUNCH_SPEED), ("hitRadius", radius), ("isPenetrate", 1 if radius > 1.0 else 0)):
+                 ("dist", reach), ("life", life), ("hitRadius", radius), ("isPenetrate", 1 if radius > 1.0 else 0)):
         bul.set(rid, k, v)
     beh.set(rid, "refId", rid)
     beh.set(rid, "variationId", 0)
@@ -247,7 +273,8 @@ for rid in OWN_ROWS:
 # the kick, row 1100, has 500 against a throwing knife's 10).
 #   Not stopped by a shield: explosions, both railcannons, the Piercer's charged shots, a coin's shot from behind.
 #   The Knuckleblaster's punch takes a kick's worth of stamina: one that is blocked breaks the guard.
-UNBLOCKABLE = [PIERCER_ID, 9000161, 9000170, 9000171] + [ARM_ROWS[k][0] for k in ("explosion", "explosion_super", "explosion_pump", "explosion_malicious", "explosion_ultra")] \
+UNBLOCKABLE = [PIERCER_ID, 9000161, 9000170, 9000171] + [ARM_ROWS[k][0] for k in ("explosion", "explosion_super", "explosion_pump", "explosion_malicious", "explosion_ultra",
+                                                                          "explosion_big", "explosion_super_big", "shockwave")] \
     + [COIN_BACK_ID + i for i in range(len(COIN_POWERS))] + [COIN_ALT_ID + q for q in range(4, COIN_ALT_MAX + 1)]
 for rid in UNBLOCKABLE:
     atk.set(rid, "disableGuard", 1)
@@ -287,11 +314,11 @@ assert chk["AtkParam_Pc"].get(COIN_ID + 1, "atkPhys") == REVOLVER_DAMAGE * 3 and
 assert abs(chk["Bullet"].get(PUNCH_ID, "life") - PUNCH_REACH / PUNCH_SPEED) < 1e-4 and chk["Bullet"].get(PUNCH_ID, "initVellocity") == PUNCH_SPEED
 assert chk["AtkParam_Pc"].get(ARM_ROWS["knuckle"][0], "dmgLevel") == 4 and chk["Bullet"].get(ARM_ROWS["blast"][0], "hitRadius") == 6.0
 assert chk["Bullet"].get(PELLET_ID, "initVellocity") == PELLET_SPEED and chk["AtkParam_Pc"].get(PELLET_ID, "atkPhys") == PELLET_DAMAGE
-assert chk["Bullet"].get(SHARP_ID, "isPenetrate") == 1 and chk["Bullet"].get(ARM_ROWS["explosion_super"][0], "hitRadius") == 6.0
+assert chk["Bullet"].get(SHARP_ID, "isPenetrate") == 1 and chk["Bullet"].get(ARM_ROWS["explosion_super"][0], "hitRadius") == 0.5
 assert all(chk["Bullet"].get(r, "sfxId_Bullet") == NO_EFFECT for r in OWN_ROWS)
 assert all(chk["Bullet"].get(r, "sfxId_Hit") == NO_EFFECT and chk["Bullet"].get(r, "isAttackSFX") == 0 and chk["Bullet"].get(r, "Material_AttackMaterial") == 6 for r in OWN_ROWS)
 assert chk["AtkParam_Pc"].get(9000170, "atkPhys") == REVOLVER_DAMAGE * 8 and chk["Bullet"].get(9000161, "isPenetrate") == 1 and chk["Bullet"].get(9000171, "isPenetrate") == 0
-assert chk["Bullet"].get(ARM_ROWS["explosion_malicious"][0], "hitRadius") == 6.75 and chk["BehaviorParam_PC"].get(9000162, "refId") == 9000162
+assert chk["Bullet"].get(ARM_ROWS["explosion_malicious"][0], "hitRadius") == 0.5 and chk["BehaviorParam_PC"].get(9000162, "refId") == 9000162
 assert all(chk["AtkParam_Pc"].get(r, "disableGuard") == 1 for r in UNBLOCKABLE) and chk["AtkParam_Pc"].get(REVOLVER_ID, "disableGuard") == 0
 assert chk["AtkParam_Pc"].get(ARM_ROWS["knuckle"][0], "atkStam") == 500 and chk["AtkParam_Pc"].get(COIN_BACK_ID + 2, "atkPhys") == REVOLVER_DAMAGE * 4
 assert chk["Bullet"].get(PUNCH_ID, "dist") == PUNCH_REACH and chk["AtkParam_Pc"].get(PUNCH_ID, "atkPhys") == PUNCH_DAMAGE
@@ -299,7 +326,7 @@ assert all(chk["BehaviorParam_PC"].get(r, "stamina") == 0 for r in chk["Behavior
 assert chk["SpEffectParam"].get(HEAL_SPEFFECT, "changeHpPoint") == -HEAL_PER_HIT
 assert chk["Bullet"].get(600, "initVellocity") == SHOT_SPEED
 assert chk["AtkParam_Pc"].get(COIN_ALT_ID + 49, "atkPhys") == int(REVOLVER_DAMAGE * 12.25) and chk["Bullet"].get(COIN_ALT_ID + 96, "isPenetrate") == 1
-assert chk["Bullet"].get(ARM_ROWS["explosion_ultra"][0], "hitRadius") == 12.0 and chk["AtkParam_Pc"].get(COIN_ALT_ID + 4, "disableGuard") == 1
+assert chk["Bullet"].get(ARM_ROWS["explosion_ultra"][0], "hitRadius") == 0.5 and chk["AtkParam_Pc"].get(COIN_ALT_ID + 4, "disableGuard") == 1
 assert chk["EquipParamProtector"].get(901000, "equipModelId") == (V1_MODEL_ID if v1_body else 0) and chk["EquipParamProtector"].get(900000, "equipModelId") == 0
 assert chk["EquipParamProtector"].get(901000, "invisibleFlag12") == (1 if v1_body else 0) and chk["EquipParamProtector"].get(903000, "equipModelGender") == (0 if v1_body else 3)
 assert chk["AtkParam_Pc"].get(ARM_ROWS["whiplash"][0], "atkPhys") == REVOLVER_DAMAGE // 2 and chk["BehaviorParam_PC"].get(9000190, "refId") == 9000190

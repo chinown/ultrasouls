@@ -17,6 +17,11 @@ void sound_stop(int voice);
 // Everything is scaled by this (0..1). The default is 0.2.
 void sound_master(float volume);
 
+// ULTRAKILL's TimeController.SetAllPitch: every voice plays this many times its own speed (1: as it is; near
+// 0: it stands still, silent), except those on a channel numbered `exempt_from` or above, which is where
+// what ULTRAKILL plays outside its slowed mixers goes (the death screen's own sounds).
+void sound_all_pitch(float pitch, int exempt_from);
+
 // How many times the output ran out of queued audio (an audible dropout), for the log.
 int sound_underruns();
 

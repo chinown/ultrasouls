@@ -2,6 +2,10 @@
 // so the result can be looked at without starting the game.
 //   g++ -O2 -o build/hud_test.exe dll/hud_test.cpp dll/hud.cpp -ld3d11 -ldxgi
 //   build/hud_test.exe build/ultrasouls_assets.bin build/hud_test
+//   build/hud_test.exe build/ultrasouls_assets.bin build/hud_test title picture.bmp ...
+//     the title menu: each picture (a 24 or 32 bit BMP of Dark Souls' title screen as the game draws it) is
+//     dressed as the DLL would dress it and written as <prefix>_title_<n>.bmp, with what was read off it and
+//     where the pointer is sent from the middle of each button
 #include <windows.h>
 #include <d3d11.h>
 #include <cmath>
@@ -55,12 +59,44 @@ static bool save_bmp(ID3D11Device *dev, ID3D11DeviceContext *ctx, ID3D11Texture2
     return true;
 }
 
+// A BMP as rows of RGBA from the top (24 or 32 bits a pixel, not compressed).
+static bool load_bmp(const char *path, std::vector<uint8_t> &rgba, UINT &w, UINT &h) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return false;
+    BITMAPFILEHEADER fh;
+    BITMAPINFOHEADER ih;
+    bool ok = fread(&fh, sizeof(fh), 1, f) == 1 && fread(&ih, sizeof(ih), 1, f) == 1 && fh.bfType == 0x4D42 && ih.biCompression != BI_RLE8 &&
+              (ih.biBitCount == 24 || ih.biBitCount == 32) && ih.biWidth > 0;
+    if (ok) {
+        w = (UINT)ih.biWidth;
+        h = (UINT)(ih.biHeight < 0 ? -ih.biHeight : ih.biHeight);
+        UINT bpp = ih.biBitCount / 8, pitch = (w * bpp + 3) & ~3u;
+        std::vector<uint8_t> line(pitch);
+        rgba.assign((size_t)w * h * 4, 255);
+        fseek(f, (long)fh.bfOffBits, SEEK_SET);
+        for (UINT r = 0; r < h && ok; r++) {
+            ok = fread(line.data(), pitch, 1, f) == 1;
+            uint8_t *dst = rgba.data() + (size_t)(ih.biHeight < 0 ? r : h - 1 - r) * w * 4;
+            for (UINT x = 0; x < w; x++) {
+                dst[x * 4 + 0] = line[x * bpp + 2];
+                dst[x * 4 + 1] = line[x * bpp + 1];
+                dst[x * 4 + 2] = line[x * bpp + 0];
+            }
+        }
+    }
+    fclose(f);
+    return ok;
+}
+
 int main(int argc, char **argv) {
     if (argc < 3) {
-        printf("usage: hud_test <pack file> <output prefix> [width height]\n");
+        printf("usage: hud_test <pack file> <output prefix> [width height | title picture.bmp ...]\n");
         return 2;
     }
-    UINT w = argc >= 5 ? (UINT)atoi(argv[3]) : 1920, h = argc >= 5 ? (UINT)atoi(argv[4]) : 1080;
+    bool title = argc >= 5 && !strcmp(argv[3], "title");
+    UINT w = argc >= 5 && !title ? (UINT)atoi(argv[3]) : 1920, h = argc >= 5 && !title ? (UINT)atoi(argv[4]) : 1080;
+    std::vector<uint8_t> picture;
+    if (title && !load_bmp(argv[4], picture, w, h)) { printf("cannot read %s\n", argv[4]); return 1; }
     ID3D11Device *dev = nullptr;
     ID3D11DeviceContext *ctx = nullptr;
     HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION, &dev, nullptr, &ctx);
@@ -81,6 +117,34 @@ int main(int argc, char **argv) {
 
     std::wstring pack(argv[1], argv[1] + strlen(argv[1]));
     if (!hud_init(dev, pack.c_str())) { printf("hud_init failed: %s\n", hud_error()); return 1; }
+
+    if (title) {
+        hud_title_column(true);                  // (the ini's title_column, which is off in the game until the column has been tried there)
+        for (int n = 4; n < argc; n++) {
+            UINT pw = 0, ph = 0;
+            if (!load_bmp(argv[n], picture, pw, ph) || pw != w || ph != h) { printf("%s: not a %u x %u BMP\n", argv[n], w, h); continue; }
+            ctx->UpdateSubresource(target, 0, nullptr, picture.data(), w * 4, 0);
+            static HudState ts;
+            ts = HudState();
+            ts.title = true;
+            ts.time = 100.0 * n;                 // far from the last picture: nothing of it is held over
+            ts.show_viewmodel = false;
+            snprintf(ts.title_note, sizeof(ts.title_note), "ULTRASOULS TEST READY");
+            hud_draw(dev, ctx, target, ts);
+            printf("%s: menu \"%s\"\n", argv[n], hud_title_state());
+            for (int i = 0; i < 4; i++) {
+                float ppu = fminf(w / 1280.0f, h / 720.0f), x = w * 0.5f + (-555.0f + 210.0f) * ppu, y = h * 0.5f - (70.0f - 75.0f * i - 35.0f) * ppu, x0 = x, y0 = y;
+                bool moved = hud_title_cursor((float)w, (float)h, &x, &y);
+                printf("  pointer on button %d (%.0f, %.0f) -> %s (%.0f, %.0f)\n", i, x0, y0, moved ? "sent to" : "left at", x, y);
+            }
+            float x = w * 0.5f, y = h * 0.75f;
+            bool moved = hud_title_cursor((float)w, (float)h, &x, &y);
+            printf("  pointer on Dark Souls' own rows -> %s (%.0f, %.0f)\n", moved ? "sent to" : "left at", x, y);
+            std::string path = std::string(argv[2]) + "_title_" + std::to_string(n - 4) + ".bmp";
+            printf("  %s: %s\n", path.c_str(), save_bmp(dev, ctx, target, path) ? "written" : "FAILED");
+        }
+        return 0;
+    }
 
     struct Shot {
         const char *name;
@@ -618,6 +682,55 @@ int main(int argc, char **argv) {
             }
             add("saw_%d", k++, s, 0.33f, 0.34f, 0.37f);
         }
+        // v0.82: the rocket launcher: at rest with a full clock (Freezeframe), the clock three quarters and a
+        // quarter full, drawing, firing (early and late), the S.R.S. Cannon with its cannonball half back, wound
+        // up most of the way (red, shaking), and at rest; rockets and a cannonball in the world
+        static const struct { const char *clip; float at; int var; float fill, alpha, charge; } rl[] = {
+            {nullptr, 0, 0, 1.0f, 1.0f, 0}, {nullptr, 0, 0, 0.75f, 1.0f, 0}, {nullptr, 0, 0, 0.25f, 1.0f, 0}, {"Equip", 0.3f, 0, 1.0f, 1.0f, 0},
+            {"Fire", 0.05f, 0, 1.0f, 1.0f, 0}, {"Fire", 0.6f, 0, 0.9f, 1.0f, 0}, {nullptr, 0, 1, 0.5f, 0.5f, 0}, {nullptr, 0, 1, 0.8f, 1.0f, 0.8f},
+            {nullptr, 0, 1, 1.0f, 1.0f, 0},
+        };
+        k = 0;
+        for (const auto &w : rl) {
+            s = HudState();
+            s.time = 198.0;
+            s.weapon = 4;
+            s.weapon_var = w.var;
+            s.revolver_clip = w.clip;
+            s.revolver_clip_start = w.clip ? 198.0 - w.at : -100.0;
+            s.clock_fill = w.fill;
+            s.clock_alpha = w.alpha;
+            s.srs_charge = w.charge;
+            const float blue[3] = {0.251f, 0.906f, 1.0f}, green[3] = {0.267f, 1.0f, 0.271f};
+            for (int i = 0; i < 3; i++) s.clock_rgb[i] = w.var ? green[i] + ((i == 0 ? 1.0f : 0.0f) - green[i]) * w.charge : blue[i];
+            s.cam_valid = true;
+            s.cam_tan_y = 0.8f;
+            s.cam_tan_x = 0.8f * 16.0f / 9.0f;
+            if (k == 0 || k == 8) {
+                aimed(s, "fx_rocket", -1.5f, -0.6f, 5.0f, 0.3f, 0.1f, 1, false, 0);
+                aimed(s, "fx_rocket", 1.0f, 0.8f, 6.0f, 1, 0, 0, false, 0);
+                aimed(s, "fx_rocket", -3.0f, 1.0f, 8.0f, -1, 0.5f, 0.2f, false, 0);
+                HudState::WorldMesh &cb = s.world_meshes[s.world_mesh_count++];
+                cb = {"fx_cannonball", {2.5f, -0.4f, 7.0f}, 0.5f, 0.7f, {0, 0}, {1, 1, 1, 1}, nullptr, 0};
+            }
+            add("rocket_%d", k++, s, 0.33f, 0.34f, 0.37f);
+        }
+    }
+
+    // v0.78, v0.79: ULTRAKILL's death: lines in the corner (0.8 s and 1.9 s in) over an empty picture and over a
+    // full one (the death shader), the black screen coming up (its flash), the black screen with the skull's
+    // first picture, and with its second and without the line about the key
+    {
+        static const float at[5] = {0.8f, 1.9f, 2.02f, 3.0f, 3.7f};
+        for (int k = 0; k < 5; k++) {
+            s = HudState();
+            s.time = 199.0;
+            s.death_time = at[k];
+            s.death_prompt = k != 4;
+            add("death_%d", k, s, 0.30f, 0.33f, 0.30f);
+            // the same over a picture with something in it (the launcher and its saws: see the loop at the end)
+            if (k < 2) add("death_glitch_%d", k, s, 0.30f, 0.33f, 0.30f);
+        }
     }
 
     // v0.73: blood on the screen after a heal, fresh and half gone
@@ -638,6 +751,9 @@ int main(int argc, char **argv) {
         warm.time -= 0.016;
         hud_draw(dev, ctx, target, warm);
         ctx->ClearRenderTargetView(rtv, shot.bg);
+        if (!strncmp(shot.name, "death_glitch", 12))
+            for (Shot &under : shots)
+                if (!strcmp(under.name, "saw_0")) hud_draw(dev, ctx, target, under.st);
         hud_draw(dev, ctx, target, shot.st);
         std::string path = std::string(argv[2]) + "_" + shot.name + ".bmp";
         printf("%s: %s\n", path.c_str(), save_bmp(dev, ctx, target, path) ? "written" : "FAILED");

@@ -235,6 +235,12 @@ class GameParam:
             name_off = new_strings_off + len(strings)
             strings += name.encode("shift_jis") + b"\0"
             table += struct.pack("<III", new_id, new_data_start + (n + j) * rs, name_off)
+        # The game finds a row by its id with a binary search, so the table has to be in order of id however the
+        # rows' data lies in the file. (Until v0.82 new rows went on the end of the table as they came. That
+        # held while it happened to: with nine more rows added, a revolver shot did 1 damage to a hollow and
+        # explosions none, the search for their attack rows going astray.)
+        entries = sorted((struct.unpack_from("<III", table, i * 12) for i in range(n + k)), key=lambda e: e[0])
+        table = bytearray(b"".join(struct.pack("<III", *e) for e in entries))
         head = bytearray(old[:0x30])
         struct.pack_into("<IH", head, 0, new_strings_off, new_data_start)
         struct.pack_into("<H", head, 0x0A, n + k)

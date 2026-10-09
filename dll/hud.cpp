@@ -120,11 +120,24 @@ struct UiDraw {
     UINT start, count;
     int add = 0;  // 1: added to the picture instead of laid over it
     int world = 0;  // 1: something of the game's world (a trail, a beam, a spark), which goes under the HUD's own panels
+    int fx = 0;     // 1: the whole picture, redrawn through the death shader
+};
+
+// Dark Souls' title menu as read off the picture (title_probe): the chosen one of its four rows (-1: none),
+// which entry each row shows (an index into TITLE_WORDS; -1 words that were not recognised, -2 an empty row),
+// and whether its arrows are up, which say that the list goes on above or below.
+struct TitleMenu {
+    int row = -1;
+    int items[4] = {-2, -2, -2, -2};
+    bool up = false, down = false;
 };
 
 struct Gfx {
     bool ready = false;
     std::string error;
+    // the death sequence's words (ultrasouls_text.txt): its lines, which of them are orange, the screen after
+    std::vector<std::string> death_lines, dead_lines;
+    std::vector<char> death_orange;
     std::vector<Tex> textures;
     std::vector<Sprite> sprites;
     std::vector<Font> fonts;
@@ -135,7 +148,13 @@ struct Gfx {
     float depth_a = 0, depth_b = 0;
 
     ID3D11VertexShader *ui_vs = nullptr, *mesh_vs = nullptr;
-    ID3D11PixelShader *ui_ps = nullptr, *mesh_ps = nullptr;
+    ID3D11PixelShader *ui_ps = nullptr, *mesh_ps = nullptr, *death_ps = nullptr, *menu_ps = nullptr;
+    ID3D11Texture2D *probe_tex = nullptr;    // the picture copied where it can be read, to tell the title screen by
+    TitleMenu title_menu;                    // the title menu as it is drawn: what was last read, or what is held over a gap
+    bool title_col = false;                  // it is drawn as ULTRAKILL's column of buttons (every row's words were read)
+    double title_good = -100.0;              // when every row's words were last read
+    ID3D11Texture2D *fx_tex = nullptr;       // the picture as it stood, for the death shader to read
+    ID3D11ShaderResourceView *fx_srv = nullptr;
     ID3D11InputLayout *ui_il = nullptr, *mesh_il = nullptr;
     ID3D11Buffer *ui_cb = nullptr, *mesh_cb = nullptr, *ui_vb = nullptr, *screen_vb = nullptr;
     ID3D11Texture2D *kept = nullptr;         // the frame kept aside during a parry's freeze
@@ -318,6 +337,45 @@ bool load_pack(ID3D11Device *dev, const wchar_t *path) {
 
 // The animated models' own pack ("USMDL001"; layout in tools/uk_models.py). Optional: without it the
 // revolver is drawn from the asset pack in its fixed pose.
+// What ULTRAKILL writes when the player dies, from the text file tools/uk_models.py makes: a section
+// [death] of lines that appear one by one (TextMeshPro's <color=orange> marks the warnings) and a section
+// [dead] for the screen after them.
+void load_text(const wchar_t *path) {
+    HANDLE f = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return;
+    LARGE_INTEGER size;
+    GetFileSizeEx(f, &size);
+    std::string data((size_t)(size.QuadPart < 65536 ? size.QuadPart : 65536), '\0');
+    DWORD got = 0;
+    BOOL read = ReadFile(f, &data[0], (DWORD)data.size(), &got, nullptr);
+    CloseHandle(f);
+    if (!read) return;
+    data.resize(got);
+    int section = 0;
+    size_t at = 0;
+    while (at <= data.size()) {
+        size_t end = data.find('\n', at);
+        if (end == std::string::npos) end = data.size();
+        std::string line = data.substr(at, end - at);
+        at = end + 1;
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line == "[death]") { section = 1; continue; }
+        if (line == "[dead]") { section = 2; continue; }
+        if (section == 1) {
+            const std::string open = "<color=orange>", close = "</color>";
+            bool orange = line.compare(0, open.size(), open) == 0;
+            for (const std::string &tag : {open, close})
+                for (size_t k; (k = line.find(tag)) != std::string::npos;) line.erase(k, tag.size());
+            g.death_lines.push_back(line);
+            g.death_orange.push_back(orange ? 1 : 0);
+        } else if (section == 2) {
+            g.dead_lines.push_back(line);
+        }
+    }
+    while (!g.death_lines.empty() && g.death_lines.back().empty()) { g.death_lines.pop_back(); g.death_orange.pop_back(); }
+    while (!g.dead_lines.empty() && g.dead_lines.back().empty()) g.dead_lines.pop_back();
+}
+
 bool load_models(ID3D11Device *dev, const wchar_t *path) {
     HANDLE f = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
     if (f == INVALID_HANDLE_VALUE) return false;
@@ -506,6 +564,69 @@ float4 ps(VO i) : SV_TARGET {
 }
 )";
 
+// The picture while the player dies: ULTRAKILL's post-process shader ('ULTRAKILL/PostProcessV2') with its DEAD
+// keyword, written back out of the compiled program (build/_dead_shader.py disassembles it). Two numbers
+// drive it, and DeathSequence runs both from 0 to 1 over its two seconds: "_Deathness" and "_Sharpness".
+//   Every point of the picture is read through a glitch. The screen is cut into 12.8 coarse rows and 204.8
+//   fine ones, each with a number from 0 to 1 that changes with the clock. A row is "broken" when its coarse
+//   number is under deathness^2, fully so when its fine number is also under the root of the deathness.
+//   A broken row is pushed sideways by the sine of (time x deathness^4 / 10000, more or less by row) and
+//   read a second time up to a twentieth of the screen lower; red comes from the first reading (x 1.1),
+//   green and blue from the second, and in a quarter x deathness^2 of the screen's sixteen blocks green
+//   and blue are cut down (to 0.75 - 0.55 deathness^2), which is the red cast.
+//   Then the sharpening: the point, plus 100 x sharpness^3 times its difference from the mean of its four
+//   neighbours (each read through the glitch too). At full sharpness every edge is blown out.
+// Left out of the port: the shader's ordinary work, which goes on under it (dithering, colour depth, gamma).
+const char DEATH_SHADER[] = R"(
+cbuffer C : register(b0) { float4 par; float4 px; }         // par: deathness, sharpness, time, -. px: one pixel in uv
+Texture2D tex : register(t0);
+SamplerState smp : register(s0);
+struct VO { float4 pos : SV_POSITION; float2 uv : TEXCOORD0; float4 col : COLOR0; float invz : TEXCOORD1; };
+float hash3(float3 v) {
+    float3 p = 17.0 * frac(v * 0.3183099 + float3(0.71, 0.113, 0.419));
+    return frac(p.x * p.y * p.z * (p.x + p.y + p.z));
+}
+float3 glitch(float2 p) {
+    float D = saturate(par.x), D2 = D * D, T = par.z;
+    float t1 = T * 0.0001, t2 = T * 0.00005, t3 = T * 0.00001;
+    float2 a = float2(t1, floor(p.y * 12.8 + 0.00001) * 10.0 + t1), b = float2(t2, floor(p.y * 204.8 + 0.00001) * 10.0 + t2);
+    float hA = hash3(a.xyx), hB = hash3(b.xyx);
+    float m = 1.0 - saturate(0.5 * ceil(hB - sqrt(D)) + ceil(hA - (D2 - 0.001)));
+    float w = saturate(lerp(sin(hA * 37.189), 1.0, 1.0 / 3.0) + lerp(sin(hB * 37.189), 1.0, 1.0 / 3.0)) - 1.0;
+    float2 q = float2(p.x + sin((1.0 + m * w) * (m * T) * D2 * D2 * 0.0001), p.y);
+    float hC = hash3(float3(floor(q * 4.0 + 0.00001) * 10.0 + t3, t3));
+    float block = max(ceil(hC - (1.0 - 0.25 * D2)), 0.0);
+    float2 q2 = float2(q.x, q.y + 0.1 * frac(m * ceil(hB * 5.0) * 0.1));
+    float3 A = tex.Sample(smp, clamp(q, 0.0, 0.9999)).rgb, B = tex.Sample(smp, clamp(q2, 0.0, 0.9999)).rgb;
+    float3 c = float3(1.1 * A.r, B.g, B.b);
+    c = lerp(c, c * float3(1.0, 0.75 - 0.55 * D2, 0.75 - 0.55 * D2), block);
+    c.r = c.g < 0.9 ? max(c.g, c.r) : c.r;
+    return lerp(A, c, ceil(m));
+}
+float4 ps(VO i) : SV_TARGET {
+    float3 c = glitch(i.uv);
+    float3 n = glitch(saturate(i.uv + float2(px.x, 0))) + glitch(saturate(i.uv - float2(px.x, 0))) + glitch(saturate(i.uv + float2(0, px.y))) +
+               glitch(saturate(i.uv - float2(0, px.y)));
+    float S = par.y;
+    return float4(saturate(c + (c - n * 0.25) * S * S * S * 100.0), 1.0);
+}
+)";
+
+// The chosen row of the title menu, redrawn as ULTRAKILL's chosen button: Dark Souls writes it in white on a
+// dark orange bar; here the bar and all round it are white and the words black.
+const char MENU_SHADER[] = R"(
+cbuffer C : register(b0) { float4 par; float4 px; }
+Texture2D tex : register(t0);
+SamplerState smp : register(s0);
+struct VO { float4 pos : SV_POSITION; float2 uv : TEXCOORD0; float4 col : COLOR0; float invz : TEXCOORD1; };
+float4 ps(VO i) : SV_TARGET {
+    float3 c = tex.Sample(smp, i.pos.xy * px.xy).rgb;
+    float words = smoothstep(0.25, 0.7, c.b);
+    float v = 1.0 - words;
+    return float4(v, v, v, 1.0);
+}
+)";
+
 typedef HRESULT(WINAPI *CompileFn)(LPCVOID, SIZE_T, LPCSTR, const void *, void *, LPCSTR, LPCSTR, UINT, UINT, ID3DBlob **, ID3DBlob **);
 
 ID3DBlob *compile(CompileFn fn, const char *src, size_t len, const char *entry, const char *profile) {
@@ -530,6 +651,15 @@ bool create_pipeline(ID3D11Device *dev) {
     if (!vs || !ps) return false;
     dev->CreateVertexShader(vs->GetBufferPointer(), vs->GetBufferSize(), nullptr, &g.ui_vs);
     dev->CreatePixelShader(ps->GetBufferPointer(), ps->GetBufferSize(), nullptr, &g.ui_ps);
+    if (ID3DBlob *dps = compile(fn, DEATH_SHADER, sizeof(DEATH_SHADER) - 1, "ps", "ps_4_0")) {
+        dev->CreatePixelShader(dps->GetBufferPointer(), dps->GetBufferSize(), nullptr, &g.death_ps);
+        dps->Release();
+    }
+    if (ID3DBlob *mps = compile(fn, MENU_SHADER, sizeof(MENU_SHADER) - 1, "ps", "ps_4_0")) {
+        dev->CreatePixelShader(mps->GetBufferPointer(), mps->GetBufferSize(), nullptr, &g.menu_ps);
+        mps->Release();
+    }
+    g.error.clear();                         // (the death shader is not needed for the rest to work)
     const D3D11_INPUT_ELEMENT_DESC ui_layout[] = {
         {"POSITION", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0},
         {"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 16, D3D11_INPUT_PER_VERTEX_DATA, 0},
@@ -705,6 +835,8 @@ struct Color {
 
 int g_ui_add = 0;        // what push_quad marks its quads with: 1 while the additive trails are being built
 int g_ui_world = 0;      // and 1 while what is being built belongs to the world and not to the HUD
+bool g_title_column = false;   // the title menu as ULTRAKILL's column of buttons (v0.83, not yet tried in the game) and not as Dark Souls' rows in place
+int g_ui_fx = 0;         // 1 for the one quad that redraws the picture through the death shader, 2 through the title menu's
 void push_quad(const Surface &sf, const Xf &xf, int tex, int sdf, const float lx[4], const float ly[4], const float u[4], const float v[4], Color c) {
     // corners in order: (0) bottom-left, (1) top-left, (2) top-right, (3) bottom-right
     UiVert q[4];
@@ -723,10 +855,11 @@ void push_quad(const Surface &sf, const Xf &xf, int tex, int sdf, const float lx
     UINT start = (UINT)g.verts.size();
     const int order[6] = {0, 1, 2, 0, 2, 3};
     for (int k : order) g.verts.push_back(q[k]);
-    if (!g.draws.empty() && g.draws.back().tex == tex && g.draws.back().sdf == sdf && g.draws.back().add == g_ui_add && g.draws.back().world == g_ui_world)
+    if (!g.draws.empty() && g.draws.back().tex == tex && g.draws.back().sdf == sdf && g.draws.back().add == g_ui_add && g.draws.back().world == g_ui_world &&
+        !g_ui_fx && !g.draws.back().fx)
         g.draws.back().count += 6;
     else
-        g.draws.push_back({tex, sdf, start, 6, g_ui_add, g_ui_world});
+        g.draws.push_back({tex, sdf, start, 6, g_ui_add, g_ui_world, g_ui_fx});
 }
 
 // Marks the vertices pushed since `first` as being in the game's world, `z` metres along the view.
@@ -869,7 +1002,302 @@ bool g_whip_hand_known = false;
 const char *g_skip_mesh = nullptr;       // a mesh draw_model leaves out, by name (the whiplash's hook while it is thrown)
 const char *g_only_mesh = nullptr;       // the one mesh draw_model draws, by name (the Overheat's glowing blade, in a pass of its own)
 
+// ULTRAKILL's death, on its screen-space canvas (reference 1280 x 720, "expand").
+//   For two seconds the picture goes through the death shader (above) and 'DeathSequence/Text (TMP)' writes
+//   its lines over it: 16 units high in the HUD's own font, from the top left corner, 50 units in from every
+//   edge; red, the warnings orange. TextAppearByLines shows one more every 0.05 s.
+//   Then 'BlackScreen':
+//     the 'crtbg' picture in (0.05, 0.05, 0.05) over everything;
+//     'YouDiedText', a legacy Text set to "best fit" in a box the width of the canvas and 40 short of its
+//     height, centred: its seven lines (the first and the last have words) are made as large as fills the
+//     box, which is 97 units a line on a 720-unit canvas, so "[YOU ARE DEAD]" stands across the top and the
+//     line about the key across the bottom (measured on Davi's screenshot of the game: 98);
+//     'LaughingSkull', half the canvas's height square in the middle, its animation changing between its
+//     two pictures every half second of a 1.017 s loop (the DLL plays its laugh as the second comes up);
+//     'Flash': a red panel the size of the canvas that masks the 'ISeeYou' picture and is closed at once, top
+//     and bottom first, by HudOpenEffect (speed 30): its height goes down at 30 x (what is left + 0.1) a
+//     second, which takes 0.08 s.
+void build_death(const HudState &st, float screen_w, float screen_h) {
+    Surface sc{};
+    sc.world = false;
+    sc.screen_w = screen_w;
+    sc.screen_h = screen_h;
+    sc.px_per_unit = fminf(screen_w / 1280.0f, screen_h / 720.0f);
+    float hw = screen_w * 0.5f / sc.px_per_unit, hh = screen_h * 0.5f / sc.px_per_unit;
+    Xf id{0, 0, 1, 1, 0};
+    float line_scale = !g.fonts.empty() && g.fonts[0].point > 0 && g.fonts[0].line > 0 ? g.fonts[0].line / g.fonts[0].point : 1.17f;
+    if (st.death_time < 2.0f) {
+        g_ui_fx = 1;
+        rect_quad(sc, id, -1, -hw, -hh, hw, hh, 0, 0, 1, 1, {1, 1, 1, 1});
+        g_ui_fx = 0;
+        int shown = (int)(st.death_time / 0.05f) + 1, count = (int)g.death_lines.size();
+        if (shown > count) shown = count;
+        float lh = 16.0f * line_scale;
+        for (int i = 0; i < shown; i++) {
+            Box row{id, -hw + 50.0f, hh - 50.0f - lh * (i + 1), hw - 50.0f, hh - 50.0f - lh * i};
+            if (row.y1 < -hh) break;
+            text(sc, row, g.death_lines[i].c_str(), 16.0f, g.death_orange[i] ? Color{1.0f, 0.5f, 0.0f, 1.0f} : Color{1.0f, 0.0f, 0.0f, 1.0f}, 0);
+        }
+        return;
+    }
+    int bg = g.sprite("crtbg");
+    if (bg >= 0) rect_quad(sc, id, g.sprites[bg].tex, -hw, -hh, hw, hh, 0, 0, 1, 1, {0.05f, 0.05f, 0.05f, 1.0f});
+    else rect_quad(sc, id, -1, -hw, -hh, hw, hh, 0, 0, 1, 1, {0.0025f, 0.0025f, 0.0025f, 1.0f});
+    {
+        // best fit: the size at which the lines fill the box's height, or its width if that is less
+        int count = (int)g.dead_lines.size();
+        size_t widest = 1;
+        for (const std::string &l : g.dead_lines) widest = l.size() > widest ? l.size() : widest;
+        float box_h = hh * 2.0f - 40.0f, size = count > 0 ? box_h / count : 14.0f, advance = 0.6f;
+        if (!g.fonts.empty() && g.fonts[0].point > 0)
+            if (const Glyph *gl = g.fonts[0].find('M')) advance = gl->adv / g.fonts[0].point;
+        if (advance > 0 && size * advance * widest > hw * 2.0f) size = hw * 2.0f / (advance * widest);
+        if (size > 200.0f) size = 200.0f;
+        float top = size * count * 0.5f;
+        for (int i = 0; i < count; i++) {
+            if (g.dead_lines[i].empty() || (i == count - 1 && count > 1 && !st.death_prompt)) continue;
+            Box row{id, -hw, top - size * (i + 1), hw, top - size * i};
+            text(sc, row, g.dead_lines[i].c_str(), size, {1, 1, 1, 1}, 1);
+        }
+    }
+    {
+        float loop = fmodf(st.death_time - 2.0f, 61.0f / 60.0f);
+        int skull = g.sprite(loop >= 0.5f && loop < 1.0f ? "SkullFrameDoubleB" : "SkullFrameDoubleA");
+        if (skull >= 0) rect_quad(sc, id, g.sprites[skull].tex, -hh * 0.5f, -hh * 0.5f, hh * 0.5f, hh * 0.5f, 0, 0, 1, 1, {1, 1, 1, 1});
+    }
+    float open = 1.1f * expf(-30.0f * (st.death_time - 2.0f)) - 0.1f;
+    if (open > 0) {
+        int pic = g.sprite("ISeeYou");
+        float h = 360.0f * open;
+        rect_quad(sc, id, -1, -640.0f, -h, 640.0f, h, 0, 0, 1, 1, {1, 0, 0, 1});
+        if (pic >= 0) rect_quad(sc, id, g.sprites[pic].tex, -640.0f, -h, 640.0f, h, 0, 0.5f - 0.5f * open, 1, 0.5f + 0.5f * open, {1, 1, 1, 1});
+    }
+}
+
+// Dark Souls' title screen, told by the picture itself (measured on a 1920 x 1080 one, as shares of its size):
+//   its logo is white letters between 36% and 55% of the way down, from 7% to 92% across, on black, with
+//   "REMASTERED" under it down to 64%; a line across at 45% is about a third white, one at 30% all black;
+//   its menu is four rows in the middle, 3.47% of the height apart, the first centred 73.15% of the way down,
+//   the chosen one on a dark orange bar (98, 46, 12) from 40.7% to 59.3% across and 3.1% tall;
+//   a notice (the offline one, the "not closed properly" one) is a grey box over the middle: the two points
+//   at 35% and 65% across, 56% down, are black without one.
+// The words of a row are told by their shape. They are centred, white (grey in a row at the edge of the list)
+// and, at 1080 lines, within 13 pixels of the row's middle line; the blue of the picture alone separates them
+// from the black and from the orange bar. Measured there, in pixels (they are scaled by the height):
+//   Continue    104 wide, one word
+//   System       81 wide, one word
+//   Log In       73 wide, the gap between its words right of the middle (7 to 15)
+//   Load Game   132 wide, its first word 57, the gap left of the middle (-8 to 1)
+//   New Game    125 wide, its first word 50, and nothing of it lower than 6 under the middle line
+//   Quit Game   122 wide, its first word 47, the tail of its Q down to 10
+// (a gap between words is 9 to 11 wide, one between letters under 5). Two arrows, at 67% and 87% of the way
+// down, are there while the list goes on above or below.
+// Returns whether the title screen is up with no notice over it, and in `menu` what its menu shows.
+const char *const TITLE_WORDS[6] = {"CONTINUE", "LOAD GAME", "NEW GAME", "SYSTEM", "LOG IN", "QUIT GAME"};
+const float TITLE_ROW0 = 0.7315f, TITLE_ROW_STEP = 0.03472f;      // the rows' middle lines, as shares of the height
+const float TITLE_ARROW_UP = 0.6704f, TITLE_ARROW_DOWN = 0.8736f; // and the arrows'
+
+bool title_probe(ID3D11Device *dev, ID3D11DeviceContext *ctx, ID3D11Texture2D *target, const D3D11_TEXTURE2D_DESC &td, TitleMenu &menu) {
+    menu = TitleMenu();
+    int &row = menu.row;
+    bool bgra = td.Format == DXGI_FORMAT_B8G8R8A8_UNORM || td.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB || td.Format == DXGI_FORMAT_B8G8R8A8_TYPELESS;
+    bool rgba = td.Format == DXGI_FORMAT_R8G8B8A8_UNORM || td.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB || td.Format == DXGI_FORMAT_R8G8B8A8_TYPELESS;
+    if (td.SampleDesc.Count != 1 || (!bgra && !rgba) || td.Width < 320 || td.Height < 180) return false;
+    D3D11_TEXTURE2D_DESC pd{};
+    if (g.probe_tex) g.probe_tex->GetDesc(&pd);
+    if (!g.probe_tex || pd.Width != td.Width || pd.Height != td.Height || pd.Format != td.Format) {
+        if (g.probe_tex) g.probe_tex->Release();
+        g.probe_tex = nullptr;
+        pd = td;
+        pd.BindFlags = 0;
+        pd.Usage = D3D11_USAGE_STAGING;
+        pd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        pd.MiscFlags = 0;
+        if (FAILED(dev->CreateTexture2D(&pd, nullptr, &g.probe_tex))) return false;
+    }
+    ctx->CopyResource(g.probe_tex, target);
+    D3D11_MAPPED_SUBRESOURCE ms;
+    if (FAILED(ctx->Map(g.probe_tex, 0, D3D11_MAP_READ, 0, &ms))) return false;
+    auto px = [&](float fx, float fy, int *rgb) {
+        int x = (int)(fx * td.Width), y = (int)(fy * td.Height);
+        x = x < 0 ? 0 : x >= (int)td.Width ? (int)td.Width - 1 : x;
+        y = y < 0 ? 0 : y >= (int)td.Height ? (int)td.Height - 1 : y;
+        const uint8_t *p = (const uint8_t *)ms.pData + (size_t)y * ms.RowPitch + (size_t)x * 4;
+        rgb[0] = p[bgra ? 2 : 0];
+        rgb[1] = p[1];
+        rgb[2] = p[bgra ? 0 : 2];
+    };
+    int c[3], white = 0, above = 0, n = 0;
+    for (float fx = 0.19f; fx < 0.81f; fx += 0.002f, n++) {
+        px(fx, 0.45f, c);
+        if (c[0] > 200 && c[1] > 200 && c[2] > 200) white++;
+        px(fx, 0.30f, c);
+        if (c[0] > 60 || c[1] > 60 || c[2] > 60) above++;
+    }
+    int a[3], b[3];
+    px(0.35f, 0.56f, a);
+    px(0.65f, 0.56f, b);
+    bool notice = a[0] + a[1] + a[2] > 12 || b[0] + b[1] + b[2] > 12;
+    bool ok = white * 100 > n * 15 && white * 100 < n * 60 && above * 100 < n * 2 && !notice;
+    const float u = td.Height / 1080.0f;
+    const int xc = (int)td.Width / 2;
+    auto blue = [&](int x, int y) { return (int)((const uint8_t *)ms.pData + (size_t)y * ms.RowPitch + (size_t)x * 4)[bgra ? 0 : 2]; };
+    auto words = [&](int i) -> int {
+        const int yc = (int)((TITLE_ROW0 + TITLE_ROW_STEP * i) * td.Height), hy = (int)(13.0f * u + 0.5f), hx = (int)(100.0f * u + 0.5f);
+        static int low[1024];                    // per column: how far under the middle line its lowest ink is
+        if (yc - hy < 0 || yc + hy >= (int)td.Height || xc - hx < 0 || xc + hx >= (int)td.Width || 2 * hx + 1 > 1024) return -1;
+        int top = 0;
+        for (int y = yc - hy; y <= yc + hy; y++)
+            for (int x = xc - hx; x <= xc + hx; x++) top = blue(x, y) > top ? blue(x, y) : top;
+        if (top < 60) return -2;
+        const int thr = top * 45 / 100, none = -1000;
+        int x0 = -1, x1 = -1;
+        for (int k = 0; k <= 2 * hx; k++) {
+            low[k] = none;
+            for (int y = yc + hy; y >= yc - hy; y--)
+                if (blue(xc - hx + k, y) >= thr) { low[k] = y - yc; break; }
+            if (low[k] != none) {
+                if (x0 < 0) x0 = k;
+                x1 = k;
+            }
+        }
+        if (x0 < 0) return -2;
+        int gaps = 0, gap_at = 0, gap_len = 0, run = 0;
+        for (int k = x0; k <= x1; k++) {
+            if (low[k] == none) { run++; continue; }
+            if (run >= 7.0f * u) {
+                if (!gaps) { gap_at = k - run; gap_len = run; }
+                gaps++;
+            }
+            run = 0;
+        }
+        const float w = (x1 - x0 + 1) / u;
+        if (!gaps) return w > 94 && w < 114 ? 0 : w > 72 && w < 92 ? 3 : -1;
+        if (gaps > 1) return -1;
+        const float gap_mid = (gap_at + gap_len * 0.5f - hx) / u, first = (gap_at - x0) / u;
+        if (gap_mid > 3.0f) return w > 63 && w < 83 ? 4 : -1;
+        if (first >= 53.5f) return w > 122 && w < 142 ? 1 : -1;
+        if (first < 41.0f || w < 112 || w > 135) return -1;
+        int tail = none;
+        for (int k = x0; k < gap_at; k++) tail = low[k] > tail ? low[k] : tail;
+        return tail >= 8.5f * u ? 5 : 2;
+    };
+    auto arrow = [&](float fy) {
+        for (int y = (int)((fy - 0.004f) * td.Height); y <= (int)((fy + 0.004f) * td.Height); y++)
+            for (int x = xc - (int)(26.0f * u); x <= xc + (int)(26.0f * u); x++)
+                if (y >= 0 && y < (int)td.Height && x >= 0 && x < (int)td.Width && blue(x, y) > 40) return true;
+        return false;
+    };
+    if (ok) {
+        for (int i = 0; i < 4; i++) {
+            px(0.42f, TITLE_ROW0 + TITLE_ROW_STEP * i, c);
+            if (c[0] > 60 && c[0] < 150 && c[1] > 20 && c[1] < 90 && c[2] < 45 && c[0] - c[2] > 45) row = i;
+            menu.items[i] = words(i);
+        }
+        menu.up = arrow(TITLE_ARROW_UP);
+        menu.down = arrow(TITLE_ARROW_DOWN);
+    }
+    ctx->Unmap(g.probe_tex, 0);
+    return ok;
+}
+
+// What of the menu is drawn, from what was just read: ULTRAKILL's column of buttons while every row that has
+// words was recognised (two at the least: "PRESS ANY BUTTON" is one unknown row), and over a gap of up to
+// 0.35 s after that (rows moving as the list scrolls); otherwise the rows as Dark Souls draws them.
+volatile ULONGLONG g_title_col_tick = 0;     // GetTickCount64 of the last picture drawn with the column on it
+void title_settle(const TitleMenu &seen, double time) {
+    int known = 0, unknown = 0;
+    for (int item : seen.items) {
+        known += item >= 0;
+        unknown += item == -1;
+    }
+    if (known >= 2 && !unknown) {
+        g.title_menu = seen;
+        g.title_col = g_title_column;        // (only where the column is asked for: title_column in the ini)
+        g.title_good = time;
+    } else if (!(g.title_col && time >= g.title_good && time - g.title_good < 0.35)) {
+        g.title_menu = seen;
+        g.title_col = false;
+    }
+}
+
+// ULTRAKILL's four buttons ('Continue', 'Options', 'Credits', 'Quit' under 'LeftSide'): 420 x 70, their top
+// left corners 555 left of the middle and 70 above it, 75 apart; and the marks this draws for Dark Souls'
+// arrows, over the first and under the last.
+const float TITLE_BTN_X = -555.0f, TITLE_BTN_TOP = 70.0f, TITLE_BTN_W = 420.0f, TITLE_BTN_H = 70.0f, TITLE_BTN_STEP = 75.0f;
+const float TITLE_MARK_UP = TITLE_BTN_TOP + 17.0f, TITLE_MARK_DOWN = TITLE_BTN_TOP - 3 * TITLE_BTN_STEP - TITLE_BTN_H - 17.0f;
+
+// ULTRAKILL's main menu over Dark Souls' title screen ('Main Menu (1)' in its menu scene, on the 1280 x 720
+// canvas the HUD's flat parts use): the frame round the screen ('Border', 3 units in), the logo top left
+// ('Title': 'TextmodeLogo', 968 x 160 at 0.6, its top left corner 555 left of the middle and 290 above it)
+// and the picture of V1 on the right ('V1': 'TextmodeV1', 740 x 825 at 0.7; 320 right of the middle there,
+// 380 here and 22 up, to stand clear of the menu and of the line of small print along the bottom). Dark Souls' own logo and the lines of text in its corner are
+// blacked out. The menu is still Dark Souls' own, which answers the keys and the mouse. Its four rows are
+// blacked out too and drawn again as ULTRAKILL's four buttons in the left column, in the HUD's font
+// (size 40, capitals): the chosen one filled white with black words, as 'Continue' is there, the others
+// framed ('Round_BorderLargeBlack', sliced at 4.05). hud_title_cursor tells Dark Souls the pointer is on
+// row i while it is on button i. Where the rows' words cannot be read (another language, another layout) the
+// menu stays where Dark Souls draws it, as before v0.83: each row in a button's frame, the chosen one
+// redrawn white with black words, in Dark Souls' own letters.
+void build_title(const HudState &st, float screen_w, float screen_h) {
+    Surface sc{};
+    sc.world = false;
+    sc.screen_w = screen_w;
+    sc.screen_h = screen_h;
+    sc.px_per_unit = fminf(screen_w / 1280.0f, screen_h / 720.0f);
+    float hw = screen_w * 0.5f / sc.px_per_unit, hh = screen_h * 0.5f / sc.px_per_unit;
+    Xf id{0, 0, 1, 1, 0};
+    auto X = [&](float f) { return (f - 0.5f) * screen_w / sc.px_per_unit; };
+    auto Y = [&](float f) { return (0.5f - f) * screen_h / sc.px_per_unit; };
+    const Color black{0, 0, 0, 1}, white{1, 1, 1, 1};
+    rect_quad(sc, id, -1, X(0.04f), Y(0.665f), X(0.96f), Y(0.33f), 0, 0, 1, 1, black);
+    rect_quad(sc, id, -1, X(0.04f), Y(0.23f), X(0.26f), Y(0.05f), 0, 0, 1, 1, black);
+    if (g.title_col) rect_quad(sc, id, -1, X(0.38f), Y(0.892f), X(0.62f), Y(0.665f), 0, 0, 1, 1, black);
+    Box screen{{0, 0, 1, 1, 0}, -hw, -hh, hw, hh};
+    image_simple(sc, child(screen, rt(0.5f, 0.5f, 0.5f, 0.5f, 380, 22, 518, 577.5f)), g.sprite("TextmodeV1"), white, true);
+    image_sliced(sc, child(screen, rt(0, 0, 1, 1, 0, 0, -6, -6)), g.sprite("Round_BorderLarge"), white);
+    image_simple(sc, child(screen, rt(0.5f, 0.5f, 0.5f, 0.5f, -555, 290, 580.8f, 96, 0, 1)), g.sprite("TextmodeLogo"), white, true);
+    if (st.title_note[0]) text(sc, child(screen, rt(0.5f, 0.5f, 0.5f, 0.5f, -555, 188, 968, 24, 0, 1)), st.title_note, 20.0f, white, 0);
+    const TitleMenu &m = g.title_menu;
+    if (g.title_col) {
+        for (int i = 0; i < 4; i++) {
+            if (m.items[i] < 0) continue;
+            Box b = child(screen, rt(0.5f, 0.5f, 0.5f, 0.5f, TITLE_BTN_X, TITLE_BTN_TOP - TITLE_BTN_STEP * i, TITLE_BTN_W, TITLE_BTN_H, 0, 1));
+            image_sliced(sc, b, g.sprite(i == m.row ? "Round_FillLarge" : "Round_BorderLargeBlack"), white, 4.05f);
+            text(sc, child(b, rt(0, 0, 1, 1, 0, 1, 0, -2)), TITLE_WORDS[m.items[i]], 40.0f, i == m.row ? black : white, 1);
+        }
+        const float mx = TITLE_BTN_X + TITLE_BTN_W * 0.5f;
+        for (int k = 0; k < 2; k++) {
+            if (!(k ? m.down : m.up)) continue;
+            float base = k ? TITLE_MARK_DOWN + 6.0f : TITLE_MARK_UP - 6.0f, tip = k ? TITLE_MARK_DOWN - 6.0f : TITLE_MARK_UP + 6.0f;
+            const float lx[4] = {mx - 14.0f, mx, mx, mx + 14.0f}, ly[4] = {base, tip, tip, base}, uv[4] = {0, 0, 1, 1};
+            push_quad(sc, id, -1, 0, lx, ly, uv, uv, white);
+        }
+        return;
+    }
+    if (m.row < 0) return;
+    float half = 0.0153f * screen_h / sc.px_per_unit + 1.5f, x0 = X(0.4068f) - 6.0f, x1 = X(0.5927f) + 6.0f;
+    for (int i = 0; i < 4; i++) {
+        float yc = Y(TITLE_ROW0 + TITLE_ROW_STEP * i);
+        if (i == m.row && g.menu_ps) {
+            g_ui_fx = 2;
+            rect_quad(sc, id, -1, x0, yc - half, x1, yc + half, 0, 0, 1, 1, white);
+            g_ui_fx = 0;
+        }
+        Box frame{{0, 0, 1, 1, 0}, x0, yc - half, x1, yc + half};
+        image_sliced(sc, frame, g.sprite("Round_BorderLarge"), white, 12.0f);
+    }
+}
+
 void build_hud(const HudState &st, float screen_w, float screen_h) {
+    if (st.title) {
+        build_title(st, screen_w, screen_h);
+        return;
+    }
+    if (st.death_time >= 0 && !st.flash_only) {
+        build_death(st, screen_w, screen_h);
+        return;
+    }
     if (st.flash_only) {
         Surface fs{};
         fs.world = false;
@@ -1005,6 +1433,9 @@ void build_hud(const HudState &st, float screen_w, float screen_h) {
         } else if (st.weapon == 3) {
             icon_name = st.weapon_var == 1 ? "SawbladeLauncherOverheat" : "SawbladeLauncher";
             glow_name = st.weapon_var == 1 ? "SawbladeLauncherOverheatGlow" : "SawbladeLauncherGlow";
+        } else if (st.weapon == 4) {
+            icon_name = st.weapon_var == 1 ? "rocketlaunchercannon" : "rocketlauncher";
+            glow_name = st.weapon_var == 1 ? "rocketlaunchercannonglow" : "rocketlauncherglow";
         } else if (st.alt) {
             icon_name = alt_icons[var];
             glow_name = alt_glows[var];
@@ -1028,7 +1459,7 @@ void build_hud(const HudState &st, float screen_w, float screen_h) {
         // (variation 0 blue, 1 green, 2 red: the Pump Charge is the shotgun's 1, the Malicious the railcannon's 2)
         const Color tint = st.weapon == 1 ? (st.weapon_var == 1 ? MARKSMAN_GREEN : PIERCER_BLUE)
                            : st.weapon == 2 ? (st.weapon_var == 1 ? SHARP_RED : PIERCER_BLUE)
-                           : st.weapon == 3 ? (st.weapon_var == 1 ? MARKSMAN_GREEN : PIERCER_BLUE)
+                           : st.weapon == 3 || st.weapon == 4 ? (st.weapon_var == 1 ? MARKSMAN_GREEN : PIERCER_BLUE)
                            : var == 1 ? MARKSMAN_GREEN : var == 2 ? SHARP_RED : PIERCER_BLUE;
         image_simple(sf, icon, rev, tint, false, s);
         image_simple(sf, icon, glow, {tint.r, tint.g, tint.b, 0.749f}, false, s);
@@ -1597,7 +2028,7 @@ bool ensure_screen_vb(ID3D11DeviceContext *ctx) {
 void draw_screens(ID3D11DeviceContext *ctx, Model &m, const HudState &st, const MeshConsts &base) {
     if (m.screens.empty() || g_pose.size() < (size_t)m.nodes * 12) return;
     if (!ensure_screen_vb(ctx)) return;
-    const char *prefix = st.weapon == 3 ? (st.weapon_var == 1 ? "overheat." : "magnet.")
+    const char *prefix = st.weapon == 4 ? "clock." : st.weapon == 3 ? (st.weapon_var == 1 ? "overheat." : "magnet.")
                          : st.weapon == 1 ? (st.weapon_var == 1 ? "pump." : "core.") : st.variation == 1 ? "marksman." : st.variation == 2 ? "sharp." : "pierce.";
     size_t plen = strlen(prefix);
     const float blue[3] = {0.25f, 0.91f, 1.0f}, green[3] = {0.2667f, 1.0f, 0.2706f}, red[3] = {1.0f, 0.2392f, 0.2392f};
@@ -1605,13 +2036,35 @@ void draw_screens(ID3D11DeviceContext *ctx, Model &m, const HudState &st, const 
     c.light[3] = 1.0f;                                // all ambient: the displays light themselves
     c.mode[0] = 1.0f;
     int layer = 0;
+    // The rocket launcher's clock is a picture of light hung over the gun: each of its panels is as see-through
+    // as its picture and its colour say, the ring empties clockwise from three o'clock as its own panel has it,
+    // and the hand turns about the hub (RocketLauncher.Update: "timerArm.localRotation = Euler(0, 0, Lerp(360,
+    // 0, amount))", "timerMeter.fillAmount = amount").
+    const bool clock = st.weapon == 4;
+    const Screen *hub = nullptr;
+    if (clock) {
+        for (const Screen &sc : m.screens)
+            if (sc.name == "clock.hub") hub = &sc;
+        c.mode[0] = 0.0f;
+        ctx->OMSetBlendState(g.blend, nullptr, 0xFFFFFFFF);
+        ctx->OMSetDepthStencilState(g.depth_read, 0);
+    }
     for (const Screen &sc : m.screens) {
         if (sc.name.compare(0, plen, prefix) != 0) continue;
         const char *what = sc.name.c_str() + plen;
-        float fill = 1.0f, rgb[3] = {sc.rgba[0], sc.rgba[1], sc.rgba[2]};
+        float fill = 1.0f, rgb[3] = {sc.rgba[0], sc.rgba[1], sc.rgba[2]}, alpha = 1.0f;
         int tex = sc.tex;
-        bool radial = false, ammo = false;
-        if (!strcmp(what, "monitor")) {
+        bool radial = false, ammo = false, pie = false, hand = false;
+        if (clock) {
+            bool white = !strcmp(what, "hub") || !strcmp(what, "arm");
+            if (!white) memcpy(rgb, st.clock_rgb, sizeof(rgb));
+            alpha = sc.rgba[3] * (white ? 1.0f : st.clock_alpha);
+            if (!strcmp(what, "ring")) {
+                pie = true;
+                fill = fminf(fmaxf(st.clock_fill, 0.0f), 1.0f);
+            }
+            hand = !strcmp(what, "arm") && hub;
+        } else if (!strcmp(what, "monitor")) {
             const char *pic = "battery_full";
             memcpy(rgb, blue, sizeof(rgb));
             if (st.pierce_charge > 0) pic = st.pierce_charge < 50.0f ? "battery_charge1" : st.pierce_charge < 100.0f ? "battery_charge2" : "battery_charge3";
@@ -1662,9 +2115,34 @@ void draw_screens(ID3D11DeviceContext *ctx, Model &m, const HudState &st, const 
             uv[k][0] = sc.corner[k][3];
             uv[k][1] = sc.corner[k][4];
         }
+        if (hand) {
+            // turned about the hub's middle, in the display's own plane, anticlockwise as the display has it
+            float mid[3] = {0, 0, 0}, ex[3], ey[3], lx = 0, ly = 0;
+            for (int i = 0; i < 3; i++) {
+                for (int k = 0; k < 4; k++) mid[i] += hub->corner[k][i] * 0.25f;
+                ex[i] = hub->corner[3][i] - hub->corner[0][i];
+                ey[i] = hub->corner[1][i] - hub->corner[0][i];
+                lx += ex[i] * ex[i];
+                ly += ey[i] * ey[i];
+            }
+            lx = sqrtf(lx);
+            ly = sqrtf(ly);
+            if (lx > 1e-9f && ly > 1e-9f) {
+                float ang = 6.2831853f * (1.0f - fminf(fmaxf(st.clock_fill, 0.0f), 1.0f)), cs = cosf(ang), sn = sinf(ang);
+                for (int k = 0; k < 4; k++) {
+                    float x = 0, y = 0;
+                    for (int i = 0; i < 3; i++) {
+                        x += (p[k][i] - mid[i]) * ex[i] / lx;
+                        y += (p[k][i] - mid[i]) * ey[i] / ly;
+                    }
+                    float x2 = x * cs - y * sn, y2 = x * sn + y * cs;
+                    for (int i = 0; i < 3; i++) p[k][i] = mid[i] + ex[i] / lx * x2 + ey[i] / ly * y2;
+                }
+            }
+        }
         // a meter keeps the edge it fills from and draws the rest in proportion
         static const int moved[5][4] = {{0, 0, 0, 0}, {2, 1, 3, 0}, {1, 2, 0, 3}, {1, 0, 2, 3}, {0, 1, 3, 2}};   // pairs: corner, the corner it shrinks towards
-        if (!radial && sc.fill >= 1 && sc.fill <= 4 && fill < 1.0f)
+        if (!radial && !pie && sc.fill >= 1 && sc.fill <= 4 && fill < 1.0f)
             for (int pair = 0; pair < 2; pair++) {
                 int a = moved[sc.fill][pair * 2], b = moved[sc.fill][pair * 2 + 1];
                 for (int k = 0; k < 3; k++) p[a][k] = p[b][k] + (p[a][k] - p[b][k]) * fill;
@@ -1726,6 +2204,19 @@ void draw_screens(ID3D11DeviceContext *ctx, Model &m, const HudState &st, const 
                 }
                 pen += gl->adv * sx;
             }
+        } else if (pie && fill < 1.0f) {
+            // Unity's "Radial 360" from the right, clockwise, in the panel's own two directions: a fan about
+            // the middle whose rim runs along the panel's edge
+            int steps = (int)ceilf(30.0f * fill);
+            auto rim = [&](float ang) {
+                float dx = cosf(ang), dy = -sinf(ang), big = fmaxf(fabsf(dx), fabsf(dy));
+                put(0.5f + 0.5f * dx / big, 0.5f + 0.5f * dy / big);
+            };
+            for (int k = 0; k < steps && count + 3 <= SCREEN_VERTS; k++) {
+                put(0.5f, 0.5f);
+                rim(6.2831853f * fill * k / steps);
+                rim(6.2831853f * fill * (k + 1) / steps);
+            }
         } else if (radial && fill < 1.0f) {
             // A pie from twelve o'clock, clockwise, as it is seen: the panel may be mounted turned or
             // flipped on the gun (the Marksman's is upside down), so each clock direction on the screen
@@ -1769,13 +2260,18 @@ void draw_screens(ID3D11DeviceContext *ctx, Model &m, const HudState &st, const 
         c.tint[0] = rgb[0];
         c.tint[1] = rgb[1];
         c.tint[2] = rgb[2];
-        c.mode[2] = letters ? 1.0f : 0.0f;                // letters: the tint alone, cut out where the font's picture says
+        c.mode[2] = letters || clock ? 1.0f : 0.0f;       // letters: the tint alone, cut out where the font's picture says
+        c.tint[3] = alpha;
         upload_consts(ctx, c);
         UINT stride = 32, offset = 0;
         ctx->IASetVertexBuffers(0, 1, &g.screen_vb, &stride, &offset);
         ID3D11ShaderResourceView *srv = letters ? letters : tex >= 0 && tex < (int)m.tex_srvs.size() && m.tex_srvs[tex] ? m.tex_srvs[tex] : g.white;
         ctx->PSSetShaderResources(0, 1, &srv);
         ctx->Draw((UINT)count, 0);
+    }
+    if (clock) {
+        ctx->OMSetBlendState(g.opaque, nullptr, 0xFFFFFFFF);
+        ctx->OMSetDepthStencilState(g.depth_on, 0);
     }
     upload_consts(ctx, base);
 }
@@ -2063,6 +2559,7 @@ void draw_viewmodel(ID3D11DeviceContext *ctx, const HudState &st, float aspect, 
     if (since >= 0 && since < 0.35f) kick = fmaxf(kick, expf(-since * 14.0f) * 0.30f);
     if (since_p >= 0 && since_p < 0.6f) kick = fmaxf(kick, expf(-since_p * 8.0f) * 0.55f);
     float charge = fmaxf(st.pierce_charge / 100.0f, st.core_charge);
+    if (st.weapon == 4) charge = st.srs_charge * 2.5f;   // the cannon winding up: the gun is thrown about by up to a hundredth of a unit
     float shake = charge > 0 ? sinf((float)st.time * 90.0f) * 0.004f * charge : 0;
     if (st.weapon == 2 && st.rail_charge >= 5.0f) shake = sinf((float)st.time * 130.0f) * 0.004f;   // the full railcannon trembles (+-0.005)
 
@@ -2113,8 +2610,9 @@ void draw_viewmodel(ID3D11DeviceContext *ctx, const HudState &st, float aspect, 
         Model *rail = st.weapon == 2 ? find_model("railcannon") : nullptr;
         Model *slab = st.weapon == 0 && st.alt ? find_model("revolver_alt") : nullptr;
         Model *saw = st.weapon == 3 ? find_model("sawlauncher") : nullptr;
-        Model *weapon = shotgun ? shotgun : rail ? rail : saw ? saw : slab ? slab : revolver;
-        bool is_revolver = !shotgun && !rail && !saw;
+        Model *rocket = st.weapon == 4 ? find_model("rocketlauncher") : nullptr;
+        Model *weapon = shotgun ? shotgun : rail ? rail : saw ? saw : rocket ? rocket : slab ? slab : revolver;
+        bool is_revolver = !shotgun && !rail && !saw && !rocket;
         // the named clip while it lasts, otherwise the idle loop
         const Clip *clip = weapon->clip(st.revolver_clip);
         float t = (float)(st.time - st.revolver_clip_start) * st.revolver_clip_speed;
@@ -2147,7 +2645,7 @@ void draw_viewmodel(ID3D11DeviceContext *ctx, const HudState &st, float aspect, 
         }
         const Clip *base = shot ? idle : nullptr;
         float base_time = (float)st.time;
-        if (saw && idle && idle->frames > 1) {
+        if ((saw || rocket) && idle && idle->frames > 1) {
             // The sawblade launcher is played the way its Animator ('Nailgun2') plays it, which the plain
             // rule above (the clip, then the idle loop wherever the clock has it) is not:
             //   a clip goes over to Idle before its end, at a set share of its length, in a short blend
@@ -2161,17 +2659,21 @@ void draw_viewmodel(ID3D11DeviceContext *ctx, const HudState &st, float aspect, 
             static const struct { const char *clip; float at, fade; } exits[] = {{"Shoot", 0.9143f, 0.0571f}, {"Equip", 0.9486f, 0.0514f}, {"ShootSuper", 0.9318f, 0.0318f}};
             const Clip *named = weapon->clip(st.revolver_clip);
             double since_start = (st.time - st.revolver_clip_start) * st.revolver_clip_speed;
-            float muddle = fminf(fmaxf(st.clip_muddle, 0.0f), 1.0f), idle_len = (idle->frames - 1) / idle->fps;
+            // (the rocket launcher is played the same way, with its Idle at its own speed and nothing on a second
+            // layer; its clips go over to Idle in their last twentieth of a second)
+            const float idle_rate = saw ? 0.5f : 1.0f;
+            float muddle = saw ? fminf(fmaxf(st.clip_muddle, 0.0f), 1.0f) : 0.0f, idle_len = (idle->frames - 1) / idle->fps;
             clip = idle;
             loop = true;
-            t = (float)fmod(st.time * 0.5, idle_len);
+            t = (float)fmod(st.time * idle_rate, idle_len);
             base = muddle > 0 ? idle : nullptr;
             base_time = 0;
             blend_weight = 1.0f - muddle;
             if (named && named != idle && since_start >= 0) {
-                float len = (named->frames - 1) / named->fps, at = len, fade = 0.05f, nt = (float)fmin(since_start, 1.0e6);
-                for (const auto &e : exits)
-                    if (named->name == e.clip) { at = e.at * len; fade = e.fade; }
+                float len = (named->frames - 1) / named->fps, at = len - 0.05f, fade = 0.05f, nt = (float)fmin(since_start, 1.0e6);
+                if (saw)
+                    for (const auto &e : exits)
+                        if (named->name == e.clip) { at = e.at * len; fade = e.fade; }
                 if (nt < at) {
                     clip = named;
                     loop = false;
@@ -2181,21 +2683,21 @@ void draw_viewmodel(ID3D11DeviceContext *ctx, const HudState &st, float aspect, 
                     loop = false;
                     t = fminf(nt, len);
                     base = idle;
-                    base_time = (nt - at) * 0.5f;
+                    base_time = (nt - at) * idle_rate;
                     blend_weight = (1.0f - (nt - at) / fade) * (1.0f - muddle);
                 } else {
-                    t = (float)fmod((since_start - at) * 0.5, idle_len);
+                    t = (float)fmod((since_start - at) * idle_rate, idle_len);
                 }
             }
         }
         float muzzle[3] = {0, 0, 0};
-        int muzzle_node = weapon->node(shotgun ? "ShootPoint L" : rail || saw ? "Shootpoint" : "ShootPoint");
+        int muzzle_node = weapon->node(shotgun ? "ShootPoint L" : rail || saw || rocket ? "Shootpoint" : "ShootPoint");
         if (muzzle_node < 0 && slab) muzzle_node = weapon->node("ShootPoint (1)");
         if (g.raster_cull) ctx->RSSetState(g.raster_cull);
         {
             // the variation's colour (ColorBlindSettings.variationColors: blue, green, red); the Malicious is the railcannon's third
             static const float var_rgb[3][3] = {{0.251f, 0.906f, 1.0f}, {0.267f, 1.0f, 0.271f}, {1.0f, 0.235f, 0.235f}};
-            int var = rail ? (st.weapon_var == 1 ? 2 : 0) : st.variation < 0 ? 0 : st.variation > 2 ? 2 : st.variation;
+            int var = rail ? (st.weapon_var == 1 ? 2 : 0) : rocket ? (st.weapon_var == 1 ? 1 : 0) : st.variation < 0 ? 0 : st.variation > 2 ? 2 : st.variation;
             g_look.on = true;
             g_look.rail = rail != nullptr;
             g_look.alt = slab != nullptr;
@@ -2623,6 +3125,9 @@ int hud_model_dirs(const char *name, float *xyz, int max_verts) {
     return n;
 }
 
+int hud_death_lines() { return (int)g.death_lines.size(); }
+bool hud_death_line_warning(int i) { return i >= 0 && i < (int)g.death_orange.size() && g.death_orange[i]; }
+
 bool hud_has_model(const char *name) {
     return find_model(name) != nullptr;
 }
@@ -2666,6 +3171,49 @@ bool hud_whip_hand(float *x, float *y) {
     return true;
 }
 
+void hud_title_column(bool on) { g_title_column = on; }
+bool hud_title_cursor(float w, float h, float *x, float *y) {
+    if (GetTickCount64() - g_title_col_tick > 250 || w < 1 || h < 1) return false;
+    const float ppu = fminf(w / 1280.0f, h / 720.0f), cx = (*x - w * 0.5f) / ppu, cy = (h * 0.5f - *y) / ppu;
+    const TitleMenu m = g.title_menu;
+    if (cx >= TITLE_BTN_X && cx < TITLE_BTN_X + TITLE_BTN_W) {
+        for (int i = 0; i < 4; i++) {
+            float top = TITLE_BTN_TOP - TITLE_BTN_STEP * i;
+            if (m.items[i] < 0 || cy > top || cy <= top - TITLE_BTN_H) continue;
+            *x = w * (0.42f + 0.16f * (cx - TITLE_BTN_X) / TITLE_BTN_W);
+            *y = h * (TITLE_ROW0 + TITLE_ROW_STEP * i + 0.022f * ((top - cy) / TITLE_BTN_H - 0.5f));
+            return true;
+        }
+        for (int k = 0; k < 2; k++) {
+            float mid = k ? TITLE_MARK_DOWN : TITLE_MARK_UP;
+            if (!(k ? m.down : m.up) || fabsf(cy - mid) > 13.0f) continue;
+            *x = w * 0.4995f;
+            *y = h * (k ? TITLE_ARROW_DOWN : TITLE_ARROW_UP);
+            return true;
+        }
+    }
+    if (*x > w * 0.38f && *x < w * 0.62f && *y > h * 0.665f && *y < h * 0.892f) {
+        *x = w * 0.30f;
+        return true;
+    }
+    return false;
+}
+
+const char *hud_title_state() {
+    static char out[96];
+    out[0] = 0;
+    if (!g.title_col) return out;
+    const TitleMenu &m = g.title_menu;
+    for (int i = 0; i < 4; i++) {
+        if (m.items[i] < 0) continue;
+        size_t n = strlen(out);
+        snprintf(out + n, sizeof(out) - n, i == m.row ? "%s[%s]" : "%s%s", n ? " " : "", TITLE_WORDS[m.items[i]]);
+    }
+    size_t n = strlen(out);
+    snprintf(out + n, sizeof(out) - n, "%s%s", m.up ? " ^" : "", m.down ? " v" : "");
+    return out;
+}
+
 bool hud_init(ID3D11Device *device, const wchar_t *pack_path) {
     static bool tried = false;
     if (tried) return g.ready;
@@ -2676,6 +3224,9 @@ bool hud_init(ID3D11Device *device, const wchar_t *pack_path) {
         size_t slash = models.find_last_of(L"\\/");
         models = (slash == std::wstring::npos ? std::wstring() : models.substr(0, slash + 1)) + L"ultrasouls_models.bin";
         load_models(device, models.c_str());
+        std::wstring words(pack_path);
+        words = (slash == std::wstring::npos ? std::wstring() : words.substr(0, slash + 1)) + L"ultrasouls_text.txt";
+        load_text(words.c_str());
     }
     return g.ready;
 }
@@ -2685,6 +3236,14 @@ void hud_draw(ID3D11Device *dev, ID3D11DeviceContext *ctx, ID3D11Texture2D *targ
     D3D11_TEXTURE2D_DESC td;
     target->GetDesc(&td);
     bool srgb = td.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB || td.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+    if (st.title) {
+        TitleMenu seen;
+        if (!title_probe(dev, ctx, target, td, seen)) {
+            g.title_col = false;
+            return;
+        }
+        title_settle(seen, st.time);
+    }
     D3D11_RENDER_TARGET_VIEW_DESC rd{};
     rd.ViewDimension = td.SampleDesc.Count > 1 ? D3D11_RTV_DIMENSION_TEXTURE2DMS : D3D11_RTV_DIMENSION_TEXTURE2D;
     rd.Format = td.Format == DXGI_FORMAT_R8G8B8A8_TYPELESS ? DXGI_FORMAT_R8G8B8A8_UNORM
@@ -2695,6 +3254,7 @@ void hud_draw(ID3D11Device *dev, ID3D11DeviceContext *ctx, ID3D11Texture2D *targ
     g.verts.clear();
     g.draws.clear();
     build_hud(st, (float)td.Width, (float)td.Height);
+    if (st.title && g.title_col) g_title_col_tick = GetTickCount64();
 
     Saved saved;
     saved.save(ctx);
@@ -2709,7 +3269,7 @@ void hud_draw(ID3D11Device *dev, ID3D11DeviceContext *ctx, ID3D11Texture2D *targ
     ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 
     bool weapon_drawn = false;
-    if (!st.flash_only && st.show_viewmodel && (!g.meshes.empty() || !g.models.empty()) && ensure_depth(dev, td.Width, td.Height, td.SampleDesc.Count)) {
+    if (!st.flash_only && st.death_time < 0 && st.show_viewmodel && (!g.meshes.empty() || !g.models.empty()) && ensure_depth(dev, td.Width, td.Height, td.SampleDesc.Count)) {
         ctx->ClearDepthStencilView(g.dsv, D3D11_CLEAR_DEPTH, 1.0f, 0);
         ctx->OMSetRenderTargets(1, &rtv, g.dsv);
         draw_world(ctx, st, srgb);
@@ -2750,9 +3310,55 @@ void hud_draw(ID3D11Device *dev, ID3D11DeviceContext *ctx, ID3D11Texture2D *targ
             ctx->PSSetConstantBuffers(0, 1, &g.ui_cb);
             ctx->PSSetSamplers(0, 1, &g.linear);
             ctx->PSSetShaderResources(2, 1, &g.scene_depth);
+            bool fx_ready = false;
+            for (const UiDraw &d : g.draws)
+                if (d.fx && (d.fx == 2 ? g.menu_ps : g.death_ps) && td.SampleDesc.Count == 1 && !fx_ready) {
+                    // the picture as it stands, for the death shader to read while it writes over it
+                    D3D11_TEXTURE2D_DESC fd{};
+                    if (g.fx_tex) g.fx_tex->GetDesc(&fd);
+                    if (!g.fx_tex || fd.Width != td.Width || fd.Height != td.Height || fd.Format != td.Format) {
+                        if (g.fx_srv) g.fx_srv->Release();
+                        if (g.fx_tex) g.fx_tex->Release();
+                        g.fx_srv = nullptr;
+                        g.fx_tex = nullptr;
+                        fd = td;
+                        fd.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+                        fd.Usage = D3D11_USAGE_DEFAULT;
+                        fd.CPUAccessFlags = 0;
+                        fd.MiscFlags = 0;
+                        if (SUCCEEDED(dev->CreateTexture2D(&fd, nullptr, &g.fx_tex))) {
+                            D3D11_SHADER_RESOURCE_VIEW_DESC vd{};
+                            vd.Format = rd.Format;
+                            vd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+                            vd.Texture2D.MipLevels = 1;
+                            dev->CreateShaderResourceView(g.fx_tex, &vd, &g.fx_srv);
+                        }
+                    }
+                    if (g.fx_tex && g.fx_srv) {
+                        ctx->CopyResource(g.fx_tex, target);
+                        fx_ready = true;
+                    }
+                }
             for (int pass = 1; pass >= 0; pass--)            // the world's first, then the HUD's own over it
             for (const UiDraw &d : g.draws) {
                 if (d.world != pass) continue;
+                if (d.fx) {
+                    if (!fx_ready) continue;
+                    float k = fminf(fmaxf(st.death_time * 0.5f, 0.0f), 1.0f);     // DeathSequence.Update: both run up to 1 in 2 s
+                    float par[8] = {k, k, 300.0f + (float)fmod(st.time, 600.0), 0, 1.0f / (float)td.Width, 1.0f / (float)td.Height, 0, 0};
+                    if (SUCCEEDED(ctx->Map(g.ui_cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &ms))) {
+                        memcpy(ms.pData, par, sizeof(par));
+                        ctx->Unmap(g.ui_cb, 0);
+                    }
+                    ctx->PSSetShader(d.fx == 2 ? g.menu_ps : g.death_ps, nullptr, 0);
+                    ctx->PSSetShaderResources(0, 1, &g.fx_srv);
+                    ctx->PSSetSamplers(0, 1, &g.point);
+                    ctx->OMSetBlendState(g.opaque, nullptr, 0xFFFFFFFF);
+                    ctx->Draw(d.count, d.start);
+                    ctx->PSSetShader(g.ui_ps, nullptr, 0);
+                    ctx->PSSetSamplers(0, 1, &g.linear);
+                    continue;
+                }
                 float mode[8] = {(float)d.sdf, srgb ? 1.0f : 0.0f, 0, 0, g.depth_a, g.depth_b, g.scene_depth ? 1.0f : 0.0f, 0};
                 if (SUCCEEDED(ctx->Map(g.ui_cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &ms))) {
                     memcpy(ms.pData, mode, sizeof(mode));

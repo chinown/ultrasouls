@@ -132,7 +132,17 @@ EXTRA_SPRITES = ["RankD", "RankC", "RankB", "RankA", "RankS", "RankSS", "RankSSS
                  # the Sawblade Launcher's pictures for the weapon panel
                  "SawbladeLauncher", "SawbladeLauncherGlow", "SawbladeLauncherOverheat", "SawbladeLauncherOverheatGlow",
                  # the light on the Attractor's magnet, which flashes with each beep of its TimeBomb
-                 "muzzleflashnailgun"]
+                 "muzzleflashnailgun",
+                 # the screen after death: its background, and the picture that flashes as it comes up
+                 "crtbg", "ISeeYou",
+                 # the rocket launcher's pictures for the weapon panel, the ring round a frozen rocket with its
+                 # four marks, the flash at a rocket's tail and the one round a cannonball
+                 "rocketlauncher", "rocketlauncherglow", "rocketlaunchercannon", "rocketlaunchercannonglow",
+                 "RageEffectWhite", "verticalgradient", "muzzleflashshotgun 1", "splash 2",
+                 # the main menu: its logo, the picture of V1 with its wings, and the frame round the screen and the buttons
+                 "TextmodeLogo", "TextmodeV1", "TextmodeV1Wings", "Round_BorderLarge", "Round_BorderLargeBlack",
+                 # the skull on it, in its two pictures
+                 "SkullFrameDoubleA", "SkullFrameDoubleB"]
 
 
 # Plain textures the effects use as sprites (they are not Sprite objects in the game's files)

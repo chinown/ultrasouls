@@ -24,7 +24,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 BUILD = os.path.join(HERE, "..", "build")
 GAME_DIR = r"F:\SteamLibrary\steamapps\common\DARK SOULS REMASTERED"
 CLASSES = ("NewMovement", "Revolver", "Coin", "GroundCheck", "RevolverBeam", "Punch", "WeaponCharges", "PlayerFootsteps", "Shotgun",
-           "Grenade", "Railcannon", "RevolverAnimationReceiver", "HookArm", "Nailgun", "Nail", "Spin", "Harpoon", "TimeBomb")
+           "Grenade", "Railcannon", "RevolverAnimationReceiver", "HookArm", "Nailgun", "Nail", "Spin", "Harpoon", "TimeBomb", "DeathSequence", "TextAppearByLines", "LaughingSkull", "PlayOnAwakeTracker",
+           "RocketLauncher", "Cannonball", "PhysicalShockwave")
 
 # sound name in the pack -> (class, object the component is on, field). A field that names a prefab is
 # followed to the first AudioSource under it. Volumes and pitches are set by the DLL, from ULTRAKILL's code.
@@ -117,6 +118,32 @@ WANTED = {
     "harpoon_stop": ("Harpoon", "Harpoon", "environmentHitSound"),    # the magnet's harpoon going into a wall
     "harpoon_pierce": ("Harpoon", "Harpoon", "enemyHitSound"),        # and into an enemy
     "magnet_beep": ("TimeBomb", "Harpoon", "beepLight"),              # the magnet's beep
+    # dying: the sequence's own sound, and the two its lines of text come with
+    "death_sequence": ("DeathSequence", "DeathSequence", "m_GameObject"),
+    "death_error": ("TextAppearByLines", "Text (TMP)", "errorSound"),
+    "death_warning": ("TextAppearByLines", "Text (TMP)", "warningSound"),
+    # the screen after it: its hum, the click it comes up with, and the skull's laugh
+    "death_buzz": ("PlayOnAwakeTracker", "BlackScreen", "m_GameObject"),
+    "death_tv_off": ("PlayOnAwakeTracker", "ISeeYou", "m_GameObject"),
+    "death_laugh": ("LaughingSkull", "LaughingSkull", "m_GameObject"),
+    # the rocket launcher: its shot, the clunk of its reload, the Freezeframe's clock (stopping, starting, ticking
+    # and winding back up) and the hum of the S.R.S. Cannon charging
+    "rocket_fire": ("RocketLauncher", "Rocket Launcher Freeze", "m_GameObject"),
+    "rocket_clunk": ("RocketLauncher", "Rocket Launcher Freeze", "clunkSound"),
+    "rocket_freeze": ("RocketLauncher", "Rocket Launcher Freeze", "timerFreezeSound"),
+    "rocket_unfreeze": ("RocketLauncher", "Rocket Launcher Freeze", "timerUnfreezeSound"),
+    "rocket_tick": ("RocketLauncher", "Rocket Launcher Freeze", "timerTickSound"),
+    "rocket_wind": ("RocketLauncher", "Rocket Launcher Freeze", "timerWindupSound"),
+    "srs_charge": ("RocketLauncher", "Rocket Launcher Cannonball", "chargeSound"),
+    # a rocket in flight, one that has hung frozen for a second, and one going off against a wall
+    "rocket_loop": ("Grenade", "Rocket", "m_GameObject"),
+    "rocket_levelup": ("Grenade", "Rocket", "levelUpEffect"),
+    "explosion_harmless": ("Grenade", "Rocket", "harmlessExplosion"),
+    # the cannonball: bouncing off an enemy, breaking, shot in the air, and the wave where it lands
+    "cannonball_bounce": ("Cannonball", "Cannonball", "bounceSound"),
+    "cannonball_break": ("Cannonball", "Cannonball", "breakEffect"),
+    "explosion_big": ("Cannonball", "Cannonball", "interruptionExplosion"),
+    "shockwave": ("PhysicalShockwave", "PhysicalShockwavePlayer", "soundEffect"),
 }
 
 

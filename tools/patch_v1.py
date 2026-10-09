@@ -88,6 +88,10 @@ ARM_ROWS = {
     # the wave where the ball lands ('PhysicalShockwavePlayer': 12 u, damage 0): it throws what it reaches
     # and does not hurt (the least an attack row can do here)
     "shockwave":     (9000204, 0.05,                  1.5,   0.5,    4,        400,   6.0),
+    # The visceral attack (ours, after Bloodborne's): a parried enemy is kept reeling by a hit that does next to
+    # nothing every 0.8 s, and a punch on it while it reels is this one blow.
+    "stun":          (9000205, 0.05,                  1.5,   0.5,    3,        200,   0.0),
+    "visceral":      (9000206, 12.0,                  1.5,   0.5,    4,        1000,  8.0),
 }
 PELLET_ID = 9000140         # one shotgun pellet. Shotgun.Shoot sends twelve; Projectile deals damage / 4 = a quarter of a revolver shot
 # Dark Souls takes a flat defence off every hit, which punishes many small hits. Measured on a hollow that
@@ -274,7 +278,7 @@ for rid in OWN_ROWS:
 #   Not stopped by a shield: explosions, both railcannons, the Piercer's charged shots, a coin's shot from behind.
 #   The Knuckleblaster's punch takes a kick's worth of stamina: one that is blocked breaks the guard.
 UNBLOCKABLE = [PIERCER_ID, 9000161, 9000170, 9000171] + [ARM_ROWS[k][0] for k in ("explosion", "explosion_super", "explosion_pump", "explosion_malicious", "explosion_ultra",
-                                                                          "explosion_big", "explosion_super_big", "shockwave")] \
+                                                                          "explosion_big", "explosion_super_big", "shockwave", "stun", "visceral")] \
     + [COIN_BACK_ID + i for i in range(len(COIN_POWERS))] + [COIN_ALT_ID + q for q in range(4, COIN_ALT_MAX + 1)]
 for rid in UNBLOCKABLE:
     atk.set(rid, "disableGuard", 1)

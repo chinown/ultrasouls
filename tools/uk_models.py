@@ -666,6 +666,18 @@ def geometry_of(node):
     return pos, nrm, uv, np.array(tris, dtype="<u4")
 
 
+def _submesh_tris(node):
+    """The triangle indices of each submesh of an object's mesh, or None when it has no mesh asset."""
+    from UnityPy.helpers.MeshHelper import MeshHandler
+    mf = next((c for c in node["components"] if c.type.name == "MeshFilter"), None)
+    mesh = follow(mf, mf.read_typetree()["m_Mesh"]) if mf is not None else None
+    if mesh is None:
+        return None
+    h = MeshHandler(mesh.read())
+    h.process()
+    return [np.array([i for tri in sub for i in tri], dtype="<u4") for sub in h.get_triangles()]
+
+
 def add_look(mat, textures, tex_index):
     """The index, in `textures`, of the picture a material draws with, tinted by the material's colour."""
     from PIL import Image
@@ -781,7 +793,18 @@ def build_flyer(name, root_name):
             print("    %s spins about its own (%g, %g, %g) at %g degrees a second" % (node["name"], d["x"], d["y"], d["z"], spin["speed"]))
         else:
             pos, nrm = _apply(m, pos, nrm)
-        meshes.append(_rigid_mesh(node["name"], tex, pos, nrm, uv, tris, bone))
+        # A mesh drawn with several materials (the rocket: its body, and its fins and nose in plain red) is
+        # packed as one mesh for each, so that each part has its own look. (Until v0.85 the whole of it was
+        # drawn with the first.)
+        parts = _submesh_tris(node)
+        mat_refs = mr.read_typetree()["m_Materials"]
+        if parts and len(parts) > 1 and len(mat_refs) >= len(parts):
+            for k, part in enumerate(parts):
+                tex_k, tname_k, _color_k = add_look(follow(mr, mat_refs[k]), textures, tex_index)
+                meshes.append(_rigid_mesh(node["name"] if k == 0 else "%s %d" % (node["name"], k), tex_k, pos, nrm, uv, part, bone))
+                print("    %-10s %-10s part %d: %d triangles, %s" % (name, node["name"], k, len(part) // 3, tname_k))
+        else:
+            meshes.append(_rigid_mesh(node["name"], tex, pos, nrm, uv, tris, bone))
         box = pos if spin is None else _apply(m, pos / scale, nrm)[0]
         print("    %-10s %-10s %d vertices, %s, material colour %s, box %s to %s" % (
             name, node["name"], len(pos), tname, [round(c, 3) for c in color], np.round(box.min(axis=0), 3), np.round(box.max(axis=0), 3)))

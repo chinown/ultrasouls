@@ -44,7 +44,7 @@ static const float JUMP_V0 = 9.0f;   // m/s
 static const float JUMP_G = 20.0f;   // m/s^2 while rising; the game's own gravity handles the fall
 static const float AIR_CARRY = 1.3f; // horizontal speed kept in the air, as a multiple of ground speed at takeoff
 
-#define MOD_VERSION "v0.84"
+#define MOD_VERSION "v0.85"
 static HMODULE g_real = nullptr;
 static FILE *g_log = nullptr;
 
@@ -507,6 +507,12 @@ static volatile bool g_teleport_keep_safe = false;   // the move is part of a fa
 // the same for a launch (an explosion throwing the player): the velocity to leave with, in m/s
 static volatile bool g_launch_pending = false;
 static float g_launch_v[3];
+// On a rocket (v0.85): the player's velocity is the rocket's at every physics step, with no steering in the air
+// and no gravity. v0.84 only threw the player along the rocket's way once a frame: between throws the keys
+// still pushed the player about and gravity still pulled, so W, A, S and D dragged the player off the rocket
+// they were turning and a ride (or standing on a frozen rocket) sank slowly.
+static volatile bool g_ride_hold = false;
+static float g_ride_v[3];
 // The whiplash's pull (HookArm.FixedUpdate, state Pulling): while it lasts the player's velocity is replaced
 // each step by 60 u/s straight at the hook, from the middle of the body.
 static volatile bool g_whip_pull = false, g_whip_jump = false;
@@ -986,6 +992,12 @@ static void step_common(void *self, void *step_info, void *gravity, StepFn orig)
                     // falling beside a wall is 40% slower to speed up
                     g_vy -= V1_GRAVITY * dt * (on_wall && g_vy < 0 ? 0.6f : 1.0f);
                     if (g_vy < -V1_FALL_SPEED_MAX) g_vy = -V1_FALL_SPEED_MAX;
+                    vel[1] = g_vy;
+                }
+                if (g_ride_hold) {
+                    g_vx = g_ride_v[0];
+                    g_vy = g_ride_v[1];
+                    g_vz = g_ride_v[2];
                     vel[1] = g_vy;
                 }
                 // Speed into a wall is dropped, as a rigid body's would be. Left in, the character was
@@ -2569,6 +2581,8 @@ static bool ray_cast(const float *a, const float *b, RayHit &out) {
 struct Coin;
 static bool coin_hits_core(const Coin &c);
 static bool coin_hits_flying(const Coin &c, double t);      // (a rocket or a cannonball in the air: with the rocket launcher)
+static void explosion_sets_off(const float *p, float radius);
+static void stun_enemy(uintptr_t chr, double t);
 // ---- A beam that hits more than once (RevolverBeam.PiercingShotCheck). ULTRAKILL's piercing beams strike
 // what is on their line one hit at a time. Every hit on a living enemy stops time for 0.05 s
 // (TimeController.HitStop: the picture stands still, with no flash) and the next hit comes 0.05 s after
@@ -2990,6 +3004,7 @@ static void parry_rewards() {
 }
 static void do_parry(const Target &tg, int anim) {
     parry_rewards();
+    stun_enemy(tg.chr, now_s());
     logf("parry: chr %p hp %d was in attack animation %d\n", (void *)tg.chr, tg.hp, anim);
 }
 // ---- sounds an animation plays partway through (its events: the shotgun clicking shut, the smacks
@@ -3232,6 +3247,7 @@ static void explode(const float *p, int kind, bool spare_player) {
     bool super = kind == EXPLODE_SUPER || kind == EXPLODE_MALICIOUS || kind == EXPLODE_ULTRA || kind == EXPLODE_SUPER_BIG;
     note_attack(HIT_EXPLOSION);
     int reached = blast_enemies(p, EXPLOSIONS[kind].max_size * UK_UNIT, rows[kind]);
+    explosion_sets_off(p, EXPLOSIONS[kind].max_size * UK_UNIT);
     InterlockedIncrement(&g_explosions);
     BlastFx &b = g_blast_fx[g_blast_fx_next++ % MAX_BLAST_FX];
     memcpy(b.p, p, sizeof(b.p));
@@ -3383,8 +3399,14 @@ static float g_magnet_hit[3];                    // where on its harpoon magnet_
 // (the rocket launcher's rockets and cannonballs, further down: a shot along the view sets off the one it meets,
 // and a punch sends a cannonball on)
 static bool shoot_flying(int beam, bool ultra, double t);
+static void explosion_sets_off(const float *p, float radius);
+static bool whip_take_on_view(double t);
+static void stun_enemy(uintptr_t chr, double t);
+static bool visceral_start(double t);
 static bool punch_ball(double t);
-static bool whip_catch_flying(const float *from, const float *dir, float step, float radius, double t);
+struct Rocket;
+struct Ball;
+static bool whip_catch_flying(const float *from, const float *dir, float step, float radius, double t, Rocket *take_rocket = nullptr, Ball *take_ball = nullptr);
 // The core the line of fire from the eye passes closest to, if any is within reach.
 static Core *core_on_line() {
     float right[3], up[3], fwd[3], eye[3];
@@ -3883,6 +3905,7 @@ static void update_punch(bool armed, float dt) {
         }
         return;
     }
+    if (visceral_start(t)) return;
     sound_play("punch_swing", 0.5f, 1.0f);
     play_arm(rand() % 2 ? "Jab" : "Jab2");
     g_last_feedbacker = t;
@@ -4156,6 +4179,11 @@ static void update_whiplash(bool armed, double t, float dt) {
             g_whip_state = WHIP_THROWING;
             whip_clip("Throw", true);
             sound_play("hook_throw", 1.0f, frand(0.9f, 1.1f));
+            if (whip_take_on_view(t)) {          // a rocket or a cannonball on its line: taken at once
+                sound_play("hook_clink", 0.5f, frand(0.9f, 1.1f));
+                whip_stop(0);
+                return;
+            }
             whip_loop("hook_throw_loop");
             InterlockedIncrement(&g_whip_throws);
         }
@@ -5072,12 +5100,26 @@ static bool enemy_on_path(const float *a, const float *b, float radius, Target &
     }
     return false;
 }
-// 'Explosion Rocket Harmless': the smoke, the ring and the noise of an explosion with no ball of fire in it
+// 'Explosion Rocket Harmless': the smoke and the noise of an explosion with no ball of fire in it, but with its
+// shell: the prefab's second ball ('Sphere_8 (1)': an Explosion of damage 0 that grows at 2.5 to 8 u) is on, and
+// it throws the player as any explosion does. This is what a rocket fired at one's feet jumps the player with.
+// (v0.82 to v0.84 had no wave: Davi, of ULTRAKILL: "it explodes as a wave that can push the player".)
 static void harmless_explosion(const float *p) {
     static const float orange[3] = {1.0f, 0.6f, 0.2f};
     if (in_sight(p)) {
         fx_explosion_sparks(p, 0);
         add_flash(p, 2.0f, 0.3f, orange);
+    }
+    {
+        BlastFx &b = g_blast_fx[g_blast_fx_next++ % MAX_BLAST_FX];
+        memcpy(b.p, p, sizeof(b.p));
+        b.radius = 8.0f * UK_UNIT;
+        b.born = now_s();
+        b.wave = true;
+        b.kind = -1;
+        b.hidden = false;
+        blast_limits(b);
+        queue_blast(p, 8.0f, 0, 2.5f, false);
     }
     float vol = heard(p, 75.0f);
     if (vol > 0.01f) sound_play("explosion_harmless", vol, frand(0.75f, 1.25f));
@@ -5246,8 +5288,12 @@ static void ride_step(Rocket &r, double t, float dt) {
             return;
         }
     }
-    memcpy(g_launch_v, v, sizeof(v));
-    g_launch_pending = true;
+    memcpy(g_ride_v, v, sizeof(v));
+    if (!g_ride_hold || !g_air) {                // (getting on, or the feet have found ground: back into the air)
+        memcpy(g_launch_v, v, sizeof(v));
+        g_launch_pending = true;
+    }
+    g_ride_hold = true;
     for (int i = 0; i < 3; i++) r.p[i] = feet[i] - r.dir[i] * ROCKET_LENGTH * 0.5f - (i == 1 ? 0.15f : 0.0f);
 }
 static void update_rockets(double t, float dt) {
@@ -5337,6 +5383,7 @@ static void update_rockets(double t, float dt) {
             trail_push(r.trail, r.trail_t, r.trail_n, ROCKET_TRAIL, r.p, t);
         }
     }
+    if (!g_ride) g_ride_hold = false;
     // 'RocketLoop' (0.2, an octave down): one voice for all of them, as loud as the nearest one in flight is
     static int voice = 0;
     if (loudest > 0.01f) {
@@ -5360,7 +5407,9 @@ static Rocket *rocket_on_line(float *where) {
             float c[3] = {r.p[0] + r.dir[0] * ROCKET_LENGTH * k / 4.0f, r.p[1] + r.dir[1] * ROCKET_LENGTH * k / 4.0f, r.p[2] + r.dir[2] * ROCKET_LENGTH * k / 4.0f};
             float d[3] = {c[0] - eye[0], c[1] - eye[1], c[2] - eye[2]}, along = d[0] * fwd[0] + d[1] * fwd[1] + d[2] * fwd[2];
             if (along <= 0.5f || along >= best_along) continue;
-            float off2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2] - along * along, reach = ROCKET_RADIUS + 0.15f;      // ours: 0.15 m of grace
+            // (what a shot has to meet is the rocket's 'InterruptSphere', 0.875 u about its middle, not its thin body;
+            // 0.2 m of grace on top is ours)
+            float off2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2] - along * along, reach = 0.875f * UK_UNIT + 0.2f;
             if (off2 > reach * reach || ray_blocked(eye, c) == 1) continue;
             best = &r;
             best_along = along;
@@ -5598,7 +5647,7 @@ static bool coin_hits_flying(const Coin &c, double t) {
 // does when the hook is back with it is done at once here: a rocket is at the player and is ridden (if it
 // came from below, within 45 degrees of straight down, or jump is held) or goes off there (the super
 // explosion with the player in the air); a cannonball hangs in front of the player with their own speed.
-static bool whip_catch_flying(const float *from, const float *dir, float step, float radius, double t) {
+static bool whip_catch_flying(const float *from, const float *dir, float step, float radius, double t, Rocket *take_rocket, Ball *take_ball) {
     float eye[3], feet[3], right[3], up[3], fwd[3];
     if (!eye_pos(eye) || !feet_pos(feet)) return false;
     auto reached = [&](const float *p, float size) {
@@ -5610,7 +5659,8 @@ static bool whip_catch_flying(const float *from, const float *dir, float step, f
     for (Rocket &r : g_rockets) {
         if (!r.alive || g_ride == &r) continue;
         float mid[3] = {r.p[0] + r.dir[0] * ROCKET_LENGTH * 0.5f, r.p[1] + r.dir[1] * ROCKET_LENGTH * 0.5f, r.p[2] + r.dir[2] * ROCKET_LENGTH * 0.5f};
-        if (!reached(mid, ROCKET_RADIUS + 0.3f)) continue;
+        if (!take_rocket && !reached(mid, ROCKET_RADIUS + 0.3f)) continue;
+        if (take_rocket && take_rocket != &r) continue;
         float d[3] = {mid[0] - feet[0], mid[1] - feet[1], mid[2] - feet[2]}, len = sqrtf(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
         bool below = len > 0.1f && -d[1] / len > 0.7071f;
         r.rideable = true;
@@ -5628,8 +5678,10 @@ static bool whip_catch_flying(const float *from, const float *dir, float step, f
         return true;
     }
     view_axes(right, up, fwd);
+    if (take_rocket) return false;
     for (Ball &b : g_balls) {
-        if (!b.alive || !reached(b.p, BALL_RADIUS)) continue;
+        if (!b.alive) continue;
+        if (take_ball ? take_ball != &b : !reached(b.p, BALL_RADIUS)) continue;
         // "cannonball.Unlaunch(); forceMaxSpeed = true; InstaBreakDefenceCancel()", then the player's own
         // velocity less any fall
         b.launched = false;
@@ -5638,7 +5690,7 @@ static bool whip_catch_flying(const float *from, const float *dir, float step, f
         b.since_bounce = 1.0f;
         b.hit_n = 0;
         b.trail_n = 0;
-        for (int i = 0; i < 3; i++) b.p[i] = eye[i] + fwd[i] * 3.0f * UK_UNIT;
+        for (int i = 0; i < 3; i++) b.p[i] = eye[i] + fwd[i] * 1.2f;        // in front of the face, in reach of a punch
         b.v[0] = g_vx;
         b.v[1] = g_air && g_vy > 0 ? g_vy : 0.0f;
         b.v[2] = g_vz;
@@ -5647,6 +5699,140 @@ static bool whip_catch_flying(const float *from, const float *dir, float step, f
     }
     return false;
 }
+// The whiplash thrown with a rocket or a cannonball on its line: it is taken at once, without waiting for the
+// hook to fly out to it and back (v0.84 waited for the hook to reach it. Davi: a ball should be at the face
+// immediately). On the line: within a metre of the view's line, and a twentieth of its distance more, in sight.
+static bool whip_take_on_view(double t) {
+    float right[3], up[3], fwd[3], eye[3];
+    if (!eye_pos(eye)) return false;
+    view_axes(right, up, fwd);
+    Rocket *rocket = nullptr;
+    Ball *ball = nullptr;
+    float best = 60.0f;
+    auto on_line = [&](const float *p) {
+        float d[3] = {p[0] - eye[0], p[1] - eye[1], p[2] - eye[2]}, along = d[0] * fwd[0] + d[1] * fwd[1] + d[2] * fwd[2];
+        if (along <= 0.5f || along >= best) return false;
+        float reach = 1.0f + along * 0.05f;
+        if (d[0] * d[0] + d[1] * d[1] + d[2] * d[2] - along * along > reach * reach || ray_blocked(eye, p) == 1) return false;
+        best = along;
+        return true;
+    };
+    for (Ball &b : g_balls)
+        if (b.alive && on_line(b.p)) { ball = &b; rocket = nullptr; }
+    for (Rocket &r : g_rockets) {
+        if (!r.alive || g_ride == &r) continue;
+        float mid[3] = {r.p[0] + r.dir[0] * ROCKET_LENGTH * 0.5f, r.p[1] + r.dir[1] * ROCKET_LENGTH * 0.5f, r.p[2] + r.dir[2] * ROCKET_LENGTH * 0.5f};
+        if (on_line(mid)) { rocket = &r; ball = nullptr; }
+    }
+    if (!rocket && !ball) return false;
+    return whip_catch_flying(eye, fwd, 0.0f, 0.0f, t, rocket, ball);
+}
+// An explosion sets off the rockets and cannonballs inside it (each as one shot in the air goes off).
+static void explosion_sets_off(const float *p, float radius) {
+    double t = now_s();
+    for (Rocket &r : g_rockets) {
+        if (!r.alive || g_ride == &r) continue;
+        float mid[3] = {r.p[0] + r.dir[0] * ROCKET_LENGTH * 0.5f, r.p[1] + r.dir[1] * ROCKET_LENGTH * 0.5f, r.p[2] + r.dir[2] * ROCKET_LENGTH * 0.5f};
+        if (dist3(p, mid) > radius + 0.44f) continue;
+        logf("rocket: set off by an explosion\n");
+        memcpy(r.p, mid, sizeof(mid));
+        rocket_end(r, 2, t);                     // (it is no longer alive when its own explosion looks for more)
+    }
+    for (Ball &b : g_balls) {
+        if (!b.alive || dist3(p, b.p) > radius + BALL_RADIUS) continue;
+        b.alive = false;
+        logf("cannonball: set off by an explosion\n");
+        explode(b.p, EXPLODE_CANNONBALL);
+    }
+}
+
+// ---- The visceral attack (ours, after Bloodborne's; not ULTRAKILL's). An enemy that has been parried is
+// "stunned" for three seconds: a mark turns over it, and every 0.8 s it is hit by a row that does next to
+// nothing but makes it reel again, so it stays open. A Feedbacker punch (F) on a stunned enemy within reach is
+// the visceral attack: the arm's hook, and 0.12 s later one blow of twelve revolver shots' worth that throws
+// the enemy back, with blood on the screen, half the health bar back, the parry's flash and 250 style.
+static const int BEHAVIOR_STUN = 9000205, BEHAVIOR_VISCERAL = 9000206;
+struct Stun { uintptr_t chr; double until, next_hold; };
+enum { MAX_STUNS = 4 };
+static Stun g_stuns[MAX_STUNS];
+static double g_visceral_at = -1.0;
+static uintptr_t g_visceral_chr = 0;
+static volatile LONG g_viscerals = 0;
+static void stun_enemy(uintptr_t chr, double t) {
+    Stun *slot = &g_stuns[0];
+    for (Stun &s : g_stuns) {
+        if (s.chr == chr) { slot = &s; break; }
+        if (s.until < slot->until) slot = &s;
+    }
+    *slot = {chr, t + 3.0, t + 0.8};
+    logf("visceral: chr %p is stunned for 3 s\n", (void *)chr);
+}
+static bool visceral_start(double t) {
+    float right[3], up[3], fwd[3], eye[3], pt[3];
+    if (g_visceral_at > 0 || !eye_pos(eye)) return false;
+    view_axes(right, up, fwd);
+    for (Stun &s : g_stuns) {
+        if (!s.chr || t > s.until || !chr_alive(s.chr) || !whip_target_point(s.chr, pt)) continue;
+        float d[3] = {pt[0] - eye[0], pt[1] - eye[1], pt[2] - eye[2]}, len = sqrtf(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+        if (len > 3.0f || (len > 0.3f && (d[0] * fwd[0] + d[1] * fwd[1] + d[2] * fwd[2]) / len < 0.5f)) continue;
+        g_visceral_chr = s.chr;
+        g_visceral_at = t + 0.12;
+        s.until = t + 1.0;                       // (it stays open until the blow has landed)
+        play_arm("Hook", 0.065);
+        sound_play("punch_swing", 0.6f, 0.8f);
+        return true;
+    }
+    return false;
+}
+static void update_viscerals(double t) {
+    float eye[3], pt[3];
+    if (!eye_pos(eye)) return;
+    for (Stun &s : g_stuns) {
+        if (!s.chr) continue;
+        if (t > s.until || !chr_alive(s.chr)) { s.chr = 0; continue; }
+        if (t >= s.next_hold && s.chr != g_visceral_chr && whip_target_point(s.chr, pt)) {
+            s.next_hold = t + 0.8;
+            float d[3] = {pt[0] - eye[0], pt[1] - eye[1], pt[2] - eye[2]}, len = sqrtf(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+            if (len > 0.05f && len < 40.0f) {
+                float from[3];
+                for (int i = 0; i < 3; i++) {
+                    d[i] /= len;
+                    from[i] = pt[i] - d[i] * 0.9f;
+                }
+                shoot(BEHAVIOR_STUN, from, d);
+            }
+        }
+    }
+    if (g_visceral_at > 0 && t >= g_visceral_at) {
+        uintptr_t chr = g_visceral_chr;
+        g_visceral_at = -1.0;
+        g_visceral_chr = 0;
+        for (Stun &s : g_stuns)
+            if (s.chr == chr) s.chr = 0;
+        if (chr_alive(chr) && whip_target_point(chr, pt)) {
+            float d[3] = {pt[0] - eye[0], pt[1] - eye[1], pt[2] - eye[2]}, len = sqrtf(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]), from[3], back[3];
+            if (len < 0.05f) { d[0] = 0; d[1] = 0; d[2] = 1; len = 1.0f; }
+            for (int i = 0; i < 3; i++) {
+                d[i] /= len;
+                from[i] = pt[i] - d[i] * 0.9f;
+                back[i] = -d[i];
+            }
+            note_attack(HIT_PUNCH);
+            bool ok = shoot(BEHAVIOR_VISCERAL, from, d);
+            for (int k = 0; k < 4; k++) fx_beam_hit(pt, back);
+            splash_screen_blood();
+            heal_player(50.0f);
+            g_freeze_request = 0.25f;
+            sound_play("punch_hit_heavy", 0.9f, 0.8f);
+            sound_play("punch_projectile", 0.5f, 0.7f);
+            static const float red[3] = {1.0f, 0.15f, 0.1f};
+            style_add(250, "VISCERAL", red);
+            InterlockedIncrement(&g_viscerals);
+            logf("visceral: the blow into chr %p: %s\n", (void *)chr, ok ? "accepted" : "REFUSED");
+        }
+    }
+}
+
 // Punch on a cannonball: Cannonball.Launch
 static bool punch_ball(double t) {
     float right[3], up[3], fwd[3], eye[3];
@@ -6398,6 +6584,7 @@ static void try_instant_fire() {
     update_saws(t, dt);
     update_rockets(t, dt);
     update_balls(t, dt);
+    update_viscerals(t);
     {
         float right[3], up[3], fwd[3], eye[3];
         if (g_ctrl && eye_pos(eye)) {
@@ -7516,7 +7703,22 @@ static bool draw_full_hud(IDXGISwapChain *sc) {
                         else ball(mg.p, 0.3f, 0, 0.3f, 0.8f, 1.0f, 1.0f);
                         float since = (float)(st.time - mg.beeped);
                         if (mg.stuck && since >= 0 && since < 1.0f)
-                            sprite("muzzleflashnailgun", mg.o, 6.4f * UK_UNIT * (1.0f + mg.load) * expf(-5.0f * since), 0, mg.load, 1.0f - mg.load, 0.0f, 1.0f);
+{
+                                // (v0.76 to v0.84 drew the prefab's own flash picture here, a hard-edged star, which read
+                                // as a flat picture stuck on the harpoon. Davi: "feels like a png". Now a soft light: a
+                                // wide glow in the load's colour with a small white heart, shrinking as before.)
+                                float size = 6.4f * UK_UNIT * (1.0f + mg.load) * expf(-5.0f * since), fade = 1.0f - since;
+                                sprite("softglow", mg.o, size * 1.5f, 0, mg.load, 1.0f - mg.load, 0.05f, 0.75f * fade);
+                                sprite("softglow", mg.o, size * 0.45f, 0, 1.0f, 1.0f, 0.9f, 0.9f * fade);
+                            }
+                    }
+                    // the mark over a stunned enemy (ours): a ring turning at its chest, beating between orange and white
+                    for (const Stun &sn : g_stuns) {
+                        float pt[3];
+                        if (!sn.chr || st.time > sn.until || !whip_target_point(sn.chr, pt)) continue;
+                        float beat = 0.5f + 0.5f * sinf((float)st.time * 14.0f);
+                        sprite("RageEffectWhite", pt, 1.3f, (float)fmod(st.time * 180.0, 360.0), 1.0f, 0.45f + 0.5f * beat, 0.1f + 0.7f * beat, 0.9f);
+                        sprite("softglow", pt, 0.9f, 0, 1.0f, 0.5f, 0.1f, 0.35f + 0.25f * beat);
                     }
                     // Rockets: the 'Rocket' prefab's own model along its way (2.1 u long), behind it its trail
                     // (0.15 s long, 1 u wide down to nothing, orange at alpha 0.39) and at its tail the blinking

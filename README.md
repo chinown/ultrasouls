@@ -26,6 +26,7 @@ Everything is matched against ULTRAKILL's own code and prefab data: speeds, timi
 - **Railcannon**: Electric and Malicious.
 - **Rocket launcher**: Freezeframe and S.R.S. Cannon, with rocket riding.
 - **Arms**: Feedbacker (parries, coin punches), Knuckleblaster (blast wave), Whiplash.
+- **Visceral attack**: parry an enemy, then punch it while it reels (not ULTRAKILL's; after Bloodborne's).
 - **HUD**: ULTRAKILL's weapon panel, health and stamina, style meter and ranks, boss bars, the displays on the guns.
 - **Feel**: healing from blood, hit stop, parry flash, camera tilt, explosions that throw you.
 - **Death**: ULTRAKILL's death sequence and screen, and **R** to restart at the last bonfire with no loading.
@@ -72,6 +73,6 @@ The addresses in the DLL are for one build of the Steam exe; [docs/DETAILS.md](d
 
 ## Status
 
-Work in progress, built and tested on one machine. The newest changes (v0.83, v0.84) have not been run in the game yet. Version by version notes, how each part works and what is still missing: [docs/DETAILS.md](docs/DETAILS.md).
+Work in progress, built and tested on one machine. The newest changes (v0.83 to v0.85) have not all been run in the game yet. Version by version notes, how each part works and what is still missing: [docs/DETAILS.md](docs/DETAILS.md).
 
 Not affiliated with FromSoftware, Bandai Namco, Arsi "Hakita" Patala or New Blood Interactive.

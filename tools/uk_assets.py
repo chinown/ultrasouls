@@ -138,6 +138,8 @@ EXTRA_SPRITES = ["RankD", "RankC", "RankB", "RankA", "RankS", "RankSS", "RankSSS
                  # the rocket launcher's pictures for the weapon panel, the ring round a frozen rocket with its
                  # four marks, the flash at a rocket's tail and the one round a cannonball
                  "rocketlauncher", "rocketlauncherglow", "rocketlaunchercannon", "rocketlaunchercannonglow",
+                 "rocketlaunchergasoline", "rocketlaunchergasolineglow",
+                 "Nailgun", "NailgunGlow", "NailgunOverheat", "NailgunOverheatGlow",
                  "RageEffectWhite", "verticalgradient", "muzzleflashshotgun 1", "splash 2",
                  # the main menu: its logo, the picture of V1 with its wings, and the frame round the screen and the buttons
                  "TextmodeLogo", "TextmodeV1", "TextmodeV1Wings", "Round_BorderLarge", "Round_BorderLargeBlack",

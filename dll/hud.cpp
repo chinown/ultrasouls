@@ -1433,9 +1433,17 @@ void build_hud(const HudState &st, float screen_w, float screen_h) {
         } else if (st.weapon == 3) {
             icon_name = st.weapon_var == 1 ? "SawbladeLauncherOverheat" : "SawbladeLauncher";
             glow_name = st.weapon_var == 1 ? "SawbladeLauncherOverheatGlow" : "SawbladeLauncherGlow";
+            if (st.nailgun && g.sprite("Nailgun") >= 0 && g.sprite("NailgunOverheat") >= 0) {
+                icon_name = st.weapon_var == 1 ? "NailgunOverheat" : "Nailgun";
+                glow_name = st.weapon_var == 1 ? "NailgunOverheatGlow" : "NailgunGlow";
+            }
         } else if (st.weapon == 4) {
-            icon_name = st.weapon_var == 1 ? "rocketlaunchercannon" : "rocketlauncher";
-            glow_name = st.weapon_var == 1 ? "rocketlaunchercannonglow" : "rocketlauncherglow";
+            icon_name = st.weapon_var == 2 ? "rocketlaunchergasoline" : st.weapon_var == 1 ? "rocketlaunchercannon" : "rocketlauncher";
+            glow_name = st.weapon_var == 2 ? "rocketlaunchergasolineglow" : st.weapon_var == 1 ? "rocketlaunchercannonglow" : "rocketlauncherglow";
+            if (g.sprite(icon_name) < 0) {           // (an asset pack from before the Firestarter)
+                icon_name = "rocketlauncher";
+                glow_name = "rocketlauncherglow";
+            }
         } else if (st.alt) {
             icon_name = alt_icons[var];
             glow_name = alt_glows[var];
@@ -1459,7 +1467,7 @@ void build_hud(const HudState &st, float screen_w, float screen_h) {
         // (variation 0 blue, 1 green, 2 red: the Pump Charge is the shotgun's 1, the Malicious the railcannon's 2)
         const Color tint = st.weapon == 1 ? (st.weapon_var == 1 ? MARKSMAN_GREEN : PIERCER_BLUE)
                            : st.weapon == 2 ? (st.weapon_var == 1 ? SHARP_RED : PIERCER_BLUE)
-                           : st.weapon == 3 || st.weapon == 4 ? (st.weapon_var == 1 ? MARKSMAN_GREEN : PIERCER_BLUE)
+                           : st.weapon == 3 || st.weapon == 4 ? (st.weapon_var == 2 ? SHARP_RED : st.weapon_var == 1 ? MARKSMAN_GREEN : PIERCER_BLUE)
                            : var == 1 ? MARKSMAN_GREEN : var == 2 ? SHARP_RED : PIERCER_BLUE;
         image_simple(sf, icon, rev, tint, false, s);
         image_simple(sf, icon, glow, {tint.r, tint.g, tint.b, 0.749f}, false, s);
@@ -1816,6 +1824,8 @@ void look_node(const Model &m, int n, float *t) {
     const std::string &nm = m.node_names[n];
     if (g_look.blade != 0 && nm == "Blade") {
         turn_z(t, g_look.blade);
+    } else if (g_look.blade != 0 && (nm == "Barrel_L" || nm == "Barrel_R")) {
+        turn_y(t, nm[7] == 'L' ? g_look.blade : -g_look.blade);        // (the nailgun's barrels, each about its own length)
     } else if (g_look.rail) {
         float level = 0, push = 0;
         if (nm == "Main_Capsule") { level = 5; push = -5; }
@@ -2450,6 +2460,16 @@ void draw_world(ID3D11DeviceContext *ctx, const HudState &st, bool srgb) {
         memcpy(c.world, world, sizeof(c.world));
         c.light[1] = 1.0f;
         c.light[3] = 1.0f;
+        if (wm.oriented && wm.rgba[3] >= 0.99f && !wm.cutout) {
+            // A solid thing with a way it points (a harpoon, a rocket, a cannonball) takes light from above and a
+            // little from behind the viewer, as the weapon in the hand does. Until v0.93 these were drawn at full
+            // brightness on every side: the harpoon's flat end read as a grey card stuck on the enemy.
+            float lx = -st.cam_fwd[0] * 0.45f, ly = 0.85f, lz = -st.cam_fwd[2] * 0.45f, ll = sqrtf(lx * lx + ly * ly + lz * lz);
+            c.light[0] = lx / ll;
+            c.light[1] = ly / ll;
+            c.light[2] = lz / ll;
+            c.light[3] = 0.45f;
+        }
         c.mode[0] = wm.cutout ? 1.0f : 0.0f;
         c.mode[1] = srgb ? 1.0f : 0.0f;
         c.mode[3] = 1.0f;
@@ -2551,6 +2571,9 @@ void draw_rail_arcs(ID3D11DeviceContext *ctx, const HudState &st, Model &m, cons
     upload_consts(ctx, base);
 }
 
+// Where the Feedbacker's fist is, along the view, in its Jab clip's reaching pose (measured on the offline pictures), and
+// which way a positive tip swings the elbow down.
+static const float ARM_HAND_Z = 1.35f, ARM_PITCH_SIGN = -1.0f;
 void draw_viewmodel(ID3D11DeviceContext *ctx, const HudState &st, float aspect, bool srgb) {
     // The meshes are stored already posed in the HUD camera's space (x right, y up, z forward), in the
     // pose the Piercer prefab is saved in. Recoil is a short kick about the grip.
@@ -2611,6 +2634,7 @@ void draw_viewmodel(ID3D11DeviceContext *ctx, const HudState &st, float aspect, 
         Model *rail = st.weapon == 2 ? find_model("railcannon") : nullptr;
         Model *slab = st.weapon == 0 && st.alt ? find_model("revolver_alt") : nullptr;
         Model *saw = st.weapon == 3 ? find_model("sawlauncher") : nullptr;
+        if (saw && st.nailgun && find_model("nailgun")) saw = find_model("nailgun");
         Model *rocket = st.weapon == 4 ? find_model("rocketlauncher") : nullptr;
         Model *weapon = shotgun ? shotgun : rail ? rail : saw ? saw : rocket ? rocket : slab ? slab : revolver;
         bool is_revolver = !shotgun && !rail && !saw && !rocket;
@@ -2698,7 +2722,7 @@ void draw_viewmodel(ID3D11DeviceContext *ctx, const HudState &st, float aspect, 
         {
             // the variation's colour (ColorBlindSettings.variationColors: blue, green, red); the Malicious is the railcannon's third
             static const float var_rgb[3][3] = {{0.251f, 0.906f, 1.0f}, {0.267f, 1.0f, 0.271f}, {1.0f, 0.235f, 0.235f}};
-            int var = rail ? (st.weapon_var == 1 ? 2 : 0) : rocket ? (st.weapon_var == 1 ? 1 : 0) : st.variation < 0 ? 0 : st.variation > 2 ? 2 : st.variation;
+            int var = rail ? (st.weapon_var == 1 ? 2 : 0) : rocket ? (st.weapon_var == 2 ? 2 : st.weapon_var == 1 ? 1 : 0) : st.variation < 0 ? 0 : st.variation > 2 ? 2 : st.variation;
             g_look.on = true;
             g_look.rail = rail != nullptr;
             g_look.alt = slab != nullptr;
@@ -2759,7 +2783,7 @@ void draw_viewmodel(ID3D11DeviceContext *ctx, const HudState &st, float aspect, 
         const Clip *ac = arm ? arm->clip(st.arm_clip) : nullptr;
         float at = (float)(st.time - st.arm_clip_start);
         if (ac && at >= 0 && at <= (ac->frames - 1) / ac->fps) {
-            if (st.arm_push[0] != 0 || st.arm_push[1] != 0 || st.arm_push[2] != 0 || st.arm_roll != 0) {
+            if (st.arm_push[0] != 0 || st.arm_push[1] != 0 || st.arm_push[2] != 0 || st.arm_roll != 0 || st.arm_pitch != 0) {
                 // (the visceral attack: the whole arm goes forward into what is in front, and comes back)
                 MeshConsts cp = ca;
                 float pushed[16];
@@ -2767,6 +2791,16 @@ void draw_viewmodel(ID3D11DeviceContext *ctx, const HudState &st, float aspect, 
                 pushed[12] += st.arm_push[0];
                 pushed[13] += st.arm_push[1];
                 pushed[14] += st.arm_push[2];
+                if (st.arm_pitch != 0) {
+                    // tipped about the hand: the far end of the arm swings down under the view while the fist stays put
+                    float to_pivot[16], tip[16], back[16];
+                    translate(to_pivot, -st.arm_push[0], -(0.05f + st.arm_push[1]), -(ARM_HAND_Z + st.arm_push[2]));
+                    rotate_x(tip, st.arm_pitch * ARM_PITCH_SIGN);
+                    translate(back, st.arm_push[0], 0.05f + st.arm_push[1], ARM_HAND_Z + st.arm_push[2]);
+                    mul44(pushed, to_pivot, pushed);
+                    mul44(pushed, tip, pushed);
+                    mul44(pushed, back, pushed);
+                }
                 if (st.arm_roll != 0) {
                     // turned about the line of sight through where the hand is (a little above the middle of the view)
                     float to_pivot[16], turn[16], back[16];

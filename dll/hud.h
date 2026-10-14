@@ -28,6 +28,7 @@ struct HudState {
     int weapon = 0;                        // 0 revolver, 1 shotgun, 2 railcannon, 3 sawblade launcher
     char weapon_note[40] = "";             // a line written under the weapon's picture (the launcher's saws, magnets and heat)
     bool alt = false;                      // the revolver is the alternate ("Slab") one
+    bool nailgun = false;                  // slot 3 is held in its standard form, the nailgun (its alternate is the sawblade launcher)
     int weapon_var = 0;                    // the shotgun's variation (0 Core Eject, 1 Pump Charge), the railcannon's (0 Electric, 1 Malicious), the launcher's (0 Attractor, 1 Overheat) or the rocket launcher's (0 Freezeframe, 1 S.R.S. Cannon)
     // the rocket launcher (weapon 4): the clock on it (how much of its ring is filled, where its hand points,
     // its colour and how strongly it is drawn) and how far the cannon is wound up, which shakes the gun
@@ -64,6 +65,7 @@ struct HudState {
     int boss_count = 0;
     struct Boss { char name[BOSS_NAME_CHARS]; float hp; } bosses[MAX_BOSSES];
     float red_tint = 0;                    // 0..1: the whole picture washed in red (the visceral attack)
+    float arm_pitch = 0;                   // and tipped up by this much about the hand (the uppercut)
     float arm_roll = 0;                    // and turned by this much about the line of sight, at the middle of the view
     float arm_push[3] = {0, 0, 0};         // the Feedbacker moved from its place by this much (right, up, forward): the visceral attack's thrust
     const char *arm_clip = nullptr;
@@ -136,7 +138,7 @@ struct HudState {
     // texture has scrolled, and its colour with alpha.
     bool cam_valid = false;
     float cam_eye[3] = {0, 0, 0}, cam_right[3] = {1, 0, 0}, cam_up[3] = {0, 1, 0}, cam_fwd[3] = {0, 0, 1}, cam_tan_x = 1, cam_tan_y = 1;
-    enum { MAX_WORLD_MESHES = 96 };
+    enum { MAX_WORLD_MESHES = 288 };
     int world_mesh_count = 0;
     // limits: for an explosion's ball, how far each vertex of the mesh may go from the middle before it
     // meets the game's world (one distance per vertex, in the order hud_model_dirs gives them); the ball

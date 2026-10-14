@@ -25,7 +25,7 @@ BUILD = os.path.join(HERE, "..", "build")
 GAME_DIR = r"F:\SteamLibrary\steamapps\common\DARK SOULS REMASTERED"
 CLASSES = ("NewMovement", "Revolver", "Coin", "GroundCheck", "RevolverBeam", "Punch", "WeaponCharges", "PlayerFootsteps", "Shotgun",
            "Grenade", "Railcannon", "RevolverAnimationReceiver", "HookArm", "Nailgun", "Nail", "Spin", "Harpoon", "TimeBomb", "DeathSequence", "TextAppearByLines", "LaughingSkull", "PlayOnAwakeTracker",
-           "RocketLauncher", "Cannonball", "PhysicalShockwave")
+           "RocketLauncher", "Cannonball", "PhysicalShockwave", "FireObjectPool")
 
 # sound name in the pack -> (class, object the component is on, field). A field that names a prefab is
 # followed to the first AudioSource under it. Volumes and pitches are set by the DLL, from ULTRAKILL's code.
@@ -105,6 +105,7 @@ WANTED = {
     "hook_clink": ("HookArm", "Hook Arm", "clinkSparks"),             # the hook meeting a wall
     # the Sawblade Launcher
     "saw_shot": ("Nailgun", "Sawblade Launcher Magnet", "muzzleFlash"),
+    "nail_shot": ("Nailgun", "Nailgun Magnet", "muzzleFlash"),
     "saw_shot_super": ("Nailgun", "Sawblade Launcher Magnet", "muzzleFlash2"),
     "saw_snap": ("Nailgun", "Sawblade Launcher Magnet", "snapSound"),
     "saw_magnet": ("Nailgun", "Sawblade Launcher Magnet", "magnetShotSound"),
@@ -135,6 +136,12 @@ WANTED = {
     "rocket_tick": ("RocketLauncher", "Rocket Launcher Freeze", "timerTickSound"),
     "rocket_wind": ("RocketLauncher", "Rocket Launcher Freeze", "timerWindupSound"),
     "srs_charge": ("RocketLauncher", "Rocket Launcher Cannonball", "chargeSound"),
+    # the Firestarter's spray (its loop and the burst it starts with), its end, the click of an empty tank, and a fire's own sound
+    "napalm_loop": ("RocketLauncher", "Rocket Launcher Napalm", "napalmMuzzleFlashSounds[0]"),
+    "napalm_start": ("RocketLauncher", "Rocket Launcher Napalm", "napalmMuzzleFlashSounds[1]"),
+    "napalm_stop": ("RocketLauncher", "Rocket Launcher Napalm", "napalmStopSound"),
+    "napalm_empty": ("RocketLauncher", "Rocket Launcher Napalm", "napalmNoAmmoSound"),
+    "fire_loop": ("FireObjectPool", "BloodsplatterManager", "simpleFirePrefab"),
     # a rocket in flight, one that has hung frozen for a second, and one going off against a wall
     "rocket_loop": ("Grenade", "Rocket", "m_GameObject"),
     "rocket_levelup": ("Grenade", "Rocket", "levelUpEffect"),
@@ -269,23 +276,146 @@ def decode(clip):
         return w.getframerate(), w.getnchannels(), w.readframes(w.getnframes())
 
 
+def find_ffmpeg():
+    import shutil
+    here = "C:" + os.sep + "ffmpeg" + os.sep + "ffmpeg.exe"
+    return shutil.which("ffmpeg") or (here if os.path.exists(here) else None)
+
+
+# Dark Souls' own sounds, taken out of your own copy's sound bank as the pack is made (nothing of them is in the
+# repository): the three of its critical hit. pack name -> the sample's name in sound/frpg_main.fsb
+#   kill-chance   the low swell as a parry lands and the enemy is open
+#   kill1         the weapon going in
+#   kill-success  the hit of the critical itself
+DS_SOUNDS = {"visc_parry": "kill-chance.wav", "visc_in": "kill1.wav", "visc_rip": "kill-success.wav"}
+
+
+def _mp3_frame_len(h):
+    b = struct.unpack(">I", h)[0]
+    if (b >> 21) != 0x7FF:
+        return 0
+    ver, layer, br_i, sr_i, pad = (b >> 19) & 3, (b >> 17) & 3, (b >> 12) & 15, (b >> 10) & 3, (b >> 9) & 1
+    if layer != 1 or br_i in (0, 15) or sr_i == 3 or ver == 1:
+        return 0
+    br = ([0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320] if ver == 3
+          else [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160])[br_i] * 1000
+    sr = [44100, 48000, 32000][sr_i] >> (0 if ver == 3 else 1 if ver == 2 else 2)
+    return (144 if ver == 3 else 72) * br // sr + pad
+
+
+def ds_sounds():
+    """{pack name: (rate, channels, 16-bit PCM)} for DS_SOUNDS. The bank is an FSB4 of MP3 samples one after the
+    other, each sample's frames padded out to four bytes; the padding is dropped and ffmpeg decodes the rest."""
+    import subprocess
+    import tempfile
+    import wave
+    path = os.path.join(GAME_DIR, "sound", "frpg_main.fsb")
+    ffmpeg = find_ffmpeg()
+    out = {}
+    try:
+        d = open(path, "rb").read()
+    except OSError:
+        print("SKIPPED Dark Souls' own sounds: %s is not there" % path)
+        return out
+    if d[:4] != b"FSB4" or not ffmpeg:
+        print("SKIPPED Dark Souls' own sounds: %s" % ("ffmpeg is needed to decode them" if d[:4] == b"FSB4" else "the bank is not an FSB4"))
+        return out
+    count, headers = struct.unpack_from("<II", d, 4)
+    pos, cur = 0x30, 0x30 + headers
+    wanted = {v: k for k, v in DS_SOUNDS.items()}
+    for _ in range(count):
+        size = struct.unpack_from("<H", d, pos)[0]
+        name = d[pos + 2:pos + 32].split(b"\0")[0].decode("latin1")
+        length = struct.unpack_from("<I", d, pos + 36)[0]
+        if name in wanted:
+            frames = bytearray()
+            p, end = cur, cur + length
+            while p + 4 <= end:
+                fl = _mp3_frame_len(d[p:p + 4])
+                if not fl:
+                    p += 1
+                    continue
+                frames += d[p:p + fl]
+                p += fl
+            mp3 = os.path.join(tempfile.gettempdir(), "ultrasouls_ds.mp3")
+            wav = os.path.join(tempfile.gettempdir(), "ultrasouls_ds.wav")
+            try:
+                open(mp3, "wb").write(frames)
+                subprocess.run([ffmpeg, "-y", "-loglevel", "error", "-i", mp3, "-ar", "48000", "-ac", "1", "-c:a", "pcm_s16le", wav], check=True)
+                with wave.open(wav, "rb") as w:
+                    out[wanted[name]] = (w.getframerate(), w.getnchannels(), w.readframes(w.getnframes()))
+            except Exception as e:
+                print("SKIPPED %s of Dark Souls: %s" % (name, e))
+            finally:
+                for f in (mp3, wav):
+                    if os.path.exists(f):
+                        os.remove(f)
+        cur += length
+        pos += size
+    return out
+
+
 def made_sounds():
-    """Sounds that are neither game's: made here from sines and noise. {name: (rate, 16-bit mono PCM)}
-    parry_clang: the ring of a parry that opens an enemy to the visceral attack (a struck-metal clang over a
-    low thump: a handful of partials that are not multiples of each other, each dying away at its own rate)."""
+    """Sounds of your own, which are neither game's: the files in reference/sounds (a folder that is not in the
+    repository) go into the pack. A 16-bit WAV is read as it is; anything else (MP3, OGG, M4A) is decoded by
+    ffmpeg if there is one (on the PATH or at C:\ffmpeg\ffmpeg.exe). Silence at the front is cut off, so a sound
+    starts when it is asked for. The pack name is the file's name, or the one names.txt in that folder gives it
+    (a line each: FILE NAME). The mod plays these if they are there:
+      visc_parry   as a parry stuns an enemy, opening it to the visceral attack
+      visc_in      as the hand goes in
+      visc_rip     as it is torn out
+    {name: (rate, channels, 16-bit PCM)}"""
+    import glob
+    import shutil
+    import subprocess
+    import tempfile
+    import wave
     import numpy as np
-    rate = 48000
-    t = np.arange(int(rate * 1.1)) / rate
-    rng = np.random.default_rng(7)
-    clang = sum(a * np.sin(2 * np.pi * f * t + p) * np.exp(-d * t)
-                for f, a, d, p in ((523, 0.50, 5.0, 0.0), (1244, 0.42, 6.5, 1.0), (1987, 0.34, 8.0, 2.1), (2890, 0.26, 10.0, 0.4),
-                                   (4310, 0.18, 13.0, 1.7), (6120, 0.10, 17.0, 2.9)))
-    strike = rng.standard_normal(len(t)) * np.exp(-90.0 * t) * 0.9
-    thump = np.sin(2 * np.pi * (95.0 * t - 60.0 * t * t).clip(0)) * np.exp(-14.0 * t) * 0.8
-    x = clang + strike + thump
-    x *= np.minimum(1.0, t / 0.002)
-    x = x / np.abs(x).max() * 0.9
-    return {"parry_clang": (rate, (x * 32767).astype("<i2").tobytes())}
+    folder = os.path.join(HERE, "..", "reference", "sounds")
+    names = {}
+    try:
+        for line in open(os.path.join(folder, "names.txt"), encoding="utf-8"):
+            parts = line.split()
+            if len(parts) >= 2 and not line.lstrip().startswith("#"):
+                names[parts[0].lower()] = parts[1].lower()
+    except OSError:
+        pass
+    ffmpeg = find_ffmpeg()
+    out = {}
+    for path in sorted(glob.glob(os.path.join(folder, "*"))):
+        base = os.path.basename(path).lower()
+        ext = os.path.splitext(base)[1]
+        if ext not in (".wav", ".mp3", ".ogg", ".m4a", ".flac"):
+            continue
+        name = names.get(base, os.path.splitext(base)[0])[:39]
+        if base not in names and not name.startswith("visc_"):
+            continue                             # (a file nobody has given a part to stays out of the pack)
+        tmp = None
+        try:
+            src = path
+            if ext != ".wav":
+                if not ffmpeg:
+                    print("SKIPPED %s: ffmpeg is needed for anything but WAV" % path)
+                    continue
+                tmp = os.path.join(tempfile.gettempdir(), "ultrasouls_snd.wav")
+                subprocess.run([ffmpeg, "-y", "-loglevel", "error", "-i", path, "-ar", "48000", "-c:a", "pcm_s16le", tmp], check=True)
+                src = tmp
+            with wave.open(src, "rb") as w:
+                if w.getsampwidth() != 2 or w.getnchannels() not in (1, 2):
+                    print("SKIPPED %s: it has to be 16-bit, mono or stereo" % path)
+                    continue
+                rate, channels = w.getframerate(), w.getnchannels()
+                pcm = np.frombuffer(w.readframes(w.getnframes()), dtype="<i2").reshape(-1, channels)
+            loud = np.abs(pcm).max(axis=1)
+            first = int(np.argmax(loud > 0.03 * max(int(loud.max()), 1)))
+            first = max(0, first - rate // 200)
+            out[name] = (rate, channels, pcm[first:].tobytes())
+        except Exception as e:
+            print("SKIPPED %s: %s" % (path, e))
+        finally:
+            if tmp and os.path.exists(tmp):
+                os.remove(tmp)
+    return out
 
 
 def cmd_pack(install=False):
@@ -306,9 +436,15 @@ def cmd_pack(install=False):
         frames = len(pcm) // (2 * channels)
         entries.append((name, rate, channels, frames, pcm))
         print("%-18s %6d Hz, %d ch, %.2f s" % (name, rate, channels, frames / rate))
-    for name, (rate, pcm) in made_sounds().items():
-        entries.append((name, rate, 1, len(pcm) // 2, pcm))
-        print("%-18s %6d Hz, 1 ch, %.2f s (made here)" % (name, rate, len(pcm) / 2 / rate))
+    for name, (rate, channels, pcm) in ds_sounds().items():
+        frames = len(pcm) // (2 * channels)
+        entries.append((name, rate, channels, frames, pcm))
+        print("%-18s %6d Hz, %d ch, %.2f s (Dark Souls' own %s, from your copy)" % (name, rate, channels, frames / rate, DS_SOUNDS[name]))
+    for name, (rate, channels, pcm) in made_sounds().items():
+        entries = [e for e in entries if e[0] != name]
+        frames = len(pcm) // (2 * channels)
+        entries.append((name, rate, channels, frames, pcm))
+        print("%-18s %6d Hz, %d ch, %.2f s (your own, from reference/sounds)" % (name, rate, channels, frames / rate))
     with open(out, "wb") as f:
         f.write(b"USSND001" + struct.pack("<I", len(entries)))
         for name, rate, channels, frames, pcm in entries:

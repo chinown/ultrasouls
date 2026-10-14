@@ -21,6 +21,40 @@ DEFS = os.path.join(ROOT, "backup", "paramdef.paramdefbnd.dcx")
 OUT = os.path.join(ROOT, "build", "GameParam.parambnd.dcx")
 GAME = r"F:\SteamLibrary\steamapps\common\DARK SOULS REMASTERED\param\GameParam\GameParam.parambnd.dcx"
 
+# ---- Enemy health, the same everywhere (v0.94; `--vanilla-enemies` leaves the enemies as the game has them).
+# V1's weapons deal what they deal: nothing about the player's level, strength or weapon goes into them (their rows
+# have a fixed attack value). Dark Souls' enemies, though, are scaled to the level the player is expected to have:
+#   - every enemy row carries one of the effects 7001 to 7015 (and some 7100) for the area it stands in, which
+#     multiply its health by up to 2.7, its defence by up to 3 and its attacks by up to 2.5;
+#   - a finished game adds the row's GameClearSpEffectID (7401 to 7415): health up to x2.7 again, defence up to
+#     x1.7, attacks up to x2.4;
+#   - and defence is a flat amount off every hit, which a fixed attack value falls under as it grows.
+# Worked out from the game's own tables with its damage rule (attack a against defence d: a - 0.79 d e^(-0.27 d / a),
+# or 0.4 a^3/d^2 - 0.09 a^2/d + 0.1 a when d is the larger): a revolver shot takes about 90 from a hollow in the
+# Undead Burg and about 20 from anything in the late areas; half of all enemy rows need 11 shots or more, a tenth
+# need 85, Gwyn 209, Kalameet 321, the Four Kings 407, before New Game+ doubles it.
+# So, with the balance on:
+#   - the area effects and the New Game+ effects no longer touch health or defence (the New Game+ ones keep what
+#     they do to the enemies' attacks: a harder game hits harder, as ULTRAKILL's difficulties do, with the same
+#     health); the area effects no longer raise the enemies' attacks either, unless `--keep-enemy-attack` is given,
+#     so that a character of any level can stand in any area;
+#   - every enemy's physical defence is 1 (and nothing extra against a cut, a blow or a thrust), so each of the
+#     mod's attacks takes its ULTRAKILL share of a revolver shot from every enemy alike, and the shares that
+#     had been raised to get past the defence (a pellet, a nail, a saw, the whiplash) are ULTRAKILL's own again;
+#   - every enemy's health is its own base health, the number the game has before any scaling, at the rate
+#     the first areas had: 80 of it to a revolver shot. A hollow soldier stays a shot or two wherever it stands.
+#     A boss gets four times that (20 of its base health to a shot), because V1 deals several times what a
+#     Dark Souls character does in the same time: 40 to 130 shots, the Four Kings' shared health 216.
+# Left alone: rows with under 10 health (things that die to anything), the two with 999 health and 999 defence
+# (things that are not meant to be hurt), and the friendly characters. Souls are untouched.
+BALANCE = "--vanilla-enemies" not in sys.argv
+KEEP_ENEMY_ATTACK = "--keep-enemy-attack" in sys.argv
+SHOT_HEALTH = 80.0          # base health to one revolver shot: what the Undead Burg's hollows take now
+BOSS_SHOT_HEALTH = 20.0     # the same for a boss
+MOST_SHOTS = 24.0           # no enemy that is not a boss takes more than this
+AREA_EFFECTS = list(range(7001, 7016)) + [7100]
+NEW_GAME_EFFECTS = list(range(7401, 7416))
+
 HEAL_SPEFFECT = 6990        # Butcher Knife's heal-on-hit, reused for every melee weapon
 HEAL_PER_HIT = 100
 MELEE_CATEGORIES = range(0, 10)   # dagger .. fist; excludes bows, crossbows, shields, ammo
@@ -92,13 +126,24 @@ ARM_ROWS = {
     # nothing every 0.8 s, and a punch on it while it reels is this one blow.
     "stun":          (9000205, 0.05,                  1.5,   0.5,    3,        200,   0.0),
     "visceral":      (9000206, 12.0,                  1.5,   0.5,    4,        1000,  8.0),
+    # The Firestarter: an oiled enemy on fire takes half a shot every half second (EnemyIdentifier.Burn), and one
+    # standing in burning oil a whole one (FireZone, with Napalm as its source). Neither staggers.
+    "burn":          (9000207, 0.5,                   1.5,   0.5,    0,        0,     0.0),
+    "fire":          (9000208, 1.0,                   1.5,   0.5,    0,        0,     0.0),
+    # A nail of the nailgun: about a fifth of a revolver's shot in ULTRAKILL (0.205). Half of the revolver's attack
+    # here, as a shotgun pellet's quarter is 0.57: Dark Souls takes a flat amount off every hit.
+    "nail":          (9000209, 0.5,                   1.2,   0.3,    0,        0,     0.0),
 }
 PELLET_ID = 9000140         # one shotgun pellet. Shotgun.Shoot sends twelve; Projectile deals damage / 4 = a quarter of a revolver shot
 # Dark Souls takes a flat defence off every hit, which punishes many small hits. Measured on a hollow that
 # one revolver shot takes 64 health from: a pellet at 0.45 of the revolver's attack value took 10. By the
 # game's damage formula for an attack below the defence (0.4 a^3/d^2 - 0.09 a^2/d + 0.1 a, which gives
 # that 10 with d = 136), 0.57 of the revolver's attack value is what lands a quarter of its damage there.
-PELLET_DAMAGE = int(REVOLVER_DAMAGE * 0.57)
+PELLET_DAMAGE = int(REVOLVER_DAMAGE * (0.25 if BALANCE else 0.57))
+if BALANCE:
+    # (with every enemy's defence at 1 the shares are ULTRAKILL's own: no need to push them past a flat defence)
+    for _name, _share in (("whiplash", 0.2), ("saw_attractor", 0.75), ("saw_overheat", 0.6), ("nail", 0.205)):
+        ARM_ROWS[_name] = (ARM_ROWS[_name][0], _share) + ARM_ROWS[_name][2:]
 PELLET_SPEED = 37.5         # 75 units a second
 PELLET_RANGE = 60.0
 SHARP_ID = 9000150          # the Sharpshooter's charged shot: goes through enemies (hitAmount 999); the DLL does the ricochets
@@ -278,7 +323,7 @@ for rid in OWN_ROWS:
 #   Not stopped by a shield: explosions, both railcannons, the Piercer's charged shots, a coin's shot from behind.
 #   The Knuckleblaster's punch takes a kick's worth of stamina: one that is blocked breaks the guard.
 UNBLOCKABLE = [PIERCER_ID, 9000161, 9000170, 9000171] + [ARM_ROWS[k][0] for k in ("explosion", "explosion_super", "explosion_pump", "explosion_malicious", "explosion_ultra",
-                                                                          "explosion_big", "explosion_super_big", "shockwave", "stun", "visceral")] \
+                                                                          "explosion_big", "explosion_super_big", "shockwave", "stun", "visceral", "burn", "fire")] \
     + [COIN_BACK_ID + i for i in range(len(COIN_POWERS))] + [COIN_ALT_ID + q for q in range(4, COIN_ALT_MAX + 1)]
 for rid in UNBLOCKABLE:
     atk.set(rid, "disableGuard", 1)
@@ -303,6 +348,53 @@ if v1_body:
         pro.set(rid, "equipModelGender", 0)          # 0: one file for both sexes ("_A_")
     for i in range(16):
         pro.set(901000, "invisibleFlag%02d" % i, 1)
+
+balance_note = "enemies left as the game has them (--vanilla-enemies)"
+if BALANCE:
+    npc, spe = g["NpcParam"], g["SpEffectParam"]
+    DEFENCE_RATES = ("physicsDiffenceRate", "magicDiffenceRate", "fireDiffenceRate", "thunderDiffenceRate")
+    ATTACK_RATES = ("physicsAttackPowerRate", "magicAttackPowerRate", "fireAttackPowerRate", "thunderAttackPowerRate")
+    for sid in AREA_EFFECTS + NEW_GAME_EFFECTS:
+        spe.set(sid, "maxHpRate", 1.0)
+        for k in DEFENCE_RATES:
+            spe.set(sid, k, 1.0)
+    if not KEEP_ENEMY_ATTACK:
+        for sid in AREA_EFFECTS:
+            for k in ATTACK_RATES:
+                spe.set(sid, k, 1.0)
+    try:
+        import ds_names
+        boss_names = ds_names.boss_rows(npc.order)
+    except Exception as e:                       # (no game text to read them from: the game's own boss mark alone)
+        print("boss names not read (%s): bosses are the rows the game marks as such" % e)
+        boss_names = {}
+    balanced = {}
+    for rid in npc.order:
+        hp, soul = npc.get(rid, "hp"), npc.get(rid, "getSoul")
+        if hp < 10 or (hp == 999 and npc.get(rid, "def_phys") >= 900):
+            continue
+        named = rid in boss_names
+        if not named and npc.get(rid, "npcType") == 2 and npc.get(rid, "teamType") == 2:
+            continue                             # a friendly character
+        # A boss: named as one in the game's text, or marked as one in its row; but not the lesser copies of a boss
+        # that stand about later as ordinary enemies, which are the ones that pay souls themselves and are small.
+        boss = (named or npc.get(rid, "npcType") == 1) and hp >= 500 and (soul == 0 or hp >= 1500)
+        shots = hp / BOSS_SHOT_HEALTH if boss else min(hp / SHOT_HEALTH, MOST_SHOTS)
+        npc.set(rid, "hp", max(1, int(round(shots * REVOLVER_DAMAGE))))
+        npc.set(rid, "def_phys", 1)
+        for k in ("def_slash", "def_blow", "def_thrust"):
+            npc.set(rid, k, 0)
+        balanced[rid] = (hp, shots, boss)
+    n_boss = sum(1 for v in balanced.values() if v[2])
+    reg = sorted(v[1] for v in balanced.values() if not v[2])
+    bos = sorted(v[1] for v in balanced.values() if v[2])
+    balance_note = ("%d enemies given the same health everywhere: %d bosses at %.0f to %.0f revolver shots (half of them under %.0f), "
+                    "the rest at %.1f to %.0f (half under %.1f, nine in ten under %.1f); enemy attacks %s" % (
+                        len(balanced), n_boss, bos[0], bos[-1], bos[len(bos) // 2], reg[0], reg[-1], reg[len(reg) // 2], reg[int(len(reg) * 0.9)],
+                        "still grow by area (--keep-enemy-attack)" if KEEP_ENEMY_ATTACK else "no longer grow by area"))
+    if "--list-enemies" in sys.argv:
+        for rid, (hp, shots, boss) in sorted(balanced.items(), key=lambda kv: (not kv[1][2], -kv[1][1])):
+            print("  %7d %-28s base health %5d -> %5d (%5.1f shots)%s" % (rid, boss_names.get(rid, ""), hp, npc.get(rid, "hp"), shots, "  boss" if boss else ""))
 
 os.makedirs(os.path.dirname(OUT), exist_ok=True)
 g.save(OUT)
@@ -333,8 +425,19 @@ assert chk["AtkParam_Pc"].get(COIN_ALT_ID + 49, "atkPhys") == int(REVOLVER_DAMAG
 assert chk["Bullet"].get(ARM_ROWS["explosion_ultra"][0], "hitRadius") == 0.5 and chk["AtkParam_Pc"].get(COIN_ALT_ID + 4, "disableGuard") == 1
 assert chk["EquipParamProtector"].get(901000, "equipModelId") == (V1_MODEL_ID if v1_body else 0) and chk["EquipParamProtector"].get(900000, "equipModelId") == 0
 assert chk["EquipParamProtector"].get(901000, "invisibleFlag12") == (1 if v1_body else 0) and chk["EquipParamProtector"].get(903000, "equipModelGender") == (0 if v1_body else 3)
-assert chk["AtkParam_Pc"].get(ARM_ROWS["whiplash"][0], "atkPhys") == REVOLVER_DAMAGE // 2 and chk["BehaviorParam_PC"].get(9000190, "refId") == 9000190
+assert chk["AtkParam_Pc"].get(ARM_ROWS["whiplash"][0], "atkPhys") == int(REVOLVER_DAMAGE * ARM_ROWS["whiplash"][1]) and chk["BehaviorParam_PC"].get(9000190, "refId") == 9000190
 print(f"stamina zeroed on {n_stam} behaviours; heal-on-hit on {n_heal} melee weapons ({n_full} had no free slot); {n_shot} projectiles retuned; {n_shop} ammo shop prices set to 1")
+if BALANCE:
+    # read back: Gwyn (1550 of base health, a boss) and a Burg hollow (85), an area effect and a New Game+ one
+    cn, cs = chk["NpcParam"], chk["SpEffectParam"]
+    assert cn.get(537000, "hp") == int(round(1550 / BOSS_SHOT_HEALTH * REVOLVER_DAMAGE)) and cn.get(537000, "def_phys") == 1 and cn.get(537000, "def_thrust") == 0
+    assert cn.get(255000, "hp") == int(round(85 / SHOT_HEALTH * REVOLVER_DAMAGE)) and cn.get(255000, "def_phys") == 1
+    assert cn.get(540000, "hp") == 999 and cn.get(540000, "def_phys") == 999              # (the Bed of Chaos is left as it is)
+    assert abs(cs.get(7014, "maxHpRate") - 1) < 1e-6 and abs(cs.get(7014, "physicsDiffenceRate") - 1) < 1e-6
+    assert abs(cs.get(7401, "maxHpRate") - 1) < 1e-6 and abs(cs.get(7401, "physicsAttackPowerRate") - 2.4) < 1e-3
+    assert KEEP_ENEMY_ATTACK or abs(cs.get(7014, "physicsAttackPowerRate") - 1) < 1e-6
+    assert chk["AtkParam_Pc"].get(ARM_ROWS["nail"][0], "atkPhys") == int(REVOLVER_DAMAGE * 0.205)
+print(balance_note)
 print("V1's body for an unarmoured player: %s" % ("on (the pieces are in the game's parts folder)" if v1_body else "off (the pieces are not installed: tools/ds_v1_body.py)"))
 print("built", os.path.normpath(OUT), os.path.getsize(OUT), "bytes")
 

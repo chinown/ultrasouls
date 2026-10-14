@@ -655,6 +655,14 @@ int main(int argc, char **argv) {
             s.saw_count = k == 0 ? 10 : 7;
             s.magnet_charge = k == 0 ? 3.0f : 1.4f;
             s.heat_sink = k == 6 || k == 7 ? 0.3f : 1.0f;
+            if (k >= 8 && k <= 11) {                 // (the nailgun: its Attractor with 64 nails, then its Overheat half hot with both heat sinks in)
+                s.nailgun = true;
+                s.weapon_var = k >= 10 ? 1 : 0;
+                s.saw_count = 64;
+                s.heat_sink = 2.0f;
+                s.blade_heat = k >= 10 ? 0.5f : 0.0f;
+                if (k == 8 || k == 10) s.revolver_clip = nullptr;
+            }
             s.cam_valid = true;
             s.cam_tan_y = 0.8f;
             s.cam_tan_x = 0.8f * 16.0f / 9.0f;
@@ -668,6 +676,7 @@ int main(int argc, char **argv) {
                 aimed(s, model, -3.5f, 1.2f, 10.0f, 0, 1, 1, true, 2.1f);
                 aimed(s, "fx_saw_heated", 3.5f, 1.8f, 13.0f, -1, -0.3f, -1, true, 0.2f);
                 aimed(s, "fx_harpoon", 2.2f, -0.2f, 7.0f, 0.3f, -1, 0.4f, false, 0);
+                if (k == 1) aimed(s, "fx_harpoon", -1.4f, 0.5f, 3.2f, 1, -0.2f, 0.3f, false, 0);       // one close by, seen from the side
                 // the level saw's trail, as the DLL gives it: additive, thinning from 1 m to nothing, here round
                 // two thirds of the 4.6 m circle a magnet holds a saw on, a point every ten degrees
                 hud_trail_begin(s, true);
@@ -716,8 +725,8 @@ int main(int argc, char **argv) {
             add("rocket_%d", k++, s, 0.33f, 0.34f, 0.37f);
         }
         // v0.86: the visceral attack's arm: drawn back, halfway in, in (with the splash over the hand), coming out
-        static const struct { float pose, right, up, fwd; bool gore; } visc[] = {
-            {0.0f, 0, -0.03f, 0.0f, false}, {0.05f, 0.12f, 0.015f, 0.30f, false}, {0.10f, 0.24f, 0.06f, 0.60f, true}, {0.2f, 0.12f, 0.03f, 0.2f, false}};
+        static const struct { float pose, right, up, fwd; bool gore; float pitch; } visc[] = {
+            {0.06f, 0.16f, -0.50f, 0.10f, false, 0.85f}, {0.08f, 0.20f, -0.20f, 0.36f, false, 0.60f}, {0.10f, 0.24f, 0.08f, 0.60f, true, 0.35f}, {0.2f, 0.29f, -0.15f, 0.24f, false, 0.73f}};
         k = 0;
         for (const auto &v : visc) {
             s = HudState();
@@ -729,7 +738,8 @@ int main(int argc, char **argv) {
             s.arm_push[0] = v.right;
             s.arm_push[1] = v.up;
             s.arm_push[2] = v.fwd;
-            s.arm_roll = v.gore ? 0.34f : 0.0f;
+            s.arm_roll = 0.0f;
+            s.arm_pitch = v.pitch;
             if (v.gore) {
                 s.screen_blood[s.screen_blood_count++] = {-12.0f, 34.0f, 1, 0.62f, 0.50f};
                 s.screen_blood[s.screen_blood_count++] = {-4.0f, 44.0f, 3, 0.55f, 0.32f};

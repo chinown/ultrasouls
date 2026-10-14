@@ -56,7 +56,7 @@ CAB = uk_assets.REVOLVER_PREFAB[0]
 MODELS = {"revolver": "Revolver Pierce", "feedbacker": "Arm Blue", "knuckleblaster": "Arm Red",
           "shotgun": "Shotgun Grenade", "revolver_alt": "Alternative Revolver Pierce",
           "railcannon": "Railcannon Electric", "whiplash": "Hook Arm",
-          "sawlauncher": "Sawblade Launcher Magnet",
+          "sawlauncher": "Sawblade Launcher Magnet", "nailgun": "Nailgun Magnet",
           "rocketlauncher": "Rocket Launcher Freeze"}    # pack name -> prefab root object
 # The displays on each weapon: model -> [(name prefix, the prefab they are read from)]. The three
 # revolvers share one rig, so the Marksman's and the Sharpshooter's displays are fixed to the same bone of
@@ -65,6 +65,7 @@ SCREENS = {"revolver": [("pierce", "Revolver Pierce"), ("marksman", "Revolver Ri
            "revolver_alt": [("pierce", "Alternative Revolver Pierce"), ("marksman", "Alternative Revolver Ricochet"), ("sharp", "Alternative Revolver Twirl")],
            "shotgun": [("core", "Shotgun Grenade"), ("pump", "Shotgun Pump")],
            "sawlauncher": [("magnet", "Sawblade Launcher Magnet"), ("overheat", "Sawblade Launcher Overheat")],
+           "nailgun": [("magnet", "Nailgun Magnet"), ("overheat", "Nailgun Overheat")],
            "rocketlauncher": [("clock", "Rocket Launcher Freeze")]}
 # The rocket launcher's display is a clock hung in the air over the gun (the same on both of its variations
 # here): its panels are named after what the DLL does with each.
@@ -82,7 +83,8 @@ PROPS = {"fx_sphere": ("Explosion", "Sphere_8"),          # the explosion's ball
 # Rigid parts of a weapon that are not skinned to its skeleton: model -> [(prefab root, object in it)]. A part
 # hangs from the model's node of its own name or, where the model has none, from the nearest node above it
 # that the model has by name (the Overheat's second, glowing blade 'Blade (1)' sits on 'Blade', a tenth larger).
-RIGID = {"sawlauncher": [("Sawblade Launcher Magnet", "Blade"), ("Sawblade Launcher Overheat", "Blade (1)")]}
+RIGID = {"sawlauncher": [("Sawblade Launcher Magnet", "Blade"), ("Sawblade Launcher Overheat", "Blade (1)")],
+         "nailgun": [("Nailgun Magnet", "Barrel_L"), ("Nailgun Magnet", "Barrel_R")]}      # the two barrels, which turn
 # Things that fly through the world, each a prefab kept whole: in ULTRAKILL's units about its own root and
 # in the root's axes, so the DLL only has to say where the root is and which way it points. An object with
 # a Spin script keeps a node of its own (the saw's teeth turn on the hub).
@@ -91,6 +93,7 @@ RIGID = {"sawlauncher": [("Sawblade Launcher Magnet", "Blade"), ("Sawblade Launc
 #   the Attractor's magnet: the harpoon, pointing along the root's z
 #   a rocket: its 'Model', pointing along the root's z
 FLYERS = {"fx_saw": "NailAltFodder", "fx_saw_overheat": "NailAlt", "fx_saw_heated": "NailAltHeated", "fx_harpoon": "Harpoon",
+          "fx_nail": "NailFodder",
           "fx_rocket": "Rocket"}
 
 
@@ -279,7 +282,7 @@ def build_model(name, root_name):
             h = MeshHandler(mesh)
             h.process()
             pos = np.array(h.m_Vertices, dtype=np.float64).reshape(-1, 3)
-            nrm = np.array(h.m_Normals, dtype=np.float64).reshape(-1, 3) if h.m_Normals else np.zeros_like(pos)
+            nrm = np.array(h.m_Normals, dtype=np.float64).reshape(len(pos), -1)[:, :3].copy() if h.m_Normals else np.zeros_like(pos)
             uv = np.array(h.m_UV0, dtype=np.float64).reshape(len(pos), -1)[:, :2] if h.m_UV0 else np.zeros((len(pos), 2))
             uv = uv.copy()
             uv[:, 1] = 1.0 - uv[:, 1]                         # Unity's V runs bottom-up, the stored image is top-down
@@ -635,7 +638,7 @@ def geometry_of(node):
         h = MeshHandler(mesh.read())
         h.process()
         pos = np.array(h.m_Vertices, dtype=np.float64).reshape(-1, 3)
-        nrm = np.array(h.m_Normals, dtype=np.float64).reshape(-1, 3) if h.m_Normals else np.zeros_like(pos)
+        nrm = np.array(h.m_Normals, dtype=np.float64).reshape(len(pos), -1)[:, :3].copy() if h.m_Normals else np.zeros_like(pos)
         uv = np.array(h.m_UV0, dtype=np.float64).reshape(len(pos), -1)[:, :2].copy() if h.m_UV0 else np.zeros((len(pos), 2))
         tris = [i for sub in h.get_triangles() for tri in sub for i in tri]
     else:

@@ -41,19 +41,22 @@ def fmg_strings(data):
     return out
 
 
-def main(install=False):
+def boss_rows(npc_ids):
+    """{NpcParam row id: boss name} for the rows among `npc_ids` that the game's own text names as a boss."""
     bnd = Bnd3(dcx_decompress(open(os.path.join(GAME_DIR, "msg", "ENGLISH", "item.msgbnd.dcx"), "rb").read()))
     names = {}
     for e in bnd.entries:                          # the base game's file, then the one the DLC adds to it
         if "NPC_name_" in e.get("name", ""):
             names.update(fmg_strings(bnd.data(e)))
+    # (below 2000 the text is the human characters' names)
+    return {rid: names[rid // 100] for rid in npc_ids if rid // 100 >= 2000 and rid // 100 in names}
+
+
+def main(install=False):
     g = GameParam(os.path.join(ROOT, "backup", "GameParam.parambnd.dcx.current"), os.path.join(ROOT, "backup", "paramdef.paramdefbnd.dcx"))
     npc = g["NpcParam"]
-    lines = []
-    for rid in npc.order:
-        model = rid // 100
-        if model >= 2000 and model in names:       # below 2000 the text is the human characters' names
-            lines.append("%d\t%s" % (rid, names[model]))
+    bosses = boss_rows(npc.order)
+    lines = ["%d\t%s" % (rid, bosses[rid]) for rid in npc.order if rid in bosses]
     os.makedirs(os.path.dirname(OUT), exist_ok=True)
     open(OUT, "w", encoding="utf-8", newline="\n").write("\n".join(lines) + "\n")
     print("wrote", os.path.normpath(OUT), len(lines), "boss rows of", len(npc.order), "characters")

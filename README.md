@@ -22,15 +22,17 @@ Everything is matched against ULTRAKILL's own code and prefab data: speeds, timi
 - **Movement**: jump, dash, slide, ground slam, wall jumps, slam storage, dash and slide jumps.
 - **Revolvers**: Piercer, Marksman (coins and ricoshots) and Sharpshooter, each with its alternate "Slab" form.
 - **Shotgun**: Core Eject and Pump Charge, with projectile boosts and core shots.
-- **Sawblade Launcher**: Attractor (magnets) and Overheat.
+- **Nailgun and Sawblade Launcher**: Attractor (magnets) and Overheat, in both forms.
 - **Railcannon**: Electric and Malicious.
-- **Rocket launcher**: Freezeframe and S.R.S. Cannon, with rocket riding.
+- **Rocket launcher**: Freezeframe, S.R.S. Cannon and Firestarter, with rocket riding.
 - **Arms**: Feedbacker (parries, coin punches), Knuckleblaster (blast wave), Whiplash.
-- **Visceral attack**: parry an enemy, then punch it while it reels (not ULTRAKILL's; after Bloodborne's).
+- **Visceral attack**: parry an enemy, or get behind one, then punch it (not ULTRAKILL's; after Bloodborne's).
+- **Finishing blows**: an enemy left nearly dead is staggered; F or G finishes it (after Doom Eternal's glory kills).
 - **HUD**: ULTRAKILL's weapon panel, health and stamina, style meter and ranks, boss bars, the displays on the guns.
 - **Feel**: healing from blood, hit stop, parry flash, camera tilt, explosions that throw you.
-- **Death**: ULTRAKILL's death sequence and screen, and **R** to restart at the last bonfire with no loading.
-- **Title screen**: Dark Souls' menu dressed as ULTRAKILL's.
+- **Enemies the same everywhere**: their health no longer grows with the area or New Game+, so V1's fixed damage works from the Asylum to the Kiln at any character level.
+- **Death**: ULTRAKILL's death sequence and screen, and **R** to restart at the last bonfire: at once if nothing was killed and the bonfire is near, otherwise through the game's own reload, which brings the enemies back. Souls are left in a bloodstain, as in Dark Souls.
+- **Title screen**: Dark Souls' menu as ULTRAKILL's, with its buttons and letters.
 - **V1's body** in third person.
 
 Third person plays as normal Dark Souls; **F5** switches.
@@ -41,9 +43,9 @@ Third person plays as normal Dark Souls; **F5** switches.
 |---|---|
 | Mouse / WASD | Look / move |
 | Left / right mouse | Fire / alt fire |
-| 1 2 3 4 5 | Revolver, shotgun, sawblade launcher, railcannon, rocket launcher (again: next variation) |
+| 1 2 3 4 5 | Revolver, shotgun, nailgun / sawblade launcher, railcannon, rocket launcher (again: next variation) |
 | E / Q | Next / last variation |
-| X | Revolver: standard or Slab |
+| X | Revolver: standard or Slab; slot 3: nailgun or sawblade launcher |
 | Space / Shift / Ctrl | Jump (wall jump by a wall) / dash / slide, or slam in the air |
 | F / G | Feedbacker / Knuckleblaster |
 | R | Whiplash; restart on the death screen |
@@ -73,6 +75,6 @@ The addresses in the DLL are for one build of the Steam exe; [docs/DETAILS.md](d
 
 ## Status
 
-Work in progress, built and tested on one machine. The newest changes (v0.83 to v0.89) have not all been run in the game yet. Version by version notes, how each part works and what is still missing: [docs/DETAILS.md](docs/DETAILS.md).
+Work in progress, built and tested on one machine. Everything up to v0.93 has been run in the game; v0.94's enemy balance has not yet. Version by version notes, how each part works and what is still missing: [docs/DETAILS.md](docs/DETAILS.md).
 
 Not affiliated with FromSoftware, Bandai Namco, Arsi "Hakita" Patala or New Blood Interactive.

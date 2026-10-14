@@ -44,7 +44,7 @@ static const float JUMP_V0 = 9.0f;   // m/s
 static const float JUMP_G = 20.0f;   // m/s^2 while rising; the game's own gravity handles the fall
 static const float AIR_CARRY = 1.3f; // horizontal speed kept in the air, as a multiple of ground speed at takeoff
 
-#define MOD_VERSION "v0.89"
+#define MOD_VERSION "v0.94"
 static HMODULE g_real = nullptr;
 static FILE *g_log = nullptr;
 
@@ -402,6 +402,43 @@ static volatile bool g_no_cooldown = false;
 static double now_s() {
     return real_s() - g_frozen_s;
 }
+// (diagnostic, v0.93: Davi found the game slowing down over a session) Where a frame's time goes, written to the log
+// every fifteen seconds in first person: the whole frame, the mod's drawing, its once-a-frame logic, the physics
+// steps (the game's own work included), and the process's memory and handles, which is where a leak would show.
+static double g_perf_logic_sum = 0, g_perf_logic_max = 0, g_perf_step_sum = 0;
+static volatile LONG g_perf_steps = 0;
+static void perf_present(double t0) {
+    static double last = 0, since = 0, frame_sum = 0, frame_max = 0, draw_sum = 0, draw_max = 0;
+    static int frames = 0;
+    double now = real_s(), draw = now - t0;
+    if (last > 0 && t0 - last < 1.0) {
+        frame_sum += t0 - last;
+        if (t0 - last > frame_max) frame_max = t0 - last;
+        frames++;
+        draw_sum += draw;
+        if (draw > draw_max) draw_max = draw;
+    }
+    last = t0;
+    if (since <= 0) since = now;
+    if (now - since < 15.0) return;
+    if (frames > 100) {
+        PROCESS_MEMORY_COUNTERS_EX pmc = {};
+        pmc.cb = sizeof(pmc);
+        GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS *)&pmc, sizeof(pmc));
+        DWORD handles = 0;
+        GetProcessHandleCount(GetCurrentProcess(), &handles);
+        logf("perf: %d frames in %.1f s: a frame %.1f ms (worst %.1f); the mod's drawing %.2f ms (worst %.1f), its logic %.2f ms (worst %.1f), "
+             "physics steps %.2f ms a frame in %.1f calls; memory %u MB working, %u MB private, %lu handles\n",
+             frames, now - since, frame_sum / frames * 1e3, frame_max * 1e3, draw_sum / frames * 1e3, draw_max * 1e3, g_perf_logic_sum / frames * 1e3,
+             g_perf_logic_max * 1e3, g_perf_step_sum / frames * 1e3, (double)g_perf_steps / frames, (unsigned)(pmc.WorkingSetSize >> 20),
+             (unsigned)(pmc.PrivateUsage >> 20), (unsigned long)handles);
+    }
+    since = now;
+    frames = 0;
+    frame_sum = frame_max = draw_sum = draw_max = 0;
+    g_perf_logic_sum = g_perf_logic_max = g_perf_step_sum = 0;
+    g_perf_steps = 0;
+}
 
 // ---- physics step hook: runs on the game's thread, once per character per frame
 typedef void (*StepFn)(void *self, void *step_info, void *gravity);
@@ -583,8 +620,23 @@ static volatile bool g_fast_respawn = true, g_respawn_enemies = false;
 // cannot be hit, and neither the game's reset, its collision switch, nor putting back what dying changed in
 // its controller and physics body changes that.)
 static volatile bool g_restart_reload = true;
+// The alternate revolver's hammer coming back, 0.89 s after every shot: ULTRAKILL's own sound, a short ratchet. Davi
+// asked four times for "the bow/crossbow reloading sound" on revolver shots to go. On 2026-10-13 the PC's sound was
+// recorded over Slab shots with the mod's own volume at nothing: Dark Souls plays nothing for a shot, so it is one
+// of ours, and this click is the only one a shot has besides the bang. Off by default; slab_click=1 in
+// ultrasouls.ini brings it back.
+static volatile bool g_slab_click = false;
+// death_penalty: a restart costs what a death costs in Dark Souls (the souls and humanity left in a bloodstain
+// where the player fell, the character hollowed), through the game's own function for it. glory_kills: an enemy
+// that one of the player's hits leaves alive with under three tenths of its health is staggered and open to a
+// finishing blow, as a parried one is (after Doom Eternal's glory kills, which Davi asked for).
+static volatile bool g_death_penalty = true, g_glory_kills = true;
+// Slot 3 has two forms in ULTRAKILL: the nailgun and its alternate, the sawblade launcher. One bit for each variation
+// held as the nailgun (1 Attractor, 2 Overheat); X swaps the one in the hand; kept in ultrasouls.ini as nailgun=.
+// (Nothing set: the sawblade launchers, as from v0.75.)
+static volatile int g_nail_mask = 0;
 static volatile bool g_title_menu = true;        // title_menu: Dark Souls' title screen dressed as ULTRAKILL's main menu
-static volatile bool g_title_column = false;     // title_column: its buttons in ULTRAKILL's left column with its own letters (v0.83; off until it has been tried in the game)
+static volatile bool g_title_column = true;      // title_column: its buttons in ULTRAKILL's left column with its own letters (v0.83; on since v0.93, when it was first run in the game: arrow keys, the pointer and Continue all worked)
 static volatile float g_chain_slow = 1.6f;
 static volatile double g_respawn_grace_until = 0;    // no damage for a moment after standing up again
 static float g_proxy_now[3];                         // where the movement code last had the player, and when
@@ -1252,8 +1304,18 @@ static void *hook_sweep(void *self, float *out, float *from, float *to) {
     return r;
 }
 
-static void hook_step(void *self, void *step_info, void *gravity) { step_common(self, step_info, gravity, g_orig_step); }
-static void hook_step_alt(void *self, void *step_info, void *gravity) { step_common(self, step_info, gravity, g_orig_step_alt); }
+static void hook_step(void *self, void *step_info, void *gravity) {
+    double p0 = real_s();
+    step_common(self, step_info, gravity, g_orig_step);
+    g_perf_step_sum += real_s() - p0;
+    InterlockedIncrement(&g_perf_steps);
+}
+static void hook_step_alt(void *self, void *step_info, void *gravity) {
+    double p0 = real_s();
+    step_common(self, step_info, gravity, g_orig_step_alt);
+    g_perf_step_sum += real_s() - p0;
+    InterlockedIncrement(&g_perf_steps);
+}
 static const uintptr_t RVA_STEP_ALT = 0x2BC9B0;
 static const uint8_t STEP_ALT_PROLOGUE[11] = {0x40, 0x55, 0x56, 0x57, 0x48, 0x81, 0xEC, 0x90, 0x04, 0x00, 0x00};
 
@@ -1326,10 +1388,10 @@ static void save_settings() {
     settings_path(path);
     FILE *f = _wfopen(path, L"w");
     if (!f) return;
-    fprintf(f, "sensitivity=%.6f\nfov_scale=%.2f\neye_height=%.2f\nvolume=%.2f\ncamera_tilt=%d\nparry_freeze=%d\nhud_motion=%d\nslab=%d\nstyle_gain=%.2f\nstyle_drain=%.2f\nhide_move_keys=%d\nquick_draw=%d\nfast_respawn=%d\nreset_enemies=%d\nchain_slow=%.2f\ntitle_menu=%d\ntitle_column=%d\nrestart_reload=%d\n", (float)g_sens,
+    fprintf(f, "sensitivity=%.6f\nfov_scale=%.2f\neye_height=%.2f\nvolume=%.2f\ncamera_tilt=%d\nparry_freeze=%d\nhud_motion=%d\nslab=%d\nstyle_gain=%.2f\nstyle_drain=%.2f\nhide_move_keys=%d\nquick_draw=%d\nfast_respawn=%d\nreset_enemies=%d\nchain_slow=%.2f\ntitle_menu=%d\ntitle_column=%d\nrestart_reload=%d\nslab_click=%d\ndeath_penalty=%d\nglory_kills=%d\nnailgun=%d\n", (float)g_sens,
             (float)g_fov_scale, (float)g_eye_height, (float)g_volume, g_camera_tilt ? 1 : 0, g_parry_freeze ? 1 : 0, g_hud_motion ? 1 : 0, (int)g_slab_mask & 7,
             (float)g_style_gain, (float)g_style_drain, g_hide_move_setting ? 1 : 0, g_quick_draw ? 1 : 0, g_fast_respawn ? 1 : 0, g_respawn_enemies ? 1 : 0,
-            (float)g_chain_slow, g_title_menu ? 1 : 0, g_title_column ? 1 : 0, g_restart_reload ? 1 : 0);
+            (float)g_chain_slow, g_title_menu ? 1 : 0, g_title_column ? 1 : 0, g_restart_reload ? 1 : 0, g_slab_click ? 1 : 0, g_death_penalty ? 1 : 0, g_glory_kills ? 1 : 0, (int)g_nail_mask & 3);
     fclose(f);
 }
 static bool load_settings() {
@@ -1350,6 +1412,10 @@ static bool load_settings() {
         else if (!strcmp(key, "title_menu")) g_title_menu = v != 0.0f;
         else if (!strcmp(key, "title_column")) g_title_column = v != 0.0f;
         else if (!strcmp(key, "restart_reload")) g_restart_reload = v != 0.0f;
+        else if (!strcmp(key, "slab_click")) g_slab_click = v != 0.0f;
+        else if (!strcmp(key, "death_penalty")) g_death_penalty = v != 0.0f;
+        else if (!strcmp(key, "glory_kills")) g_glory_kills = v != 0.0f;
+        else if (!strcmp(key, "nailgun")) g_nail_mask = (int)v & 3;
         else if (!strcmp(key, "reset_enemies")) g_respawn_enemies = v != 0.0f;
         else if (!strcmp(key, "chain_slow") && v >= 0.5f && v <= 6.0f) g_chain_slow = v;
         else if (!strcmp(key, "hud_motion")) g_hud_motion = v != 0.0f;
@@ -1441,7 +1507,13 @@ static uint64_t hook_cam(void *self, float dt, void *a3, void *a4, uint64_t a5, 
         float frame = last > 0 && now - last < 0.1 ? (float)(now - last) : 0.0f;
         last = now;
         if (on && !g_sliding) g_boost = g_boost + V1_BOOST_REGEN * frame > 300.0f ? 300.0f : g_boost + V1_BOOST_REGEN * frame;
-        if (on) try_instant_fire();
+        if (on) {
+            double p0 = real_s();
+            try_instant_fire();
+            double took = real_s() - p0;
+            g_perf_logic_sum += took;
+            if (took > g_perf_logic_max) g_perf_logic_max = took;
+        }
         // The game's character update (exe+2BB150) skips the physics step when the character is at
         // rest and the game asked for no movement, except on every 10th frame. Since the game never
         // sees our keys, a jump, dash or slide from standstill waited for that 10th frame, or never
@@ -2176,7 +2248,7 @@ static void style_update(float dt) {
 // and kills in quick succession add 25 DOUBLE KILL, 50 TRIPLE KILL, then 100 MULTIKILL xN (the window is
 // ULTRAKILL's: a timer of 5 that runs down at 10 per second).
 static bool eye_pos(float *eye);
-enum Hitter { HIT_NONE = 0, HIT_REVOLVER, HIT_PUNCH, HIT_COIN, HIT_SHOTGUN, HIT_SHOTGUN_ZONE, HIT_EXPLOSION };
+enum Hitter { HIT_NONE = 0, HIT_REVOLVER, HIT_PUNCH, HIT_COIN, HIT_SHOTGUN, HIT_SHOTGUN_ZONE, HIT_EXPLOSION, HIT_FIRE };
 static volatile int g_last_hitter = HIT_NONE;
 static volatile double g_last_attack_time = -100.0;
 static void note_attack(int hitter) {
@@ -2288,6 +2360,7 @@ static void style_kill(bool boss) {
     // the enemy was within the 4 u in front of the muzzle
     if (boss) style_add(100, "BIG KILL");
     else if (g_last_hitter == HIT_EXPLOSION) style_add(45, "EXPLODED");
+    else if (g_last_hitter == HIT_FIRE) style_add(20, "FRIED");            // (StyleCalculator: hitter "fire")
     else if (g_last_hitter == HIT_SHOTGUN_ZONE) style_add(100, "OVERKILL");
     else style_add(g_last_hitter == HIT_SHOTGUN ? 45 : 30, "KILL");
     g_multikill_count++;
@@ -2304,6 +2377,21 @@ static void style_hit(bool boss) {
     case HIT_EXPLOSION: style_add(15, ""); break;
     default: style_add(10, ""); break;
     }
+}
+static void stun_enemy(uintptr_t chr, double t);
+static const float GLORY_FRACTION = 0.3f;
+// One of the player's hits has left this enemy alive with `hp` health: staggered if that is little enough, once in
+// eight seconds for any one enemy, and never a boss.
+static void glory_check(uintptr_t chr, int hp, double t) {
+    static struct { uintptr_t chr; double at; } lately[8];
+    static int next = 0;
+    int max_hp = 0;
+    if (!g_glory_kills || hp <= 0 || boss_name(chr) || !safe_read(chr + 0x3EC, &max_hp, 4) || max_hp <= 0 || (float)hp > GLORY_FRACTION * (float)max_hp) return;
+    for (auto &l : lately)
+        if (l.chr == chr && t - l.at < 8.0) return;
+    lately[next++ % 8] = {chr, t};
+    stun_enemy(chr, t);
+    logf("glory: chr %p left with %d of %d health: staggered, open to a finishing blow\n", (void *)chr, hp, max_hp);
 }
 static void watch_enemies(double t, float dt) {
     if (g_multikill_timer > 0) g_multikill_timer -= dt * 10.0f;
@@ -2337,6 +2425,7 @@ static void watch_enemies(double t, float dt) {
         if (mine && before > 0 && c.hp < before) {
             if (c.hp <= 0) style_kill(c.team == 7);
             else style_hit(c.team == 7);
+            glory_check(c.chr, c.hp, t);
             const float bodies = 0.75f;
             int hitter = g_last_hitter;
             float heal = 0;
@@ -2532,6 +2621,7 @@ static void hit_coin(Coin &c, double t) {
 static const uintptr_t RVA_RAYCAST = 0x2B03E0;
 static const uint8_t RAYCAST_BYTES[8] = {0x40, 0x53, 0x55, 0x56, 0x57, 0x41, 0x56, 0x48};
 static const int RAYCAST_FILTER = 0x26;
+static int g_ray_filter = RAYCAST_FILTER;         // (a test aid changes it for a moment)
 static int ray_blocked(const float *a, const float *b) {
     uintptr_t exe = (uintptr_t)GetModuleHandleA(nullptr);
     if (memcmp((void *)(exe + RVA_RAYCAST), RAYCAST_BYTES, sizeof(RAYCAST_BYTES)) != 0) return -1;
@@ -2556,7 +2646,30 @@ static int ray_blocked(const float *a, const float *b) {
 static const uintptr_t RVA_WORLD_CASTRAY = 0x9B5150, RVA_VT_CLOSEST_RAY = 0x130B840;
 static const uint8_t WORLD_CASTRAY_BYTES[8] = {0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x6C};
 struct RayHit { bool hit; float fraction, dist, point[3], normal[3]; };
+static bool ray_cast_as(const float *a, const float *b, int filter, RayHit &out);
+// v0.93: The filter the game's sight checks use (0x26) is also stopped by walls that are not there for anything
+// else: found on 2026-10-13 round the roof by the Undead Burg's bridge, where a rocket ridden or fired off the edge
+// burst in mid air ("against the world") nine metres out, on something the player then flew straight through.
+// Asked layer by layer (the `rays` test aid), the ground and the stone walls answer to layers 4 and 5 with the
+// same 0x20 as well, and that unseen wall does not. So a hit counts as the world only if layer 4 finds it too:
+// if it does not, or finds the world further on, the ray goes on to there.
+static const int RAY_SOLID_FILTER = 0x24;
 static bool ray_cast(const float *a, const float *b, RayHit &out) {
+    if (!ray_cast_as(a, b, g_ray_filter, out)) return false;
+    if (!out.hit || g_ray_filter != RAYCAST_FILTER) return true;
+    RayHit solid;
+    if (!ray_cast_as(a, b, RAY_SOLID_FILTER, solid)) return true;
+    if (!solid.hit || solid.dist > out.dist + 0.3f) {
+        static int told = 0;
+        if (told < 10) {
+            told++;
+            logf("ray: %.1f m along it, something that stops sight but is not solid (the solid world is %s): passed\n", out.dist, solid.hit ? "further on" : "not on this ray");
+        }
+        out = solid;
+    }
+    return true;
+}
+static bool ray_cast_as(const float *a, const float *b, int filter, RayHit &out) {
     out = RayHit{};
     out.fraction = 1.0f;
     uintptr_t exe = (uintptr_t)GetModuleHandleA(nullptr);
@@ -2570,7 +2683,7 @@ static bool ray_cast(const float *a, const float *b, RayHit &out) {
     float from[4] = {a[0], a[1], a[2], 1.0f}, to[4] = {b[0], b[1], b[2], 1.0f};
     memcpy(input, from, 16);
     memcpy(input + 0x10, to, 16);
-    *(int *)(input + 0x24) = RAYCAST_FILTER;
+    *(int *)(input + 0x24) = filter;
     *(uintptr_t *)collector = exe + RVA_VT_CLOSEST_RAY;
     *(float *)(collector + 0x08) = 1.0f;
     *(float *)(collector + 0x20) = 1.0f;
@@ -2593,6 +2706,8 @@ struct Coin;
 static bool coin_hits_core(const Coin &c);
 static bool coin_hits_flying(const Coin &c, double t);      // (a rocket or a cannonball in the air: with the rocket launcher)
 static void explosion_sets_off(const float *p, float radius);
+static void napalm_ignite(const float *p, float radius, double t);
+static void burn_enemy(uintptr_t chr, double t);
 static void stun_enemy(uintptr_t chr, double t);
 // ---- A beam that hits more than once (RevolverBeam.PiercingShotCheck). ULTRAKILL's piercing beams strike
 // what is on their line one hit at a time. Every hit on a living enemy stops time for 0.05 s
@@ -2980,6 +3095,7 @@ static bool enemy_attacking(uintptr_t chr, int &seen) {
     return false;
 }
 // The nearest living enemy inside a punch's reach along the view.
+static bool glory_finisher(const Target &tg, double t);
 static bool punch_target(Target &out) {
     float right[3], up[3], fwd[3], eye[3];
     if (!eye_pos(eye)) return false;
@@ -3920,7 +4036,9 @@ static void update_punch(bool armed, float dt) {
         play_arm2("Punch");
         punch_ball(t);                           // (either arm sends a cannonball on)
         g_blast_check = t + BLAST_CHECK_AT;
+        bool finishing = in_reach && glory_finisher(tg, t);
         if (!shoot(BEHAVIOR_KNUCKLE)) return;
+        if (finishing) return;
         if (in_reach) {
             // (v0.60 played "Hook" here. The Knuckleblaster's controller lists a Hook clip, but it is
             // written for another arm's bones: the arm stood still in its rest pose whenever a punch landed.)
@@ -4454,6 +4572,11 @@ static const float SAW_MASS[3] = {1.0f, 0.5f, 3.0f};     // the three Nail prefa
 // it at a wall reaches 4 u ahead of the tail; the box a shot breaks ('Cube') runs from 0.2 u behind the
 // tail to 4.3 u ahead and is 0.6 u across.
 static const float HARPOON_MAGNET = 1.35f * UK_UNIT, HARPOON_LENGTH = 4.0f * UK_UNIT;
+// Where a harpoon stops: the front of the prefab's own box (6 x 6 x 45 about (0, 0, 7), a tenth of that in the world)
+// is 2.95 u ahead of its tail, and its point is 3.92 u ahead: the last unit of it goes into what it hits. (Until
+// v0.93 it stopped with 0.4 u in a wall, and went 2.6 u through an enemy: seen in the game on 2026-10-13 as a grey
+// bar lying over the ground it should have been stuck in.)
+static const float HARPOON_BOX_FRONT = 2.95f * UK_UNIT;
 enum { MAX_SAWS = 32, SAW_TRAIL = 64, MAX_MAGNETS = 3, MAGNET_TRAIL = 12 };
 struct Saw {
     bool alive, stopped, hidden;
@@ -4807,14 +4930,14 @@ static void update_saws(double t, float dt) {
                 sound_play("harpoon_pierce", 0.5f, 1.0f);
                 for (int i = 0; i < 3; i++) {    // "magnet.transform.position = other.bounds.center"
                     m.p[i] = took.p[i];
-                    m.o[i] = m.p[i] - m.fwd[i] * HARPOON_MAGNET;
+                    m.o[i] = where[i] - m.fwd[i] * (HARPOON_BOX_FRONT + 0.25f);  // (its box stops at the body's surface, a quarter of a metre before its middle)
                 }
                 logf("sawblade launcher: magnet stuck in chr %p\n", (void *)m.chr);
             }
             if (!landed && wall) {
                 // its point is in the wall, the rest of it stands out
                 for (int i = 0; i < 3; i++) {
-                    m.o[i] = h.point[i] - m.fwd[i] * (HARPOON_LENGTH - 0.4f * UK_UNIT);
+                    m.o[i] = h.point[i] - m.fwd[i] * HARPOON_BOX_FRONT;
                     m.p[i] = m.o[i] + m.fwd[i] * HARPOON_MAGNET;
                 }
                 landed = true;
@@ -4897,10 +5020,189 @@ static void update_saws(double t, float dt) {
     }
 }
 // Nailgun.Update and FixedUpdate for the two launchers
+// ---- The nailgun: slot 3's standard form (Nailgun with altVersion off, Nail, Magnet in ULTRAKILL's code).
+//   A nail leaves from 1 u ahead of the eye at 200 u/s, turned up to a third of the gun's spread off the aim about
+//   each axis (the Attractor's spread is 10 degrees, the Overheat's 20, doubled while it burns out), and falls.
+//   The time between nails runs down at 100 a second from the gun's rate of 4: 25 nails a second.
+//   Attractor: 100 nails, coming back 5 a second while the trigger is up; alt fire is the same magnet as the
+//   sawblade launcher's. Within a magnet's 25 u a nail is pulled towards it by (the way to it) x (how near, 0 to 1)
+//   x 50 x the magnet's strength 300 x the step, as a force on its 0.2 of mass.
+//   Overheat: it heats while it fires (0.55 a second) and cools 0.3 a second; over half heat the rate falls off
+//   (4 + (heat - 0.5) x 7). Two heat sinks, each back in eight seconds. Alt fire with a heat sink in and a tenth
+//   of heat or more burns it out: until the heat has run off (a second from full) it fires heated nails at a
+//   rate of 1.5, and with no heat sink left the rate is 14.
+//   A nail deals about a fifth of a revolver's shot ('NailFodder' 0.205, 'NailHeated' 0.185).
+// Not in: nails standing in what they hit, a magnet drawing an enemy by the nails in it, the Jumpstart.
+enum { MAX_NAILS = 128 };
+struct NailObj { bool alive, heated, hidden; float p[3], v[3]; double born; };
+static NailObj g_nails[MAX_NAILS];
+static float g_nail_ammo = 100.0f, g_nail_sinks = 2.0f, g_nail_heat = 0;
+static bool g_nail_burnout = false, g_nail_shot_ok = false;
+static volatile LONG g_nails_fired = 0, g_nail_hits = 0;
+static const float NAIL_FIRE_RATE = 4.0f, NAIL_SPEED = 200.0f * UK_UNIT;
+static const int BEHAVIOR_NAIL = 9000209;
+static int g_spin_voice = 0;                     // the whirr of the blade, or of the barrels
+static bool nail_held() { return g_weapon == WEAPON_SAWLAUNCHER && ((g_nail_mask >> g_saw_var) & 1); }
+static void spawn_nail(const float *dir, bool heated, double t) {
+    float eye[3], right[3], up[3], fwd[3];
+    if (!eye_pos(eye)) return;
+    view_axes(right, up, fwd);
+    NailObj *slot = &g_nails[0];
+    for (NailObj &n : g_nails) {
+        if (!n.alive) { slot = &n; break; }
+        if (n.born < slot->born) slot = &n;
+    }
+    *slot = NailObj{};
+    slot->alive = true;
+    slot->heated = heated;
+    slot->born = t;
+    for (int i = 0; i < 3; i++) {
+        slot->p[i] = eye[i] + fwd[i] * UK_UNIT;
+        slot->v[i] = dir[i] * NAIL_SPEED;
+    }
+    InterlockedIncrement(&g_nails_fired);
+}
+static void update_nails(double t, float dt) {
+    for (NailObj &n : g_nails) {
+        if (!n.alive) continue;
+        bool drawn = false;
+        for (const MagnetObj &m : g_magnets) {
+            if (!m.alive) continue;
+            float d[3] = {m.p[0] - n.p[0], m.p[1] - n.p[1], m.p[2] - n.p[2]}, dist = sqrtf(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+            if (dist >= MAGNET_RANGE) continue;
+            drawn = true;
+            // Magnet.FixedUpdate: "if (|velocity . way| < 1000) AddForce(way x (radius - distance) / radius x 50 x strength x step)":
+            // on 0.2 of mass and with ULTRAKILL's step of 0.008 s that is 600 x (how near) a second, a second, for each unit away
+            if (fabsf(n.v[0] * d[0] + n.v[1] * d[1] + n.v[2] * d[2]) < 1000.0f * UK_UNIT * UK_UNIT) {
+                float k = (MAGNET_RANGE - dist) / MAGNET_RANGE * 600.0f * dt;
+                for (int i = 0; i < 3; i++) n.v[i] += d[i] * k;
+            }
+        }
+        if (t - n.born > (drawn ? 12.0 : 5.0)) { n.alive = false; continue; }
+        n.v[1] -= 40.0f * UK_UNIT * dt;
+        float next[3] = {n.p[0] + n.v[0] * dt, n.p[1] + n.v[1] * dt, n.p[2] + n.v[2] * dt}, at[3];
+        RayHit h;
+        bool wall = ray_cast(n.p, next, h) && h.hit;
+        Target tg;
+        if (enemy_on_path(n.p, wall ? h.point : next, 0.15f, tg, at)) {
+            float sp = sqrtf(n.v[0] * n.v[0] + n.v[1] * n.v[1] + n.v[2] * n.v[2]), d[3] = {0, 0, 1}, from[3];
+            if (sp > 1e-3f)
+                for (int i = 0; i < 3; i++) d[i] = n.v[i] / sp;
+            for (int i = 0; i < 3; i++) from[i] = at[i] - d[i] * 0.6f;
+            note_attack(HIT_REVOLVER);
+            if (shoot(BEHAVIOR_NAIL, from, d)) InterlockedIncrement(&g_nail_hits);
+            if (n.heated) {                          // (a heated nail lights what is soaked)
+                burn_enemy(tg.chr, t);
+            }
+            if (in_sight(at)) fx_pellet_hit(at, d);
+            n.alive = false;
+        } else if (wall) {
+            if (in_sight(h.point)) fx_pellet_hit(h.point, h.normal);
+            n.alive = false;
+        } else {
+            memcpy(n.p, next, sizeof(next));
+            n.hidden = !in_sight(n.p);
+        }
+    }
+}
+static void spawn_magnet(const float *fwd);
+static void nail_gun(double t, float dt, bool lmb, bool alt, bool can_shoot) {
+    bool overheat = g_saw_var == SAW_OVERHEAT, firing = can_shoot && lmb;
+    float heat = g_nail_heat;
+    if (overheat && (g_nail_burnout || g_nail_sinks < 1.0f)) {
+        heat = move_towards(heat, 0.0f, dt);
+        if (g_nail_burnout && heat <= 0) {
+            g_nail_burnout = false;
+            logf("nailgun: burnt out, cooled\n");
+        }
+    } else if (firing && heat < 1.0f) {
+        heat = overheat ? move_towards(heat, 1.0f, dt * 0.55f) : 1.0f;
+    } else if (heat > 0 && !firing) {
+        heat = move_towards(heat, 0.0f, dt * 0.3f);
+    }
+    g_nail_heat = heat;
+    if (firing) g_saw_spin = 250.0f + heat * 2250.0f;
+    else g_saw_spin = move_towards(g_saw_spin, 0.0f, dt * 1000.0f);
+    g_saw_blade = fmodf(g_saw_blade + g_saw_spin * dt, 360.0f);
+    if (g_saw_spin > 1.0f) {
+        float pitch = g_saw_spin / 1500.0f * 2.0f;
+        if (!g_spin_voice) g_spin_voice = sound_play("saw_spin", 0.2f, pitch, true);
+        else sound_set(g_spin_voice, 0.2f, pitch);
+    } else if (g_spin_voice) {
+        sound_stop(g_spin_voice);
+        g_spin_voice = 0;
+    }
+    g_saw_muddle = 0;
+    float rate = !overheat ? NAIL_FIRE_RATE + 3.5f - heat * 3.5f : g_nail_burnout ? NAIL_FIRE_RATE - 2.5f
+                 : g_nail_sinks >= 1.0f ? (heat < 0.5f ? NAIL_FIRE_RATE : NAIL_FIRE_RATE + (heat - 0.5f) * 7.0f) : NAIL_FIRE_RATE + 10.0f;
+    float right[3], up[3], fwd[3];
+    view_axes(right, up, fwd);
+    if (alt) {
+        if (!overheat) {
+            if (g_magnet_charge >= 1.0f) {
+                g_magnet_charge -= 1.0f;
+                spawn_magnet(fwd);
+                if (can_shoot) play_revolver("Shoot");
+                sound_play("saw_magnet", 0.6f, 1.0f);
+                logf("nailgun: magnet thrown (%.0f left)\n", g_magnet_charge);
+            } else {
+                sound_play("saw_no_ammo", 0.6f, 1.0f);
+            }
+        } else if (can_shoot && !g_nail_burnout && g_nail_sinks >= 1.0f && heat >= 0.1f) {
+            g_nail_burnout = true;
+            g_saw_cooldown = 0;
+            g_nail_sinks -= 1.0f;
+            rate = NAIL_FIRE_RATE - 2.5f;
+            logf("nailgun: a heat sink burnt out at heat %.2f (%.0f left)\n", heat, g_nail_sinks);
+        }
+    }
+    if (!firing) {
+        if (!lmb) g_nail_shot_ok = false;
+        return;
+    }
+    if (g_saw_cooldown != 0) return;
+    if (!overheat && (int)lroundf(g_nail_ammo) <= 0) {
+        g_saw_cooldown = rate * 2.0f;
+        sound_play(g_nail_shot_ok ? "saw_last_shot" : "saw_no_ammo", 0.6f, 1.0f);
+        g_nail_shot_ok = false;
+        return;
+    }
+    // Nailgun.Shoot
+    g_saw_cooldown = rate;
+    g_nail_shot_ok = true;
+    if (!overheat) g_nail_ammo -= 1.0f;
+    float spread = (overheat ? 20.0f : 10.0f) * (g_nail_burnout ? 2.0f : 1.0f);
+    float yaw = frand(-spread / 3.0f, spread / 3.0f) * 3.14159265f / 180.0f, pitch = frand(-spread / 3.0f, spread / 3.0f) * 3.14159265f / 180.0f, dir[3], len = 0;
+    for (int i = 0; i < 3; i++) {
+        dir[i] = fwd[i] + right[i] * tanf(yaw) + up[i] * tanf(pitch);
+        len += dir[i] * dir[i];
+    }
+    len = sqrtf(len);
+    for (float &x : dir) x /= len;
+    play_revolver("Shoot");
+    // (the muzzle flash's own sound: 0.65; an octave up while burning out; lower and quiet with no heat sink in)
+    bool spent = overheat && !g_nail_burnout && g_nail_sinks < 1.0f;
+    if (!sound_play("nail_shot", spent ? 0.25f : 0.65f, g_nail_burnout ? 2.0f : spent ? 0.75f : 1.0f, false, CH_GUN))
+        sound_play("saw_shot", 0.4f, 1.6f, false, CH_GUN);
+    g_muzzle_flash = t;
+    spawn_nail(dir, g_nail_burnout, t);
+}
 static void update_saw_launcher(double t, float dt, bool lmb, bool rmb) {
-    bool held = g_weapon == WEAPON_SAWLAUNCHER, overheat = g_saw_var == SAW_OVERHEAT;
+    bool held = g_weapon == WEAPON_SAWLAUNCHER, overheat = g_saw_var == SAW_OVERHEAT, nail = nail_held();
     bool can_shoot = held && t >= g_saw_ready_at, firing = can_shoot && lmb, alt = held && rmb && !g_prev_saw_rmb;
     g_prev_saw_rmb = held && rmb;
+    // WeaponCharges, for the nailgun: its nails and its heat sinks
+    if (!(nail && !overheat && lmb)) g_nail_ammo = move_towards(g_nail_ammo, 100.0f, dt * 5.0f);
+    if (!(nail && overheat && lmb) && g_nail_sinks < 2.0f) g_nail_sinks = move_towards(g_nail_sinks, 2.0f, dt * 0.125f);
+    if (g_no_cooldown) {
+        g_nail_ammo = 100.0f;
+        g_nail_sinks = 2.0f;
+    }
+    if (!nail) {
+        g_nail_burnout = false;
+        if (g_nail_heat > 0) g_nail_heat = move_towards(g_nail_heat, 0.0f, dt * 0.3f);
+    }
+    update_nails(t, dt);
     // WeaponCharges: what comes back whichever weapon is held
     if (!(held && !overheat && lmb)) g_saw_ammo = move_towards(g_saw_ammo, 10.0f, dt * 0.5f);
     {
@@ -4917,6 +5219,10 @@ static void update_saw_launcher(double t, float dt, bool lmb, bool rmb) {
         g_saw_cooldown = move_towards(g_saw_cooldown, 0.0f, dt * 100.0f);
         if (g_saw_cooldown < 0.01f) g_saw_cooldown = 0;
     }
+    if (nail) {
+        nail_gun(t, dt, lmb, alt, can_shoot);
+        return;
+    }
     // the heat
     if (overheat && g_saw_sinks < 1.0f) {
         g_saw_heat = move_towards(g_saw_heat, 0.0f, dt);
@@ -4932,14 +5238,13 @@ static void update_saw_launcher(double t, float dt, bool lmb, bool rmb) {
     {
         // the blade's own whirr ('MachineGunSpin', the looping source on the gun's Blade): 0.2, at a pitch of
         // spinSpeed / 1500 x 2, so it climbs to 3.3 while firing and runs down with the blade
-        static int spin_voice = 0;
         if (held && g_saw_spin > 1.0f) {
             float pitch = g_saw_spin / 1500.0f * 2.0f;
-            if (!spin_voice) spin_voice = sound_play("saw_spin", 0.2f, pitch, true);
-            else sound_set(spin_voice, 0.2f, pitch);
-        } else if (spin_voice) {
-            sound_stop(spin_voice);
-            spin_voice = 0;
+            if (!g_spin_voice) g_spin_voice = sound_play("saw_spin", 0.2f, pitch, true);
+            else sound_set(g_spin_voice, 0.2f, pitch);
+        } else if (g_spin_voice) {
+            sound_stop(g_spin_voice);
+            g_spin_voice = 0;
         }
     }
     if (!held) {
@@ -5081,7 +5386,7 @@ static int targets_near(const float *from, Target *out, int max_n, float max_dis
 //              or jump is held; a cannonball comes to hang in front of the player, to be punched.
 //   Coins:     a coin's shot goes for a rocket or a cannonball in the air before it goes for an enemy.
 // Not in: the napalm.
-enum { ROCKET_FREEZE = 0, ROCKET_SRS = 1 };
+enum { ROCKET_FREEZE = 0, ROCKET_SRS = 1, ROCKET_NAPALM = 2 };
 static volatile int g_rocket_var = ROCKET_FREEZE;
 static const int BEHAVIOR_CANNONBALL = 9000200, BEHAVIOR_SHOCKWAVE = 9000204;     // the ball: + 0..3 for 2, 3.5, 5 and 7
 static const float ROCKET_SPEED = 100.0f * UK_UNIT, ROCKET_LENGTH = 2.1f * UK_UNIT, ROCKET_RADIUS = 0.35f * UK_UNIT;
@@ -5175,6 +5480,7 @@ static void harmless_explosion(const float *p) {
         b.hidden = false;
         blast_limits(b);
         queue_blast(p, 8.0f, 0, 2.5f, false);
+        napalm_ignite(p, 3.0f * UK_UNIT, now_s());
     }
     float vol = heard(p, 75.0f);
     if (vol > 0.01f) sound_play("explosion_harmless", vol, frand(0.75f, 1.25f));
@@ -5312,9 +5618,15 @@ static void ride_step(Rocket &r, double t, float dt) {
     if (jumped || slid) {
         // "PlayerRideEnd(); Jump()": off it with a jump, keeping its speed; a slide just lets go
         g_ride = nullptr;
-        g_launch_v[0] = v[0];
-        g_launch_v[1] = v[1] + (jumped ? V1_JUMP_SPEED : 0.0f);
-        g_launch_v[2] = v[2];
+        if (jumped) {
+            g_launch_v[0] = v[0];
+            g_launch_v[1] = v[1] + V1_JUMP_SPEED;
+            g_launch_v[2] = v[2];
+        } else {
+            // slide: off it and straight down, at the speed of a slam (v0.84 to v0.90 kept the rocket's own speed)
+            g_launch_v[0] = g_launch_v[2] = 0;
+            g_launch_v[1] = -100.0f * UK_UNIT;
+        }
         g_launch_pending = true;
         logf("rocket: the player %s off it\n", jumped ? "jumped" : "dropped");
         return;
@@ -5355,6 +5667,15 @@ static void update_rockets(double t, float dt) {
     bool frozen = g_rockets_frozen;
     float loudest = 0, feet[3];
     bool have_feet = feet_pos(feet);
+    // (where the feet were a frame ago: getting on is tested along the way they have come, not only where they are)
+    static float prev_feet[3];
+    static bool have_prev = false;
+    float from_feet[3] = {feet[0], feet[1], feet[2]};
+    if (have_feet) {
+        if (have_prev && dist3(prev_feet, feet) < 6.0f) memcpy(from_feet, prev_feet, sizeof(from_feet));
+        memcpy(prev_feet, feet, sizeof(prev_feet));
+        have_prev = true;
+    }
     if (!g_air) g_rides = 0;
     if (g_ride && !g_ride->alive) g_ride = nullptr;
     for (Rocket &r : g_rockets) {
@@ -5404,9 +5725,18 @@ static void update_rockets(double t, float dt) {
         r.hooked = false;
         // getting on: falling, in the air, within 2.25 u of the point 1 u ahead of its tail (once per approach)
         if (have_feet && !g_dead) {
-            float spot[3] = {r.p[0] + r.dir[0] * UK_UNIT, r.p[1] + r.dir[1] * UK_UNIT, r.p[2] + r.dir[2] * UK_UNIT}, d = dist3(feet, spot);
-            bool falling = g_air && g_vy < 0;
-            if (d < 2.25f * UK_UNIT && falling && r.rideable) {
+            // ULTRAKILL: within 2.25 u of the point 1 u ahead of the rocket's tail, in the air and moving down. Here, so
+            // that the quick way on works at any speed (jump, fire, freeze, dash into it, let go: Davi, v0.90: done
+            // fast it did not take): the distance is to the whole of the way the feet came this frame (a dash goes
+            // more than a metre a frame and could step right over the spot), a dash counts as moving down, as does
+            // the top of a jump, and the reach is 2.6 u.
+            float spot[3] = {r.p[0] + r.dir[0] * UK_UNIT, r.p[1] + r.dir[1] * UK_UNIT, r.p[2] + r.dir[2] * UK_UNIT};
+            float seg[3] = {feet[0] - from_feet[0], feet[1] - from_feet[1], feet[2] - from_feet[2]}, sl2 = seg[0] * seg[0] + seg[1] * seg[1] + seg[2] * seg[2];
+            float k = sl2 > 1e-6f ? ((spot[0] - from_feet[0]) * seg[0] + (spot[1] - from_feet[1]) * seg[1] + (spot[2] - from_feet[2]) * seg[2]) / sl2 : 0.0f;
+            k = k < 0 ? 0 : k > 1 ? 1 : k;
+            float nearest[3] = {from_feet[0] + seg[0] * k, from_feet[1] + seg[1] * k, from_feet[2] + seg[2] * k}, d = dist3(nearest, spot);
+            bool falling = g_air && (g_vy < 0.5f || g_dash_left > 0);
+            if (d < 2.6f * UK_UNIT && falling && r.rideable) {
                 if (!g_ride && !r.in_range) {
                     ride_start(r, t);
                     continue;
@@ -5769,9 +6099,22 @@ static bool whip_catch_flying(const float *from, const float *dir, float step, f
     // brought in at HOOK_PULL by update_rockets and update_balls, which do the rest when it arrives.)
     if (!take_ball)
         for (Rocket &r : g_rockets) {
-            if (!r.alive || g_ride == &r || r.hooked) continue;
+            if (!r.alive || r.hooked) continue;
             float mid[3] = {r.p[0] + r.dir[0] * ROCKET_LENGTH * 0.5f, r.p[1] + r.dir[1] * ROCKET_LENGTH * 0.5f, r.p[2] + r.dir[2] * ROCKET_LENGTH * 0.5f};
             if (take_rocket ? take_rocket != &r : !reached(mid, ROCKET_RADIUS + 0.3f)) continue;
+            if (g_ride == &r) {
+                // HookArm: the rocket the player is on cannot be got onto again, so the hook coming back with it sets
+                // it off, there and then (it is already at the player), as the super explosion with the player in
+                // the air. (Until v0.92 the hook passed through the rocket being ridden. Davi: looking straight down at
+                // it and using the whiplash should set it off at once.)
+                logf("whiplash: the rocket being ridden: it goes off (%s)\n", g_air ? "in the air: the super explosion" : "on the ground");
+                g_ride = nullptr;
+                r.alive = false;
+                g_frozen_idle_since = t;
+                float at[3] = {feet[0], feet[1] + 0.3f, feet[2]};
+                explode(at, g_air ? EXPLODE_SUPER : EXPLODE_PLAIN);
+                return true;
+            }
             float d[3] = {mid[0] - feet[0], mid[1] - feet[1], mid[2] - feet[2]}, len = sqrtf(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
             r.hooked = true;
             r.hook_below = len > 0.1f && -d[1] / len > 0.7071f;      // within 45 degrees of straight down
@@ -5816,7 +6159,7 @@ static bool whip_take_on_view(double t) {
     for (Ball &b : g_balls)
         if (b.alive && on_line(b.p)) { ball = &b; rocket = nullptr; }
     for (Rocket &r : g_rockets) {
-        if (!r.alive || g_ride == &r) continue;
+        if (!r.alive) continue;                  // (also the one being ridden)
         float mid[3] = {r.p[0] + r.dir[0] * ROCKET_LENGTH * 0.5f, r.p[1] + r.dir[1] * ROCKET_LENGTH * 0.5f, r.p[2] + r.dir[2] * ROCKET_LENGTH * 0.5f};
         if (on_line(mid)) { rocket = &r; ball = nullptr; }
     }
@@ -5824,8 +6167,288 @@ static bool whip_take_on_view(double t) {
     return whip_catch_flying(eye, fwd, 0.0f, 0.0f, t, rocket, ball);
 }
 // An explosion sets off the rockets and cannonballs inside it (each as one shot in the air goes off).
+// ---- The Firestarter: the rocket launcher's third variation (RocketLauncher's "Napalm variation", GasolineProjectile,
+// GasolineStain, StainVoxelManager, BurningVoxel, FireZone, Flammable, EnemyIdentifier.Burn in ULTRAKILL's code).
+//   Alt fire held sprays oil: a blob every 0.02 s from 1 u ahead of the eye at 150 u/s, turned up to a degree off
+//   the aim, each costing 0.015 of the tank; the tank fills at 0.125 a second and has to hold a quarter before
+//   the spray will start again.
+//   A blob that meets an enemy soaks it (0.1 of fuel a blob, 5 at the most); one that meets the world leaves a
+//   stain in that 2.75 u cell of it.
+//   Fire: an explosion lights the stains it reaches and the soaked enemies in it. A lit cell burns for six seconds
+//   and dies down over two more, lighting the cells next to it a twentieth of a second on; whatever enemy stands
+//   in it (a box 2.75 u square and 5.5 u tall) takes a whole shot's damage every half second, a soaked one catches
+//   fire, and the player loses 10 of V1's 100. An enemy on fire burns 0.175 of its fuel every half second and
+//   takes half a shot each time, lighting the stains under it; out of fuel, it goes out.
+//   A kill by fire is FRIED (20).
+// Ours: how the oil and the fire look (ULTRAKILL's stain is a decal and its fire an animated picture: a dark disc
+// lying on the surface and soft flames here), and one stain a cell.
+enum { MAX_OIL = 72, MAX_STAINS = 64, MAX_OILED = 16 };
+struct OilBlob { bool alive; float p[3], v[3]; double born; };
+struct OilStain { bool alive, burning, spread; float p[3], n[3]; int cell[3]; double born, lit_at, next_tick; float turn; };
+struct Oiled { uintptr_t chr; float fuel, heat; bool burning; double next_pulse, next_fire; };
+static OilBlob g_oil[MAX_OIL];
+static OilStain g_stains[MAX_STAINS];
+static Oiled g_oiled[MAX_OILED];
+static volatile float g_napalm_fuel = 1.0f;
+static float g_napalm_cooldown = 0;
+static volatile bool g_napalm_firing = false;
+static bool g_napalm_want = false;               // alt fire is held with the Firestarter in the hand
+static double g_player_fire_at = -100.0;
+static volatile LONG g_oil_blobs = 0, g_stains_lit = 0, g_fire_hits = 0;
+static const float NAPALM_SPEED = 150.0f * UK_UNIT, NAPALM_VOXEL = 2.75f * UK_UNIT, NAPALM_BURN = 6.0f, NAPALM_FADE = 2.0f;
+static const int BEHAVIOR_BURN = 9000207, BEHAVIOR_FIRE = 9000208;
+static Oiled *oiled_find(uintptr_t chr, bool make) {
+    Oiled *spare = nullptr;
+    for (Oiled &o : g_oiled) {
+        if (o.chr == chr) return &o;
+        if (!o.chr && !spare) spare = &o;
+    }
+    if (!make || !spare) return nullptr;
+    *spare = Oiled{};
+    spare->chr = chr;
+    return spare;
+}
+static void hurt_player(float damage) {          // of V1's 100, as an explosion's is taken
+    uintptr_t chr = g_player_chr;
+    int hp = 0, max_hp = 0;
+    if (damage <= 0 || g_no_cooldown || g_dead || !chr || !safe_read(chr + 0x3E8, &hp, 4) || !safe_read(chr + 0x3EC, &max_hp, 4) || max_hp <= 0 || hp <= 0) return;
+    int lost = (int)(damage / 100.0f * (float)max_hp + 0.5f);
+    hp = lost >= hp ? 0 : hp - lost;
+    if (hp <= 0) {
+        g_death.fast = g_fast_respawn;
+        g_death.begin = true;
+        if (g_fast_respawn) hp = 1;
+    }
+    safe_write(chr + 0x3E8, &hp, 4);
+}
+static void stain_light(OilStain &sn, double t) {
+    if (sn.burning && t - sn.lit_at < NAPALM_BURN) return;
+    if (!sn.burning) InterlockedIncrement(&g_stains_lit);
+    sn.burning = true;
+    sn.spread = false;
+    sn.lit_at = t;
+    sn.next_tick = t;
+}
+static void burn_enemy(uintptr_t chr, double t) {
+    Oiled *o = oiled_find(chr, false);
+    if (!o || o->burning || o->fuel <= 0) return;
+    o->burning = true;
+    o->heat = 0.1f;
+    o->next_pulse = t;
+    logf("firestarter: chr %p catches fire with %.2f of fuel on it\n", (void *)chr, o->fuel);
+}
+// An explosion at p: the stains and the soaked enemies it reaches
+static void napalm_ignite(const float *p, float radius, double t) {
+    int lit = 0;
+    for (OilStain &sn : g_stains)
+        if (sn.alive && !sn.burning && dist3(sn.p, p) <= radius + NAPALM_VOXEL * 0.5f) {
+            stain_light(sn, t);
+            lit++;
+        }
+    for (Oiled &o : g_oiled) {
+        float pt[3];
+        if (o.chr && !o.burning && o.fuel > 0 && whip_target_point(o.chr, pt) && dist3(pt, p) <= radius + 0.75f) burn_enemy(o.chr, t);
+    }
+    if (lit) logf("firestarter: %d stains lit\n", lit);
+}
+static void stain_add(const float *p, const float *n, double t) {
+    int cell[3];
+    for (int i = 0; i < 3; i++) cell[i] = (int)lroundf(p[i] / NAPALM_VOXEL);
+    OilStain *slot = nullptr;
+    for (OilStain &sn : g_stains) {
+        if (sn.alive && sn.cell[0] == cell[0] && sn.cell[1] == cell[1] && sn.cell[2] == cell[2]) {
+            sn.born = t;                         // more oil on a cell that has some: it lasts longer, and a burning one burns on
+            if (sn.burning && t - sn.lit_at < NAPALM_BURN + NAPALM_FADE) sn.lit_at = t;
+            return;
+        }
+        if (!sn.alive && !slot) slot = &sn;
+    }
+    if (!slot) {
+        slot = &g_stains[0];
+        for (OilStain &sn : g_stains)
+            if (!sn.burning && sn.born < slot->born) slot = &sn;
+    }
+    *slot = OilStain{};
+    slot->alive = true;
+    memcpy(slot->p, p, sizeof(slot->p));
+    memcpy(slot->n, n, sizeof(slot->n));
+    memcpy(slot->cell, cell, sizeof(cell));
+    slot->born = t;
+    slot->turn = frand(0.0f, 6.28f);
+    // (oil that lands by a fire is alight at once)
+    for (OilStain &sn : g_stains)
+        if (&sn != slot && sn.alive && sn.burning && t - sn.lit_at < NAPALM_BURN && abs(sn.cell[0] - cell[0]) <= 1 && abs(sn.cell[1] - cell[1]) <= 1 && abs(sn.cell[2] - cell[2]) <= 1) {
+            stain_light(*slot, t);
+            break;
+        }
+}
+static void napalm_shoot(double t) {
+    float right[3], up[3], fwd[3], eye[3];
+    if (!eye_pos(eye)) return;
+    view_axes(right, up, fwd);
+    OilBlob *slot = &g_oil[0];
+    for (OilBlob &b : g_oil) {
+        if (!b.alive) { slot = &b; break; }
+        if (b.born < slot->born) slot = &b;
+    }
+    const float spread = 0.0175f;                // a degree, about each of its own axes
+    float a = frand(-spread, spread), c = frand(-spread, spread), d[3], len = 0;
+    for (int i = 0; i < 3; i++) {
+        d[i] = fwd[i] + right[i] * a + up[i] * c;
+        len += d[i] * d[i];
+    }
+    len = sqrtf(len);
+    slot->alive = true;
+    slot->born = t;
+    for (int i = 0; i < 3; i++) {
+        slot->p[i] = eye[i] + fwd[i] * UK_UNIT;
+        slot->v[i] = d[i] / len * NAPALM_SPEED;
+    }
+    g_napalm_fuel = g_napalm_fuel - 0.015f > 0 ? g_napalm_fuel - 0.015f : 0.0f;
+    InterlockedIncrement(&g_oil_blobs);
+}
+static void update_napalm(double t, float dt) {
+    // WeaponCharges.Charge
+    float fuel = g_napalm_fuel;
+    if (fuel < 1.0f) fuel = move_towards(fuel, 1.0f, dt * 0.125f);
+    if (g_no_cooldown) fuel = 1.0f;
+    g_napalm_fuel = fuel;
+    // RocketLauncher.Update: the spray starts with a quarter of a tank at the least and goes on while there is any
+    static int spray_voice = 0;
+    static bool prev_want = false;
+    bool want = g_napalm_want, firing = g_napalm_firing;
+    if (want && fuel > 0 && (firing || fuel >= 0.25f)) {
+        if (!firing) {
+            if (!spray_voice) spray_voice = sound_play("napalm_loop", 0.75f, 1.0f, true);
+            sound_play("napalm_start", 1.0f, 1.0f, false, CH_FREE);
+            logf("firestarter: spraying (tank %.2f)\n", fuel);
+        }
+        firing = true;
+    } else if (firing) {
+        firing = false;
+        if (spray_voice) sound_stop(spray_voice);
+        spray_voice = 0;
+        sound_play("napalm_stop", 0.66f, frand(0.9f, 1.1f), false, CH_FREE);
+        logf("firestarter: the spray stops (tank %.2f, %ld blobs so far)\n", fuel, g_oil_blobs);
+    } else if (want && !prev_want && fuel < 0.25f) {
+        sound_play("napalm_empty", 0.66f, 0.5f, false, CH_FREE);
+    }
+    prev_want = want;
+    g_napalm_firing = firing;
+    if (g_napalm_cooldown > 0) g_napalm_cooldown -= dt;
+    for (int n = 0; firing && g_napalm_cooldown <= 0 && n < 4; n++) {
+        napalm_shoot(t);
+        g_napalm_cooldown += 0.02f;
+    }
+    if (!firing && g_napalm_cooldown < 0) g_napalm_cooldown = 0;
+    // the blobs in the air
+    for (OilBlob &b : g_oil) {
+        if (!b.alive) continue;
+        if (t - b.born > 5.0) { b.alive = false; continue; }
+        b.v[1] -= 40.0f * UK_UNIT * dt;
+        float next[3] = {b.p[0] + b.v[0] * dt, b.p[1] + b.v[1] * dt, b.p[2] + b.v[2] * dt}, at[3];
+        RayHit h;
+        bool wall = ray_cast(b.p, next, h) && h.hit;
+        Target tg;
+        if (enemy_on_path(b.p, wall ? h.point : next, 0.3f, tg, at)) {
+            if (Oiled *o = oiled_find(tg.chr, true)) {
+                o->fuel = o->fuel + 0.1f > 5.0f ? 5.0f : o->fuel + 0.1f;
+                // (oil on one that is already burning feeds the fire; on one standing in a fire, it lights)
+                for (const OilStain &sn : g_stains)
+                    if (sn.alive && sn.burning && t - sn.lit_at < NAPALM_BURN && dist3(sn.p, tg.p) < NAPALM_VOXEL) burn_enemy(tg.chr, t);
+            }
+            b.alive = false;
+        } else if (wall) {
+            stain_add(h.point, h.normal, t);
+            b.alive = false;
+        } else {
+            memcpy(b.p, next, sizeof(next));
+        }
+    }
+    // the stains: a minute if nothing lights them
+    float feet[3];
+    bool have_feet = feet_pos(feet);
+    float loudest = 0;
+    for (OilStain &sn : g_stains) {
+        if (!sn.alive) continue;
+        if (!sn.burning) {
+            if (t - sn.born > 60.0) sn.alive = false;
+            continue;
+        }
+        float age = (float)(t - sn.lit_at);
+        if (age >= NAPALM_BURN + NAPALM_FADE) { sn.alive = false; continue; }
+        float vol = heard(sn.p, 25.0f);
+        if (vol > loudest) loudest = vol;
+        if (!sn.spread && age >= 0.05f) {
+            sn.spread = true;
+            for (OilStain &o : g_stains)
+                if (o.alive && !o.burning && abs(o.cell[0] - sn.cell[0]) <= 1 && abs(o.cell[1] - sn.cell[1]) <= 1 && abs(o.cell[2] - sn.cell[2]) <= 1) stain_light(o, t);
+        }
+        if (age >= NAPALM_BURN || t < sn.next_tick) continue;
+        sn.next_tick = t + 0.5;
+        // FireZone: what stands in the burning cell
+        const float half = NAPALM_VOXEL * 0.5f + 0.25f, below = 2.25f * UK_UNIT, above = 3.25f * UK_UNIT;
+        Target in[8];
+        int n = find_targets(sn.p, in, 8, NAPALM_VOXEL + 1.5f);
+        for (int i = 0; i < n; i++) {
+            const Target &e = in[i];
+            float ey = e.p[1] - TARGET_HEIGHT * 0.5f;
+            if (fabsf(e.p[0] - sn.p[0]) > half || fabsf(e.p[2] - sn.p[2]) > half || ey < sn.p[1] - below || ey - TARGET_HEIGHT * 0.5f > sn.p[1] + above) continue;
+            Oiled *o = oiled_find(e.chr, true);
+            if (o && t < o->next_fire) continue;                 // (one hurt in half a second, however many cells it stands in)
+            if (o) o->next_fire = t + 0.5;
+            note_attack(HIT_FIRE);
+            float from[3] = {e.p[0], e.p[1] - 0.9f, e.p[2]}, up_dir[3] = {0, 1, 0};
+            if (shoot(BEHAVIOR_FIRE, from, up_dir)) InterlockedIncrement(&g_fire_hits);
+            burn_enemy(e.chr, t);
+        }
+        if (have_feet && fabsf(feet[0] - sn.p[0]) <= half && fabsf(feet[2] - sn.p[2]) <= half && feet[1] + 0.9f > sn.p[1] - below && feet[1] < sn.p[1] + above && t - g_player_fire_at >= 0.5) {
+            g_player_fire_at = t;
+            hurt_player(10.0f);
+            logf("firestarter: the player is standing in the fire: 10 of health\n");
+        }
+    }
+    // the enemies on fire
+    for (Oiled &o : g_oiled) {
+        if (!o.chr) continue;
+        float pt[3];
+        if (!chr_alive(o.chr) || !whip_target_point(o.chr, pt)) { o = Oiled{}; continue; }
+        if (!o.burning) {
+            if (o.fuel <= 0 && t > o.next_fire + 5.0) o = Oiled{};
+            continue;
+        }
+        float vol = heard(pt, 25.0f);
+        if (vol > loudest) loudest = vol;
+        if (t < o.next_pulse) continue;
+        o.next_pulse = t + 0.5;
+        // Flammable.Pulse, then EnemyIdentifier.Burn's damage
+        if (o.fuel >= 0.175f) o.fuel -= 0.175f;
+        else if (o.fuel > 0) { o.heat = 0.175f - o.fuel; o.fuel = 0; }
+        else o.heat -= 0.25f;
+        if (o.heat <= 0) {
+            o.burning = false;
+            o.next_fire = t;
+            continue;
+        }
+        note_attack(HIT_FIRE);
+        float from[3] = {pt[0], pt[1] - 0.9f, pt[2]}, up_dir[3] = {0, 1, 0};
+        if (shoot(BEHAVIOR_BURN, from, up_dir)) InterlockedIncrement(&g_fire_hits);
+        float under[3] = {pt[0], pt[1] - TARGET_HEIGHT, pt[2]};
+        for (OilStain &sn : g_stains)                            // "TryIgniteGasoline": the oil it stands on
+            if (sn.alive && !sn.burning && dist3(sn.p, under) < NAPALM_VOXEL * 0.75f) stain_light(sn, t);
+    }
+    static int fire_voice = 0;
+    if (loudest > 0.01f) {
+        if (!fire_voice) fire_voice = sound_play("fire_loop", 0.3f * loudest, 1.0f, true);
+        else sound_set(fire_voice, 0.3f * loudest, 1.0f);
+    } else if (fire_voice) {
+        sound_stop(fire_voice);
+        fire_voice = 0;
+    }
+}
 static void explosion_sets_off(const float *p, float radius) {
     double t = now_s();
+    napalm_ignite(p, radius, t);
     for (Rocket &r : g_rockets) {
         if (!r.alive || g_ride == &r) continue;
         float mid[3] = {r.p[0] + r.dir[0] * ROCKET_LENGTH * 0.5f, r.p[1] + r.dir[1] * ROCKET_LENGTH * 0.5f, r.p[2] + r.dir[2] * ROCKET_LENGTH * 0.5f};
@@ -5862,7 +6485,18 @@ static void explosion_sets_off(const float *p, float radius) {
 // of the animations a hollow could be forced into when every tenth one from 4000 to 9990 was tried on
 // 2026-10-09 (7000, 7100, 7110, 7210 to 7250, 7300, 9100, 9200, 9600 and the 99xx idles): the 7000s are what
 // it plays when it is grabbed or thrown. A character that has no such animation is left as it is.
-static const int VISC_ANIM_IN = 7100, VISC_ANIM_OUT = 7110;
+// v0.93: the game's own table of throws (ThrowParam) gives what an enemy plays when the player's critical hit takes
+// it: 2500 from the front (a riposte: run through, held, let fall) and 2510 from behind (a backstab), the same two
+// numbers for every enemy. Those are forced now, and 7100 / 7110 only on a character that will not take them.
+// The blow itself: on 2026-10-13 the whole of v0.92's attack played on a hollow and its health did not move (the
+// shot comes while the animation forced a moment before still shrugs hits off). So the health is looked at
+// again 0.15 s after the shot, and if it has not gone down the blow's damage is taken off it directly (an
+// enemy brought to nothing this way dies as any other does and its souls come: tried the same day).
+static const int VISC_ANIM_IN = 7100, VISC_ANIM_OUT = 7110, VISC_ANIM_FRONT = 2500, VISC_ANIM_BEHIND = 2510, VISC_DIRECT_DAMAGE = 1800;      // (twelve revolver shots at 150 each, what its row deals: v0.93 had 770, twelve of the 64 a shot took from a hollow then)
+static bool g_visc_behind = false, g_visc_own_anim = false;
+static uintptr_t g_visc_check_chr = 0;
+static double g_visc_check_at = 0, g_visc_anim_check_at = 0;
+static int g_visc_check_hp = 0;
 static void force_animation(uintptr_t chr, int anim) {
     uintptr_t exe = (uintptr_t)GetModuleHandleA(nullptr), vt = 0;
     if (!chr || !safe_read(chr, &vt, 8) || vt != exe + RVA_VT_ENEMY) return;
@@ -5877,8 +6511,19 @@ static void force_animation(uintptr_t chr, int anim) {
 // coming off, and comes out in about 0.3 s, pulling a wide fan of blood after it that hangs as a mist for half a
 // second more while the enemy is thrown back; the hunter is free again about 0.9 s after that. (The red and grey
 // of those clips is their maker's grading, not the game's, so the red wash here is kept faint.)
-static const float VISC_WIND = 0.65f, VISC_IN = 0.80f, VISC_RIP = 2.15f, VISC_OUT = 2.42f, VISC_END = 3.30f, VISC_POSE = 0.10f;
+// v0.90 (Davi: Bloodborne's own pace was too slow here after all; quicker, but more to it and more violent): two and
+// a half seconds. Drawn back by the hip while the player is carried up to the enemy (0.42 s), in (0.12 s, with a
+// stop of the picture), a second, harder shove deeper at one second, the hand worked round in the wound wider
+// and wider and drawn back a little, then torn out and across in an arc (0.22 s) with the longest stop, the
+// player thrown back a step. The view shakes while the hand is in and jolts at the shove and the rip.
+// v0.92 (Davi: the arm stayed out and in the enemy far too long, and its shaking in there was the goofiest part): just
+// over a second. Drawn down 0.22 s, up and in 0.10 s, in for a fifth of a second and quite still, out 0.14 s. There
+// is no second shove, no working the hand round and no tremor of the view any more: only the jolt as it comes out.
+static const float VISC_WIND = 0.22f, VISC_IN = 0.32f, VISC_SHOVE = 99.0f, VISC_RIP = 0.52f, VISC_OUT = 0.66f, VISC_END = 1.10f, VISC_POSE = 0.10f;
+static bool g_visc_shoved = false;
+static float g_visc_yaw0 = 0, g_visc_pitch0 = 0; // where the view pointed as the hand went in (it shakes about that)
 static float g_red_tint = 0;                     // the picture washed in red (HudState.red_tint)
+static float g_arm_pitch = 0;                    // the arm tipped up about the hand (HudState.arm_pitch)
 static float g_arm_roll = 0;                     // the arm turned about the line of sight (HudState.arm_roll)
 static float g_arm_push[3] = {0, 0, 0};          // where the arm is moved to for it (HudState.arm_push)
 static int g_visceral_stage = 0;                 // 0 before the hand is in, 1 in, 2 out
@@ -5898,29 +6543,137 @@ static void stun_enemy(uintptr_t chr, double t) {
         if (s.until < slot->until) slot = &s;
     }
     *slot = {chr, t + 3.0, t + 0.8};
-    sound_play("parry_clang", 0.7f, frand(0.95f, 1.05f));      // (made by tools/uk_sounds.py: the ring of a parry that opens an enemy)
+    // (v0.88 rang a made-up metal clang here, which Davi found really bad: gone. A sound of the player's own choosing is
+    // played if the sound pack has one called visc_parry: a WAV put in reference/sounds, see tools/uk_sounds.py.)
+    sound_play("visc_parry", 0.9f, 1.0f);
     logf("visceral: chr %p is stunned for 3 s\n", (void *)chr);
+}
+// Which enemies know the player is there (v0.91: the attack from behind is only for one that does not). An enemy
+// is taken to know for eight seconds after it has been seen attacking, has lost health, or has faced the player
+// (within 45 degrees) with nothing between them and less than 20 m apart. Looked at five times a second.
+struct Aware { uintptr_t chr; int hp; double until; };
+enum { MAX_AWARE = 24 };
+static Aware g_aware[MAX_AWARE];
+static bool enemy_aware(uintptr_t chr, double t) {
+    for (const Aware &a : g_aware)
+        if (a.chr == chr) return t < a.until;
+    return false;
+}
+static void update_aware(double t) {
+    static double next = 0;
+    float eye[3];
+    if (t < next || !eye_pos(eye)) return;
+    next = t + 0.2;
+    Target near_by[12];
+    int n = targets_near(eye, near_by, 12, 30.0f);
+    for (int i = 0; i < n; i++) {
+        const Target &tg = near_by[i];
+        Aware *slot = nullptr;
+        for (Aware &a : g_aware)
+            if (a.chr == tg.chr) slot = &a;
+        if (!slot) {
+            slot = &g_aware[0];
+            for (Aware &a : g_aware)
+                if (a.until < slot->until) slot = &a;
+            *slot = {tg.chr, tg.hp, 0.0};
+        }
+        float to[3] = {eye[0] - tg.p[0], 0.0f, eye[2] - tg.p[2]}, flat = sqrtf(to[0] * to[0] + to[2] * to[2]);
+        bool faces = flat > 0.05f && (to[0] / flat * -sinf(tg.yaw) + to[2] / flat * -cosf(tg.yaw)) > 0.7f;
+        int anim = -1;
+        bool knows = enemy_attacking(tg.chr, anim) || tg.hp < slot->hp || (faces && tg.dist < 20.0f && ray_blocked(eye, tg.p) != 1);
+        slot->hp = tg.hp;
+        if (knows) slot->until = t + 8.0;
+    }
+}
+static bool g_visc_check_kill = false;            // the blow is taken off the health whether or not something else landed
+static void fx_blood(const float *at, const float *dir, int count, float speed, float spread) {
+    if (!in_sight(at)) return;
+    for (int k = 0; k < count; k++) {
+        float r[3], v[3];
+        rand_unit(r);
+        for (int i = 0; i < 3; i++) v[i] = (dir[i] + r[i] * spread) * speed * frand(0.4f, 1.0f);
+        Particle &p = new_particle(at, v, frand(0.35f, 0.7f), frand(0.03f, 0.09f), 9.0f, "blooddrop");      // (v0.86's were three times the size: red discs)
+        p.r = 0.75f;
+        p.g = 0.02f;
+        p.b = 0.02f;
+    }
+}
+// The Knuckleblaster on a staggered enemy (v0.93): its punch lands as ever, throwing the enemy back, and the blow
+// that the visceral attack deals is taken off the enemy's health a moment after, when it is already in the air.
+// Blood out of its back, a stop of the picture, health and style as for the visceral.
+static bool glory_finisher(const Target &tg, double t) {
+    bool open = false;
+    for (Stun &s : g_stuns)
+        if (s.chr == tg.chr && t <= s.until) {
+            open = true;
+            s.chr = 0;
+        }
+    if (!open || g_visceral_at > 0) return false;
+    float eye[3], d[3] = {0, 0, 1};
+    if (eye_pos(eye)) {
+        float len = dist3(eye, tg.p);
+        if (len > 0.05f)
+            for (int i = 0; i < 3; i++) d[i] = (tg.p[i] - eye[i]) / len;
+    }
+    g_visc_check_chr = tg.chr;
+    g_visc_check_hp = tg.hp;
+    g_visc_check_at = t + 0.12;
+    g_visc_check_kill = true;
+    fx_blood(tg.p, d, 140, 14.0f, 0.55f);
+    static const float mist[3] = {0.55f, 0.02f, 0.02f};
+    add_flash(tg.p, 1.5f, 0.6f, mist);
+    splash_screen_blood();
+    heal_player(50.0f);
+    g_hitstop_request = 0.18f;
+    if (!sound_play("visc_rip", 0.95f, 1.0f)) sound_play("punch_hit_heavy", 0.9f, 0.6f);
+    sound_play("knuckle_hit_heavy", 0.9f, 0.8f);
+    static const float red[3] = {1.0f, 0.15f, 0.1f};
+    style_add(250, "FINISHER", red);
+    logf("glory: the Knuckleblaster's finishing blow on chr %p (hp %d)\n", (void *)tg.chr, tg.hp);
+    return true;
 }
 static bool visceral_start(double t) {
     float right[3], up[3], fwd[3], eye[3], pt[3];
     if (g_visceral_at > 0 || !eye_pos(eye)) return false;
     view_axes(right, up, fwd);
+    auto begin = [&](uintptr_t chr, float len, const char *how) {
+        g_visceral_chr = chr;
+        g_visceral_at = t;                       // (when it began)
+        g_visceral_stage = 0;
+        g_visc_shoved = false;
+        g_visc_behind = how[0] == 'f';           // ("from behind")
+        g_visc_own_anim = false;
+        g_visc_anim_check_at = 0;
+        sound_play("punch_swing", 0.6f, 0.7f);
+        logf("visceral: begun on chr %p, %.1f m away (%s)\n", (void *)chr, len, how);
+    };
     for (Stun &s : g_stuns) {
         if (!s.chr || t > s.until || !chr_alive(s.chr) || !whip_target_point(s.chr, pt)) continue;
         float d[3] = {pt[0] - eye[0], pt[1] - eye[1], pt[2] - eye[2]}, len = sqrtf(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
         if (len > 3.0f || (len > 0.3f && (d[0] * fwd[0] + d[1] * fwd[1] + d[2] * fwd[2]) / len < 0.5f)) continue;
-        g_visceral_chr = s.chr;
-        g_visceral_at = t;                       // (when it began)
-        g_visceral_stage = 0;
-        s.until = t + 3.8;                       // (it stays open until the blow has landed)
-        sound_play("parry_clang", 0.45f, 0.55f);
-        sound_play("punch_swing", 0.6f, 0.7f);
-        logf("visceral: begun on chr %p, %.1f m away\n", (void *)s.chr, len);
+        s.until = t + VISC_END + 0.5;            // (it stays open until the blow has landed)
+        begin(s.chr, len, "stunned");
+        return true;
+    }
+    // From behind (v0.90, Davi's wish: a sneak attack): an enemy within 2.6 m that the player is looking at and that
+    // has its back to them is taken the same way, with no parry first. "Its back to them": the way from the
+    // player to it is within about 55 degrees of the way it faces (its facing is read as in the coin's
+    // shot-from-behind test).
+    Target cand[4];
+    int n = targets_near(eye, cand, 4, 2.6f);
+    for (int i = 0; i < n; i++) {
+        float d[3] = {cand[i].p[0] - eye[0], cand[i].p[1] - eye[1], cand[i].p[2] - eye[2]}, len = sqrtf(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+        float flat = sqrtf(d[0] * d[0] + d[2] * d[2]);
+        if (len < 0.2f || flat < 0.05f || (d[0] * fwd[0] + d[1] * fwd[1] + d[2] * fwd[2]) / len < 0.6f) continue;
+        float behind = d[0] / flat * -sinf(cand[i].yaw) + d[2] / flat * -cosf(cand[i].yaw);
+        if (behind < 0.55f || enemy_aware(cand[i].chr, t)) continue;      // (not one that is already fighting the player)
+        begin(cand[i].chr, len, "from behind");
         return true;
     }
     return false;
 }
 static void update_viscerals(double t) {
+    update_aware(t);
     float eye[3], pt[3];
     if (!eye_pos(eye)) return;
     for (Stun &s : g_stuns) {
@@ -5940,9 +6693,32 @@ static void update_viscerals(double t) {
         }
     }
     g_visceral_gore = false;
+    if (g_visc_check_chr && t >= g_visc_check_at) {
+        int hp = 0;
+        bool read = safe_read(g_visc_check_chr + OFF_CHR_HP, &hp, 4);
+        if (read && hp > 0 && (g_visc_check_kill || hp >= g_visc_check_hp)) {
+            int left = hp > VISC_DIRECT_DAMAGE ? hp - VISC_DIRECT_DAMAGE : 0;
+            safe_write(g_visc_check_chr + OFF_CHR_HP, &left, 4);
+            logf("visceral: the blow had not landed (health still %d of %d before it): taken off directly, %d left\n", hp, g_visc_check_hp, left);
+        } else {
+            logf("visceral: the blow landed (health %d -> %d)\n", g_visc_check_hp, read ? hp : -1);
+        }
+        g_visc_check_chr = 0;
+        g_visc_check_kill = false;
+    }
+    if (g_visc_anim_check_at > 0 && t >= g_visc_anim_check_at && g_visceral_chr) {
+        // did it take its own part? If not, the one every hollow has
+        g_visc_anim_check_at = 0;
+        int now_anim = -1;
+        enemy_attacking(g_visceral_chr, now_anim);
+        g_visc_own_anim = now_anim == (g_visc_behind ? VISC_ANIM_BEHIND : VISC_ANIM_FRONT);
+        logf("visceral: the enemy is in animation %d (%s)\n", now_anim, g_visc_own_anim ? "its own part" : "not its own part: the stagger instead");
+        if (!g_visc_own_anim && chr_alive(g_visceral_chr)) force_animation(g_visceral_chr, VISC_ANIM_IN);
+    }
     if (g_visceral_at <= 0) {
         g_arm_push[0] = g_arm_push[1] = g_arm_push[2] = 0;
         g_arm_roll = 0;
+        g_arm_pitch = 0;
         g_red_tint = 0;
         return;
     }
@@ -5961,52 +6737,53 @@ static void update_viscerals(double t) {
         }
     }
     // blood: drops thrown from `at` about the direction `dir` (the 'blooddrop' picture the explosions' sparks use, in red)
-    auto blood = [&](const float *at, const float *dir, int count, float speed, float spread) {
-        if (!in_sight(at)) return;
-        for (int k = 0; k < count; k++) {
-            float r[3], v[3];
-            rand_unit(r);
-            for (int i = 0; i < 3; i++) v[i] = (dir[i] + r[i] * spread) * speed * frand(0.4f, 1.0f);
-            Particle &p = new_particle(at, v, frand(0.35f, 0.7f), frand(0.03f, 0.09f), 9.0f, "blooddrop");      // (v0.86's were three times the size: red discs)
-            p.r = 0.75f;
-            p.g = 0.02f;
-            p.b = 0.02f;
-        }
-    };
+    auto blood = [&](const float *at, const float *dir, int count, float speed, float spread) { fx_blood(at, dir, count, speed, spread); };
     // the arm: its reaching pose, and where the whole of it is
     float pose = 0, right_k = 0, up_k = 0, fwd_k = 0, roll_k = 0;
+    // v0.91 (Davi: it read as an arm held out, kept there and taken back): an uppercut. The arm is drawn down and back
+    // out of the bottom of the view with the forearm turned up, comes up from under the view and forward into
+    // the gut, fastest at the start, lifts with each shove while the hand is worked round, and is dragged back
+    // down and out the way it went in.
+    float pitch_k = 0;
     if (a < VISC_WIND) {
-        // (drawn back low, by the hip, as the hunter's hand is in Davi's two pictures of Bloodborne's attack; pulled
-        // back along the view instead, it filled the screen)
-        float k = a / VISC_WIND;
-        up_k = -0.24f * k * k * (3.0f - 2.0f * k);
+        float k = a / VISC_WIND, e = k * k * (3.0f - 2.0f * k);
+        pose = VISC_POSE * 0.6f * e;
+        up_k = -0.85f * e;                       // (under the bottom of the view)
+        right_k = 0.16f * e;
+        fwd_k = 0.10f * e;
+        pitch_k = 0.85f * e;
     } else if (a < VISC_IN) {
-        float k = (a - VISC_WIND) / (VISC_IN - VISC_WIND);
-        k = k * k * (3.0f - 2.0f * k);
-        pose = VISC_POSE * k;
-        fwd_k = 0.60f * k;
-        right_k = 0.24f * k;
-        up_k = -0.24f + 0.30f * k;                // (up from the hip into the body)
+        float k = (a - VISC_WIND) / (VISC_IN - VISC_WIND), e = 1.0f - (1.0f - k) * (1.0f - k);
+        pose = VISC_POSE * (0.6f + 0.4f * e);
+        up_k = -0.85f + 0.93f * e;
+        right_k = 0.16f + 0.08f * e;
+        fwd_k = 0.10f + 0.50f * e;
+        pitch_k = 0.85f - 0.50f * e;
     } else if (a < VISC_RIP) {
-        float in = a - VISC_IN, shake = 0.012f + 0.01f * sinf(in * 9.0f);
-        float deeper = in / (VISC_RIP - VISC_IN);
+        float deeper = fminf(1.0f, (a - VISC_IN) / (VISC_RIP - VISC_IN));      // held still, sinking in a little
         pose = VISC_POSE;
-        roll_k = 0.34f * sinf(in * 5.2f) + 0.05f * sinf(in * 33.0f);          // turning in the wound
-        fwd_k = 0.60f + 0.07f * deeper + sinf(in * 47.0f) * shake + 0.04f * sinf(in * 6.0f);
-        right_k = 0.24f + sinf(in * 61.0f) * shake;
-        up_k = 0.06f + sinf(in * 53.0f + 1.0f) * shake;
+        fwd_k = 0.60f + 0.06f * deeper;
+        right_k = 0.24f;
+        up_k = 0.08f + 0.02f * deeper;
+        pitch_k = 0.35f + 0.06f * deeper;
     } else if (a < VISC_OUT) {
-        float k = (a - VISC_RIP) / (VISC_OUT - VISC_RIP);
+        float k = (a - VISC_RIP) / (VISC_OUT - VISC_RIP), e = 1.0f - (1.0f - k) * (1.0f - k);
         pose = VISC_POSE + (0.33f - VISC_POSE) * k;
-        fwd_k = 0.60f - 0.72f * k;
-        right_k = 0.24f * (1.0f - k);
-        up_k = 0.06f * (1.0f - k);
+        roll_k = 0.45f * e;
+        fwd_k = 0.66f - 0.84f * e;
+        right_k = 0.24f + 0.10f * e;
+        up_k = 0.10f - 0.83f * e;
+        pitch_k = 0.41f + 0.44f * e;
     } else {
-        float k = (a - VISC_OUT) / (VISC_END - VISC_OUT);
-        k = k > 1.0f ? 1.0f : k;
+        float k = fminf((a - VISC_OUT) / 0.33f, 1.0f), left = (1.0f - k) * (1.0f - k);
         pose = 0.33f + (a - VISC_OUT);
-        fwd_k = -0.12f * (1.0f - k);
+        roll_k = 0.45f * left;
+        fwd_k = -0.18f * left;
+        right_k = 0.34f * left;
+        up_k = -0.73f * left;
+        pitch_k = 0.85f * left;
     }
+    g_arm_pitch = pitch_k;
     // the picture goes red while the hand is in, most as it comes out, and clears over half a second (Bloodborne's own
     // screen in the second of Davi's pictures)
     g_red_tint = a < VISC_IN ? 0.0f : a < VISC_RIP ? 0.12f + 0.16f * (a - VISC_IN) / (VISC_RIP - VISC_IN) : a < VISC_OUT ? 0.6f : fmaxf(0.0f, 0.6f * (1.0f - (a - VISC_OUT) / 0.7f));
@@ -6020,6 +6797,14 @@ static void update_viscerals(double t) {
     if (a < VISC_OUT) {
         // the player stands where they are (the rocket ride's hold, with no speed), and looks at the enemy
         g_ride_v[0] = g_ride_v[1] = g_ride_v[2] = 0;
+        if (there) {
+            float flat = sqrtf(d[0] * d[0] + d[2] * d[2]), gap = len * flat;      // how far off it is along the ground
+            float speed = a >= VISC_WIND && a < VISC_IN && gap > 1.1f ? fminf((gap - 1.1f) / (VISC_IN - VISC_WIND), 12.0f) : a >= VISC_RIP ? -2.5f : 0.0f;
+            if (flat > 0.05f) {
+                g_ride_v[0] = d[0] / flat * speed;
+                g_ride_v[2] = d[2] / flat * speed;
+            }
+        }
         g_ride_hold = true;
         if (there && a < VISC_IN) {
             float want_yaw = atan2f(d[0], d[2]), want_pitch = asinf(d[1] > 1.0f ? 1.0f : d[1] < -1.0f ? -1.0f : d[1]);
@@ -6029,16 +6814,29 @@ static void update_viscerals(double t) {
             g_pitch = g_pitch + (want_pitch - g_pitch) * 0.35f;
         }
     }
+    if (g_visceral_stage >= 1 && a < VISC_OUT + 0.4f) {
+        // the view shakes about where it pointed as the hand went in: a tremor while it is in, harder after the shove,
+        // and a jolt as it is torn out that dies away in 0.4 s
+        float amp = a < VISC_RIP ? 0.0f : 0.05f * fmaxf(0.0f, 1.0f - (a - VISC_RIP) / (VISC_OUT + 0.4f - VISC_RIP));
+        g_yaw = g_visc_yaw0 + amp * sinf(a * 71.0f) + amp * 0.5f * sinf(a * 113.0f);
+        g_pitch = g_visc_pitch0 + amp * sinf(a * 93.0f + 1.0f);
+    }
     if (g_visceral_stage == 0 && a >= VISC_IN) {
+        g_visc_yaw0 = g_yaw;
+        g_visc_pitch0 = g_pitch;
         g_visceral_stage = 1;
         g_visceral_hold_at = t + 0.2;
         if (there) {
             shoot(BEHAVIOR_STUN, from, d);
-            force_animation(chr, VISC_ANIM_IN);
-            blood(pt, back, 14, 6.0f, 0.6f);
-            g_hitstop_request = 0.07f;
-            sound_play("hook_hit", 0.8f, 0.6f);
-            sound_play("punch_hit_heavy", 0.7f, 0.7f);
+            force_animation(chr, g_visc_behind ? VISC_ANIM_BEHIND : VISC_ANIM_FRONT);
+            g_visc_anim_check_at = t + 0.08;
+            blood(pt, back, 40, 7.0f, 0.6f);
+            splash_screen_blood();
+            g_hitstop_request = 0.10f;
+            if (!sound_play("visc_in", 0.9f, 1.0f)) {            // (the player's own sound if the pack has one, else these)
+                sound_play("hook_hit", 0.8f, 0.6f);
+                sound_play("punch_hit_heavy", 0.7f, 0.7f);
+            }
         }
     }
     if (g_visceral_stage == 1 && a < VISC_RIP) {
@@ -6048,13 +6846,29 @@ static void update_viscerals(double t) {
             blood(pt, back, 4, 2.2f, 1.1f);      // (no more blows while it is held: each one would start its animation over)
         }
     }
+    if (g_visceral_stage == 1 && !g_visc_shoved && a >= VISC_SHOVE && a < VISC_RIP) {
+        // the second shove: deeper, with its own stop of the picture and its own blood, and the enemy jolted again
+        g_visc_shoved = true;
+        if (there) {
+            force_animation(chr, VISC_ANIM_IN);
+            blood(pt, back, 45, 8.0f, 0.7f);
+            splash_screen_blood();
+            g_hitstop_request = 0.08f;
+            sound_play("punch_hit_heavy", 0.8f, 0.55f);
+            sound_play("hook_hit", 0.6f, 0.5f);
+        }
+    }
     if (g_visceral_stage == 1 && a >= VISC_OUT) {
         g_visceral_stage = 2;
         for (Stun &s : g_stuns)
             if (s.chr == chr) s.chr = 0;
         if (there) {
             note_attack(HIT_PUNCH);
-            force_animation(chr, VISC_ANIM_OUT);
+            if (!g_visc_own_anim) force_animation(chr, VISC_ANIM_OUT);
+            g_visc_check_chr = chr;
+            g_visc_check_hp = 0;
+            safe_read(chr + OFF_CHR_HP, &g_visc_check_hp, 4);
+            g_visc_check_at = t + 0.15;
             bool ok = shoot(BEHAVIOR_VISCERAL, from, d);
             {
                 // the fan of blood the hand pulls out after it, back towards the player and off to one side, and the mist it leaves
@@ -6069,10 +6883,12 @@ static void update_viscerals(double t) {
             splash_screen_blood();
             splash_screen_blood();
             heal_player(50.0f);
-            g_hitstop_request = 0.16f;
-            sound_play("punch_hit_heavy", 0.9f, 0.6f);
-            sound_play("punch_projectile", 0.55f, 0.7f);
-            sound_play("hook_hit", 0.7f, 0.45f);
+            g_hitstop_request = 0.20f;
+            if (!sound_play("visc_rip", 0.95f, 1.0f)) {
+                sound_play("punch_hit_heavy", 0.9f, 0.6f);
+                sound_play("punch_projectile", 0.55f, 0.7f);
+                sound_play("hook_hit", 0.7f, 0.45f);
+            }
             static const float red[3] = {1.0f, 0.15f, 0.1f};
             style_add(250, "VISCERAL", red);
             InterlockedIncrement(&g_viscerals);
@@ -6132,6 +6948,8 @@ static void freeze_rockets(bool on, double t) {
     g_rockets_frozen = on;
     if (on) {
         g_frozen_idle_since = t;
+        for (Rocket &r : g_rockets)
+            if (r.alive) r.rideable = true;      // (at once, not a frame later)
         sound_play("rocket_freeze", 1.0f, 1.0f);
     } else {
         g_auto_unfreeze = false;
@@ -6143,9 +6961,11 @@ static void freeze_rockets(bool on, double t) {
 }
 // RocketLauncher.Update, and what WeaponCharges does for it whichever weapon is held
 static void update_rocket_launcher(double t, float dt, bool lmb, bool rmb) {
-    bool held = g_weapon == WEAPON_ROCKET, srs = g_rocket_var == ROCKET_SRS;
+    bool held = g_weapon == WEAPON_ROCKET, srs = g_rocket_var == ROCKET_SRS, napalm = g_rocket_var == ROCKET_NAPALM;
     bool rmb_pressed = held && rmb && !g_prev_rocket_rmb;
     g_prev_rocket_rmb = held && rmb;
+    if (!held || !napalm || !rmb) g_napalm_want = false;
+    update_napalm(t, dt);
     // WeaponCharges.Charge
     float freeze_time = g_freeze_time, cb_ready = g_cb_ready;
     if (cb_ready < 1.0f) cb_ready = move_towards(cb_ready, 1.0f, dt * 0.125f);
@@ -6223,6 +7043,14 @@ static void update_rocket_launcher(double t, float dt, bool lmb, bool rmb) {
             g_cb_ready = 0;
         }
         g_cb_charge = charge;
+    } else if (napalm) {
+        g_cb_charge = 0;
+        g_napalm_want = alt_held;
+        // the clock's wind-up as the tank comes back to a quarter (RocketLauncher.Update: "timerWindupSound" at 0.5, its own speed)
+        static float last_known = 1.0f;
+        float fuel = g_napalm_fuel;
+        if (fuel >= 0.25f && last_known < 0.25f) sound_play("rocket_wind", 0.5f, 1.0f);
+        last_known = fuel;
     } else {
         g_cb_charge = 0;
         static float last_known = 5.0f;
@@ -6405,6 +7233,14 @@ static int dead_enemies() {
 static bool bonfire_reload(int bonfire) {
     uintptr_t exe = (uintptr_t)GetModuleHandleA(nullptr), man = 0;
     if (bonfire <= 0 || !safe_read(exe + 0x1C7B1B0, &man, 8) || !man) return false;
+    {
+        // The game's script function RequestFullRecover (exe+4B0CE0) is one line: a byte at GameDataMan + 0x80 set
+        // to 1. The game takes it at the next load (seen on 2026-10-13: it stayed set while playing and was back
+        // at 0 after the warp) and does what a rest at a bonfire does for the player: health, flasks, spells.
+        uintptr_t data = 0;
+        uint8_t one = 1;
+        if (safe_read(exe + 0x1C8A530, &data, 8) && data) safe_write(data + 0x80, &one, 1);
+    }
     ((void (*)(uintptr_t, int))(exe + 0x4AAF30))(man, bonfire);
     return true;
 }
@@ -6473,6 +7309,8 @@ static int reset_enemies() {
 // not refilled, and enemies stay as they were unless respawn_enemies is set. If the mod does not know yet
 // where the last bonfire puts the player, this one death is left to the game, which shows where.
 static uintptr_t g_reload_old_chr = 0;            // the player's character as it was when the warp was asked for
+static float g_reload_spot[3] = {0, 0, 0}, g_reload_yaw = 0;   // where that bonfire's place is
+static bool g_reload_has_spot = false;
 static double g_reload_end_at = 0;                // a restart that goes through the game's warp: when the death screen comes down
 static void death_respawn(double t) {
     DeathState &d = g_death;
@@ -6488,6 +7326,28 @@ static void death_respawn(double t) {
         int zero = 0;
         if (chr) safe_write(chr + 0x3E8, &zero, 4);
         return;
+    }
+    if (g_death_penalty) {
+        // What a death costs in Dark Souls, by the game's own function for it (its script name is UpDateBloodMark,
+        // exe+4AD5A0, which comes down to exe+48A5A0(event manager, the player, 1)): the souls and the humanity
+        // are put in the bloodstain's record with the place the player fell, and taken from the player, who is
+        // hollowed. Called while the body is still where it fell.
+        uintptr_t exe = (uintptr_t)GetModuleHandleA(nullptr), man = 0, data = 0, pgd = 0;
+        int souls = -1, humanity = -1, souls_after = -1;
+        if (safe_read(exe + 0x1C8A530, &data, 8) && data && safe_read(data + 0x10, &pgd, 8) && pgd) {
+            safe_read(pgd + 0x94, &souls, 4);
+            safe_read(pgd + 0x84, &humanity, 4);
+        }
+        if (safe_read(exe + 0x1C7B1B0, &man, 8) && man && pgd) {
+            ((void (*)(uintptr_t, uintptr_t, char))(exe + 0x48A5A0))(man, chr, 1);
+            safe_read(pgd + 0x94, &souls_after, 4);
+            // ...and the stain itself is made in the world there and then (the game's CreateHeroBloodStain, exe+4B1540),
+            // while the body is still where it fell: it is made where the player stands (tried on 2026-10-13: asked
+            // for after the move to the bonfire, the stain lay at the bonfire). A restart that loads the area again
+            // makes it once more from the record.
+            ((void (*)())(exe + 0x4B1540))();
+            logf("death: the penalty: %d souls and %d humanity left in a bloodstain (souls now %d)\n", souls, humanity, souls_after);
+        }
     }
     memcpy(g_teleport_to, spot->p, sizeof(g_teleport_to));
     g_teleport_abs = true;
@@ -6514,7 +7374,14 @@ static void death_respawn(double t) {
     logf("death: back at bonfire %d (%.1f %.1f %.1f), %.2f s after the blow; enemies reset: %d\n", id, spot->p[0], spot->p[1], spot->p[2], t - d.t0, reset);
     {
         int dead = dead_enemies();
-        if (g_restart_reload && dead > 0) {
+        // v0.93: is the bonfire's place in the world at all? With the last bonfire in an area that is not loaded
+        // (Firelink Shrine's, dying on a roof in the Undead Burg) the player was put in empty space there and fell
+        // for good: seen on 2026-10-13. No ground under the place: the game's own warp, which loads the area.
+        float top[3] = {spot->p[0], spot->p[1] + 1.0f, spot->p[2]}, under[3] = {spot->p[0], spot->p[1] - 2.5f, spot->p[2]};
+        RayHit ground;
+        bool no_ground = !(ray_cast(top, under, ground) && ground.hit);
+        if (no_ground) logf("death: nothing to stand on at the bonfire's place: its area is not loaded, so the game's warp it is\n");
+        if ((g_restart_reload && dead > 0) || no_ground) {
             bool ok = bonfire_reload(id);
             for (int i = 0; i < MAX_TRACKED; i++) g_tracked[i].was_alive = false;
             if (ok) {
@@ -6522,8 +7389,11 @@ static void death_respawn(double t) {
                 // forgotten: left known, the fall rescue kept putting the player back where they had been while
                 // the game was putting them at the bonfire (tried on 2026-10-09).
                 g_have_safe = false;
-                g_reload_end_at = t + 8.0;
+                g_reload_end_at = t + 45.0;
                 g_reload_old_chr = chr;
+                memcpy(g_reload_spot, spot->p, sizeof(g_reload_spot));
+                g_reload_yaw = spot->yaw;
+                g_reload_has_spot = true;
                 return;
             }
             logf("death: %d enemies were dead: the game's own warp to the bonfire, which loads the area again: %s\n", dead, ok ? "asked for" : "NOT possible");
@@ -6535,8 +7405,12 @@ static void death_step(double t, float dt) {
     DeathState &d = g_death;
     if (!g_dead) return;
     // The warp's cover comes down as soon as the game has the player in the world again (a new character, with
-    // health) and a third of a second has gone by for the picture; after eight seconds whatever happens. (v0.87
-    // waited six seconds every time.)
+    // health, whose body the game is stepping again) and a third of a second has gone by for the picture; after
+    // 45 seconds whatever happens. (v0.87 waited six seconds every time. v0.88 to v0.92 took the new character
+    // alone as the sign, and gave up after eight seconds: when the bonfire is in another area than the one the
+    // player died in, the character is there within three seconds but stands at a placeholder spot, unstepped,
+    // for ten more while the area loads, and the game does not put it at the bonfire: seen on 2026-10-13, the
+    // player dropping out of the world from there. So the mod puts the player at the bonfire's place itself.)
     uintptr_t reload_chr = 0;
     bool reload_done = false;
     if (g_reload_end_at > 0) {
@@ -6544,7 +7418,7 @@ static void death_step(double t, float dt) {
         uintptr_t exe = (uintptr_t)GetModuleHandleA(nullptr), man = 0;
         int hp_now = 0;
         bool back = safe_read(exe + 0x1C77E50, &man, 8) && man && safe_read(man + 0x68, &reload_chr, 8) && reload_chr && reload_chr != g_reload_old_chr &&
-                    safe_read(reload_chr + 0x3E8, &hp_now, 4) && hp_now > 0;
+                    safe_read(reload_chr + 0x3E8, &hp_now, 4) && hp_now > 0 && t - g_proxy_now_at < 0.25;
         if (!back) back_since = 0;
         else if (back_since == 0) back_since = t;
         reload_done = t >= g_reload_end_at || (back && t - back_since > 0.33);
@@ -6560,6 +7434,20 @@ static void death_step(double t, float dt) {
             int max_hp = 0;
             if (chr && safe_read(chr + 0x3EC, &max_hp, 4) && max_hp > 0) safe_write(chr + 0x3E8, &max_hp, 4);
             g_respawn_grace_until = t + 1.5;
+            if (g_reload_has_spot) {
+                float off = dist3(g_proxy_now, g_reload_spot);
+                logf("death: the area is loaded; the player is %.1f m from the bonfire's place%s\n", off, off > 3.0f ? ": put there" : "");
+                if (off > 3.0f) {
+                    memcpy(g_teleport_to, g_reload_spot, sizeof(g_teleport_to));
+                    g_teleport_abs = true;
+                    g_teleport_keep_safe = false;
+                    g_teleport_pending = true;
+                    g_yaw = g_reload_yaw;
+                    g_pitch = 0;
+                    g_vx = g_vy = g_vz = 0;
+                }
+                g_reload_has_spot = false;
+            }
         }
         death_end("the area is loaded again");
         return;
@@ -6929,6 +7817,110 @@ static void try_instant_fire() {
                     } else {
                         logf("debug: %s: no enemy\n", cmd);
                     }
+                } else if (got >= 1 && !strcmp(cmd, "ride")) {
+                    // a rocket along the view, under the feet, and the player on it
+                    spawn_rocket(t);
+                    Rocket *newest = nullptr;
+                    for (Rocket &r : g_rockets)
+                        if (r.alive && (!newest || r.born >= newest->born)) newest = &r;
+                    float feet[3];
+                    if (newest && feet_pos(feet)) {
+                        for (int i = 0; i < 3; i++) newest->p[i] = feet[i] - newest->dir[i] * ROCKET_LENGTH * 0.5f;
+                        ride_start(*newest, t);
+                        logf("debug: ride: on a rocket heading (%.2f %.2f %.2f)\n", newest->dir[0], newest->dir[1], newest->dir[2]);
+                    }
+                } else if (got >= 1 && !strcmp(cmd, "rays") && eye_pos(eye)) {
+                    // how far each of the 32 collision layers lets a ray along the view go (up to 60 m), with the bits
+                    // the game's own sight check adds (0x20) and without
+                    float right[3], up[3], fwd[3], to[3];
+                    view_axes(right, up, fwd);
+                    for (int i = 0; i < 3; i++) to[i] = eye[i] + fwd[i] * 60.0f;
+                    char line[700] = "";
+                    for (int pass = 0; pass < 2; pass++) {
+                        size_t n = 0;
+                        for (int layer = 0; layer < 32; layer++) {
+                            g_ray_filter = layer | (pass ? 0x20 : 0);
+                            RayHit h;
+                            bool ok = ray_cast(eye, to, h);
+                            n += snprintf(line + n, sizeof(line) - n, " %d:%s", layer, !ok ? "?" : h.hit ? "" : "-");
+                            if (ok && h.hit) n += snprintf(line + n, sizeof(line) - n, "%.1f", h.dist);
+                        }
+                        logf("debug: rays (%s):%s\n", pass ? "with 0x20" : "plain", line);
+                    }
+                    g_ray_filter = RAYCAST_FILTER;
+                } else if (got >= 2 && !strcmp(cmd, "look")) {
+                    // look YAW [PITCH]: the view set outright, in degrees (pitch up is positive)
+                    g_yaw = arg * 3.14159265f / 180.0f;
+                    g_pitch = (got >= 3 ? arg2 : 0) * 3.14159265f / 180.0f;
+                    logf("debug: look: yaw %d, pitch %d degrees\n", arg, got >= 3 ? arg2 : 0);
+                } else if (got >= 1 && !strcmp(cmd, "behind") && eye_pos(eye)) {
+                    // behind [CM]: the player put on the ground that far behind the nearest living enemy's back, facing it
+                    Target near_by[1];
+                    uintptr_t pos = g_player_pos;
+                    if (pos && find_targets(eye, near_by, 1, 300.0f) == 1) {
+                        const Target &e = near_by[0];
+                        const float *feet = (const float *)(pos + OFF_POS_X);
+                        float dist = (got >= 2 ? arg : 150) * 0.01f;
+                        float spot[3] = {e.p[0] + sinf(e.yaw) * dist, e.p[1], e.p[2] + cosf(e.yaw) * dist}, under[3] = {spot[0], spot[1] - 3.0f, spot[2]};
+                        RayHit h;
+                        if (ray_cast(spot, under, h) && h.hit) {
+                            g_teleport_delta[0] = spot[0] - feet[0];
+                            g_teleport_delta[1] = h.point[1] + 0.1f - feet[1];
+                            g_teleport_delta[2] = spot[2] - feet[2];
+                            g_teleport_pending = true;
+                            g_yaw = atan2f(e.p[0] - spot[0], e.p[2] - spot[2]);
+                            g_pitch = 0;
+                            logf("debug: behind chr %p (hp %d, it was %.1f m away, its facing %.2f rad)\n", (void *)e.chr, e.hp, e.dist, e.yaw);
+                        } else {
+                            logf("debug: behind: no ground behind chr %p\n", (void *)e.chr);
+                        }
+                    }
+                } else if (got >= 1 && (!strcmp(cmd, "oil") || !strcmp(cmd, "ignite")) && eye_pos(eye)) {
+                    // oil [HUNDREDTHS]: the nearest living enemy soaked, and a stain put under it; ignite: an explosion's
+                    // lighting (no damage) at its feet
+                    Target near_by[1];
+                    if (find_targets(eye, near_by, 1, 200.0f) == 1) {
+                        const Target &e = near_by[0];
+                        float under[3] = {e.p[0], e.p[1] - TARGET_HEIGHT, e.p[2]}, up_n[3] = {0, 1, 0};
+                        if (cmd[0] == 'o') {
+                            if (Oiled *o = oiled_find(e.chr, true)) o->fuel = (got >= 2 ? arg : 100) * 0.01f;
+                            stain_add(under, up_n, t);
+                            logf("debug: oil: chr %p (hp %d) soaked and standing on a stain\n", (void *)e.chr, e.hp);
+                        } else {
+                            napalm_ignite(under, 1.0f, t);
+                            logf("debug: ignite at chr %p (hp %d)\n", (void *)e.chr, e.hp);
+                        }
+                    }
+                } else if (got >= 1 && !strcmp(cmd, "coinshot")) {
+                    // a coin tossed and hit as a plain revolver shot hits one (a script cannot aim at a coin in flight)
+                    throw_coin();
+                    Coin *newest = nullptr;
+                    for (Coin &c : g_coins)
+                        if (c.alive && (!newest || c.born >= newest->born)) newest = &c;
+                    if (newest) {
+                        hit_coin(*newest, t);
+                        newest->charged = false;
+                        newest->carry = 0;
+                    }
+                    logf("debug: coinshot: %s\n", newest ? "a coin tossed and shot" : "no coin");
+                } else if (got >= 1 && !strcmp(cmd, "mapreload")) {
+                    // the game's script function SummonedMapReload (exe+4B0780 -> exe+490070(event manager)): what does it do?
+                    uintptr_t exe2 = (uintptr_t)GetModuleHandleA(nullptr), man = 0;
+                    if (safe_read(exe2 + 0x1C7B1B0, &man, 8) && man) {
+                        logf("debug: mapreload: calling\n");
+                        ((void (*)(uintptr_t))(exe2 + 0x490070))(man);
+                        logf("debug: mapreload: returned\n");
+                    }
+                } else if (got >= 1 && !strcmp(cmd, "stain")) {
+                    // the game's script function CreateHeroBloodStain (exe+4B1540)
+                    logf("debug: stain: calling\n");
+                    ((void (*)())((uintptr_t)GetModuleHandleA(nullptr) + 0x4B1540))();
+                    logf("debug: stain: returned\n");
+                } else if (got >= 1 && !strcmp(cmd, "die")) {
+                    // the player's health to 1, which the mod takes for a killing blow
+                    int one = 1;
+                    if (g_player_chr) safe_write(g_player_chr + OFF_CHR_HP, &one, 4);
+                    logf("debug: die: the player's health set to 1\n");
                 } else if (got >= 1 && !strcmp(cmd, "punchball")) {
                     logf("debug: punchball: %s\n", punch_ball(t) ? "a ball was sent on" : "no ball in reach");
                 } else if (got >= 4 && !strcmp(cmd, "boom") && eye_pos(eye)) {
@@ -7047,7 +8039,7 @@ static void try_instant_fire() {
         static const int next_variation[3] = {2, 0, 1};      // Piercer -> Sharpshooter, Marksman -> Piercer, Sharpshooter -> Marksman
         bool k1 = armed && key_down('1'), k2 = armed && key_down('2'), k3 = armed && key_down('3'), k4 = armed && key_down('4'), k5 = armed && key_down('5'), ke = armed && key_down('E'),
              kq = armed && key_down('Q'), kx = armed && key_down('X');
-        int weapon = g_weapon, variation = g_variation, shotgun_var = g_shotgun_var, rail_var = g_rail_var, slab_mask = g_slab_mask, saw_var = g_saw_var, rocket_var = g_rocket_var;
+        int weapon = g_weapon, variation = g_variation, shotgun_var = g_shotgun_var, rail_var = g_rail_var, slab_mask = g_slab_mask, saw_var = g_saw_var, rocket_var = g_rocket_var, nail_mask = g_nail_mask;
         bool next = ke && !prev_e;
         if (k1 && !prev1) {
             next = weapon == WEAPON_REVOLVER;
@@ -7069,7 +8061,7 @@ static void try_instant_fire() {
             if (weapon == WEAPON_REVOLVER) variation = next_variation[variation];
             else if (weapon == WEAPON_SHOTGUN) shotgun_var ^= 1;
             else if (weapon == WEAPON_SAWLAUNCHER) saw_var ^= 1;
-            else if (weapon == WEAPON_ROCKET) rocket_var ^= 1;
+            else if (weapon == WEAPON_ROCKET) rocket_var = (rocket_var + 1) % 3;
             else rail_var ^= 1;
         }
         // Q: the last variation of the weapon in the hand (the Sharpshooter, the Pump Charge, the Malicious)
@@ -7077,10 +8069,11 @@ static void try_instant_fire() {
             if (weapon == WEAPON_REVOLVER) variation = 2;
             else if (weapon == WEAPON_SHOTGUN) shotgun_var = 1;
             else if (weapon == WEAPON_SAWLAUNCHER) saw_var = SAW_OVERHEAT;
-            else if (weapon == WEAPON_ROCKET) rocket_var = ROCKET_SRS;
+            else if (weapon == WEAPON_ROCKET) rocket_var = ROCKET_NAPALM;
             else rail_var = 1;
         }
         if (kx && !prev_x && weapon == WEAPON_REVOLVER) slab_mask ^= 1 << variation;
+        if (kx && !prev_x && weapon == WEAPON_SAWLAUNCHER) nail_mask ^= 1 << saw_var;
         prev1 = k1;
         prev2 = k2;
         prev3 = k3;
@@ -7090,8 +8083,9 @@ static void try_instant_fire() {
         prev_q = kq;
         prev_x = kx;
         if (weapon != g_weapon || variation != g_variation || shotgun_var != g_shotgun_var || rail_var != g_rail_var || slab_mask != g_slab_mask ||
-            saw_var != g_saw_var || rocket_var != g_rocket_var) {
-            bool choice_changed = slab_mask != g_slab_mask;
+            saw_var != g_saw_var || rocket_var != g_rocket_var || nail_mask != g_nail_mask) {
+            bool choice_changed = slab_mask != g_slab_mask || nail_mask != g_nail_mask;
+            g_nail_mask = nail_mask;
             g_weapon = weapon;
             g_saw_var = saw_var;
             g_rocket_var = rocket_var;
@@ -7122,11 +8116,12 @@ static void try_instant_fire() {
                 g_rocket_drawn_at = t;
                 g_rocket_rmb_stale = true;
             } else if (weapon == WEAPON_SAWLAUNCHER) {
-                // its Equip clip: CanShoot at 0.30 s, the snap of the saw going in at 0.48 s
+                // its Equip clip: CanShoot at 0.30 s, the snap of the saw going in at 0.48 s (the nailgun's: CanShoot at 0.45 s)
+                bool as_nailgun = (nail_mask >> saw_var) & 1;
                 play_revolver("Equip");
-                g_saw_ready_at = t + 0.30;
+                g_saw_ready_at = t + (as_nailgun ? 0.45 : 0.30);
                 g_saw_cooldown = 0;
-                sound_later(0.48, "saw_snap", 0.2f, 1.0f, CH_FREE);
+                if (!as_nailgun) sound_later(0.48, "saw_snap", 0.2f, 1.0f, CH_FREE);
             } else if (weapon == WEAPON_SHOTGUN) {
                 play_revolver("Equip");
                 g_shotgun_ready_at = g_cores_ready_at = t + SHOTGUN_EQUIP_READY;
@@ -7147,8 +8142,9 @@ static void try_instant_fire() {
                 g_next_shot = t + (g_quick_draw ? 0.0 : REVOLVER_PICKUP_READY);
             }
             static const char *const names[3] = {"Piercer", "Marksman", "Sharpshooter"};
-            const char *held = weapon == WEAPON_ROCKET ? (rocket_var ? "rocket launcher (S.R.S. Cannon)" : "rocket launcher (Freezeframe)")
-                               : weapon == WEAPON_SAWLAUNCHER ? (saw_var ? "sawblade launcher (Overheat)" : "sawblade launcher (Attractor)")
+            const char *held = weapon == WEAPON_ROCKET ? (rocket_var == ROCKET_NAPALM ? "rocket launcher (Firestarter)" : rocket_var ? "rocket launcher (S.R.S. Cannon)" : "rocket launcher (Freezeframe)")
+                               : weapon == WEAPON_SAWLAUNCHER ? ((nail_mask >> saw_var) & 1 ? (saw_var ? "nailgun (Overheat)" : "nailgun (Attractor)")
+                                                                 : saw_var ? "sawblade launcher (Overheat)" : "sawblade launcher (Attractor)")
                                : weapon == WEAPON_SHOTGUN ? (shotgun_var ? "shotgun (Pump Charge)" : "shotgun (Core Eject)")
                                : weapon == WEAPON_RAILCANNON ? (rail_var ? "railcannon (Malicious)" : "railcannon (Electric)") : names[variation];
             Target all[16];
@@ -7325,9 +8321,9 @@ static void try_instant_fire() {
         if (slab) {
             g_cyl_target += 90.0f;
             g_slab_slow_until[g_variation] = 0;
-            // (the 'RevolverClick' prefab plays its clip at twice its speed. Until v0.81 it was played at its own: an octave
-            // down and twice as long, a slow ratchet after every Slab shot, which Davi took for a crossbow)
-            sound_play("slab_click", 0.5f, 2.0f, false, CH_FREE);
+            // (the 'RevolverClick' prefab's RandomPitch plays its clip at 1.45 to 1.55 times its speed; v0.81 to v0.92
+            // played it at the 2 its AudioSource says, and before that at 1)
+            if (g_slab_click) sound_play("slab_click", 0.5f, frand(1.45f, 1.55f), false, CH_FREE);
         }
     }
     bool alt_fired = false;
@@ -7588,7 +8584,7 @@ static void try_instant_fire() {
                 g_next_shot = t + 0.47;
                 g_slab_slow_until[g_variation] = 0;
                 g_slab_click_at = -1;
-                sound_later(0.12, "slab_click", 0.5f, 2.0f, CH_FREE);
+                if (g_slab_click) sound_later(0.12, "slab_click", 0.5f, 1.5f, CH_FREE);
                 fired = false;                   // (nothing left for slab_fired to arm)
                 logf("slab: split-window coin shot, instant reload\n");
             }
@@ -7795,6 +8791,7 @@ static bool draw_full_hud(IDXGISwapChain *sc) {
                 st.variation = g_variation;
                 st.weapon = g_weapon;
                 st.alt = slab_held();
+                st.nailgun = nail_held();
                 st.weapon_var = g_weapon == WEAPON_SHOTGUN ? (int)g_shotgun_var : g_weapon == WEAPON_RAILCANNON ? (int)g_rail_var
                                 : g_weapon == WEAPON_SAWLAUNCHER ? (int)g_saw_var : g_weapon == WEAPON_ROCKET ? (int)g_rocket_var : 0;
                 if (g_weapon == WEAPON_ROCKET) {
@@ -7803,11 +8800,13 @@ static bool draw_full_hud(IDXGISwapChain *sc) {
                     // that is not back yet leaves it at half strength
                     static const float blue[3] = {0.251f, 0.906f, 1.0f}, green[3] = {0.267f, 1.0f, 0.271f};
                     float charge = g_cb_charge, ready = g_cb_ready;
-                    bool srs = g_rocket_var == ROCKET_SRS;
-                    st.clock_fill = !srs ? g_freeze_time / 5.0f : charge > 0 ? charge : ready;
-                    st.clock_alpha = srs && charge <= 0 && ready < 1.0f ? 0.5f : 1.0f;
+                    bool srs = g_rocket_var == ROCKET_SRS, napalm = g_rocket_var == ROCKET_NAPALM;
+                    static const float red[3] = {1.0f, 0.239f, 0.239f};
+                    float tank = g_napalm_fuel;
+                    st.clock_fill = napalm ? tank : !srs ? g_freeze_time / 5.0f : charge > 0 ? charge : ready;
+                    st.clock_alpha = (srs && charge <= 0 && ready < 1.0f) || (napalm && !g_napalm_firing && tank < 0.25f) ? 0.5f : 1.0f;
                     st.srs_charge = srs ? charge : 0.0f;
-                    for (int i = 0; i < 3; i++) st.clock_rgb[i] = srs ? green[i] + ((i == 0 ? 1.0f : 0.0f) - green[i]) * charge : blue[i];
+                    for (int i = 0; i < 3; i++) st.clock_rgb[i] = napalm ? red[i] : srs ? green[i] + ((i == 0 ? 1.0f : 0.0f) - green[i]) * charge : blue[i];
                 }
                 // (v0.75 wrote the launcher's saws, magnets and heat under the weapon's picture; from v0.76 they are
                 // on the gun's own display, as in ULTRAKILL, unless the model pack is an older one without it)
@@ -7823,8 +8822,12 @@ static bool draw_full_hud(IDXGISwapChain *sc) {
                     st.blade_spin = g_saw_blade * 3.14159265f / 180.0f;
                     st.blade_heat = g_saw_var == SAW_OVERHEAT ? g_saw_heat : 0.0f;
                     st.saw_count = (int)lroundf(g_saw_ammo);
+                    if (st.nailgun) {
+                        st.blade_heat = g_saw_var == SAW_OVERHEAT ? g_nail_heat : 0.0f;
+                        st.saw_count = (int)lroundf(g_nail_ammo);
+                    }
                     st.magnet_charge = g_magnet_charge;
-                    st.heat_sink = g_saw_sinks;
+                    st.heat_sink = st.nailgun ? g_nail_sinks : g_saw_sinks;
                 }
                 st.rail_charge = g_rail_charge;
                 st.twirl = g_twirl_angle * 3.14159265f / 180.0f;
@@ -7885,6 +8888,7 @@ static bool draw_full_hud(IDXGISwapChain *sc) {
                 st.rail_flash = (float)fmax(0.0, 1.0 - (now_s() - g_rail_full_at));
                 memcpy(st.arm_push, g_arm_push, sizeof(st.arm_push));
                 st.arm_roll = g_arm_roll;
+                st.arm_pitch = g_arm_pitch;
                 st.red_tint = g_red_tint;
                 if (g_visceral_gore && st.screen_blood_count + 2 <= HudState::MAX_SCREEN_BLOOD) {
                     // Over the hand, where it goes into the enemy: two of the screen's own blood splashes, small, the
@@ -8114,6 +9118,16 @@ static bool draw_full_hud(IDXGISwapChain *sc) {
                     // or orange from alpha 0.49.
                     static int have_saw = -1;
                     if (have_saw < 0) have_saw = hud_has_model("fx_saw") && hud_has_model("fx_saw_overheat") && hud_has_model("fx_saw_heated") ? 1 : 0;
+                    static int have_nail = -1;
+                    if (have_nail < 0) have_nail = hud_has_model("fx_nail") ? 1 : 0;
+                    for (const NailObj &nl : g_nails) {
+                        if (!nl.alive || nl.hidden) continue;
+                        float dx = nl.p[0] - eye[0], dy = nl.p[1] - eye[1], dz = nl.p[2] - eye[2];
+                        if (dx * dx + dy * dy + dz * dz < 1.0f) continue;
+                        if (have_nail == 1) aimed("fx_nail", nl.p, nl.v, true, 0);
+                        else sprite("softglow", nl.p, 0.12f, 0, 0.9f, 0.9f, 0.9f, 1.0f);
+                        if (nl.heated) sprite("softglow", nl.p, 0.35f, 0, 1.0f, 0.55f, 0.1f, 0.7f);
+                    }
                     for (const Saw &sw : g_saws) {
                         if (!sw.alive) continue;
                         static const float sizes[3] = {4.0f, 3.0f, 6.0f}, widths[3] = {2.0f, 2.0f, 3.0f};
@@ -8157,18 +9171,105 @@ static bool draw_full_hud(IDXGISwapChain *sc) {
                                 // (v0.76 to v0.84 drew the prefab's own flash picture here, a hard-edged star, which read
                                 // as a flat picture stuck on the harpoon. Davi: "feels like a png". Now a soft light: a
                                 // wide glow in the load's colour with a small white heart, shrinking as before.)
+                                // (v0.93: seen in the game on 2026-10-13, v0.85's glow washed the whole picture green from
+                                // two metres. It is smaller and fainter now, and never wider than the harpoon is far.)
                                 float size = 6.4f * UK_UNIT * (1.0f + mg.load) * expf(-5.0f * since), fade = 1.0f - since;
-                                sprite("softglow", mg.o, size * 1.5f, 0, mg.load, 1.0f - mg.load, 0.05f, 0.75f * fade);
-                                sprite("softglow", mg.o, size * 0.45f, 0, 1.0f, 1.0f, 0.9f, 0.9f * fade);
+                                float far_off = sqrtf(dx * dx + dy * dy + dz * dz);
+                                if (size > far_off) size = far_off;
+                                sprite("softglow", mg.o, size * 0.8f, 0, mg.load, 1.0f - mg.load, 0.05f, 0.4f * fade);
+                                sprite("softglow", mg.o, size * 0.22f, 0, 1.0f, 1.0f, 0.9f, 0.9f * fade);
                             }
+                    }
+                    // The Firestarter's oil and fire (ours to look at: see update_napalm). A blob is a small dark ball; a
+                    // stain is the effect ball pressed flat onto its surface, nearly black; a burning one has flames
+                    // over it, soft balls of light that rise and thin out, each on its own beat.
+                    for (const OilBlob &ob : g_oil)
+                        if (ob.alive) sprite("softglow", ob.p, 0.32f, 0, 0.16f, 0.09f, 0.03f, 0.95f);
+                    auto flames = [&](const float *base, const float *nrm, float wide, float tall, float strength, float seed, int count) {
+                        for (int k = 0; k < count; k++) {
+                            float beat = (float)fmod(st.time * (1.1 + 0.23 * k) + seed * (k + 1) * 0.37, 1.0), ang = seed * 3.1f + k * 2.4f + beat * 0.8f;
+                            float off = wide * (0.15f + 0.3f * ((k * 7 + 3) % 5) / 4.0f) * (1.0f - beat * 0.6f);
+                            float tx[3] = {nrm[1], -nrm[0], 0.0f}, tl = sqrtf(tx[0] * tx[0] + tx[1] * tx[1]);
+                            if (tl < 0.2f) { tx[0] = 1; tx[1] = 0; tx[2] = 0; tl = 1; }
+                            for (float &x : tx) x /= tl;
+                            float ty[3] = {nrm[1] * tx[2] - nrm[2] * tx[1], nrm[2] * tx[0] - nrm[0] * tx[2], nrm[0] * tx[1] - nrm[1] * tx[0]};
+                            float pt[3];
+                            for (int i = 0; i < 3; i++) pt[i] = base[i] + (tx[i] * cosf(ang) + ty[i] * sinf(ang)) * off + (i == 1 ? 0.15f + tall * beat : 0.0f) + nrm[i] * 0.1f;
+                            float size = wide * (0.75f - 0.45f * beat) * strength;
+                            sprite("softglow", pt, size, 0, 1.0f, 0.75f - 0.55f * beat, 0.18f - 0.16f * beat, (0.85f - 0.75f * beat) * strength);
+                        }
+                    };
+                    for (const OilStain &sn : g_stains) {
+                        if (!sn.alive) continue;
+                        float dx = sn.p[0] - eye[0], dy = sn.p[1] - eye[1], dz = sn.p[2] - eye[2], far_off = sqrtf(dx * dx + dy * dy + dz * dz);
+                        if (far_off > 70.0f) continue;
+                        float age = sn.burning ? (float)(st.time - sn.lit_at) : 0.0f, left = sn.burning && age > NAPALM_BURN ? 1.0f - (age - NAPALM_BURN) / NAPALM_FADE : 1.0f;
+                        if (left <= 0) continue;
+                        float grow = (float)(st.time - sn.born) < 0.15f ? (float)(st.time - sn.born) / 0.15f : 1.0f;
+                        if (st.world_mesh_count < HudState::MAX_WORLD_MESHES) {
+                            HudState::WorldMesh &w = st.world_meshes[st.world_mesh_count++];
+                            w = HudState::WorldMesh{};
+                            w.model = "fx_sphere";
+                            for (int i = 0; i < 3; i++) w.p[i] = sn.p[i] + sn.n[i] * 0.03f;
+                            w.radius = NAPALM_VOXEL * 0.62f * (0.4f + 0.6f * grow);
+                            w.rgba[0] = sn.burning ? 0.10f : 0.05f;
+                            w.rgba[1] = 0.035f;
+                            w.rgba[2] = 0.02f;
+                            w.rgba[3] = 0.9f * left;
+                            w.oriented = true;
+                            float tx[3] = {sn.n[1], -sn.n[0], 0.0f}, tl = sqrtf(tx[0] * tx[0] + tx[1] * tx[1]);
+                            if (tl < 0.2f) { tx[0] = 1; tx[1] = 0; tx[2] = 0; tl = 1; }
+                            for (float &x : tx) x /= tl;
+                            float ty[3] = {sn.n[1] * tx[2] - sn.n[2] * tx[1], sn.n[2] * tx[0] - sn.n[0] * tx[2], sn.n[0] * tx[1] - sn.n[1] * tx[0]};
+                            float c = cosf(sn.turn), sv = sinf(sn.turn);
+                            for (int i = 0; i < 3; i++) {
+                                w.ax[i] = tx[i] * c + ty[i] * sv;
+                                w.ay[i] = (ty[i] * c - tx[i] * sv) * 0.85f;
+                                w.az[i] = sn.n[i] * 0.03f;
+                            }
+                        }
+                        if (sn.burning && far_off < 55.0f && in_sight(sn.p)) {
+                            flames(sn.p, sn.n, NAPALM_VOXEL * 0.9f, 1.5f, left, sn.turn, far_off < 25.0f ? 5 : 3);
+                            float glow_at[3] = {sn.p[0] + sn.n[0] * 0.4f, sn.p[1] + sn.n[1] * 0.4f + 0.3f, sn.p[2] + sn.n[2] * 0.4f};
+                            sprite("softglow", glow_at, NAPALM_VOXEL * 2.2f, 0, 1.0f, 0.45f, 0.1f, 0.16f * left);
+                        }
+                    }
+                    for (const Oiled &ol : g_oiled) {
+                        float pt[3];
+                        const float up_n[3] = {0, 1, 0};
+                        if (!ol.chr || !ol.burning || !whip_target_point(ol.chr, pt) || !in_sight(pt)) continue;
+                        float at[3] = {pt[0], pt[1] - 0.6f, pt[2]};
+                        flames(at, up_n, 0.9f, 1.3f, 1.0f, (float)(ol.chr & 0xFFF) * 0.01f, 5);
                     }
                     // the mark over a stunned enemy (ours): a ring turning at its chest, beating between orange and white
                     for (const Stun &sn : g_stuns) {
                         float pt[3];
                         if (!sn.chr || st.time > sn.until || !whip_target_point(sn.chr, pt)) continue;
                         float beat = 0.5f + 0.5f * sinf((float)st.time * 14.0f);
-                        sprite("RageEffectWhite", pt, 0.75f, (float)fmod(st.time * 180.0, 360.0), 1.0f, 0.45f + 0.5f * beat, 0.1f + 0.7f * beat, 0.8f);
-                        sprite("softglow", pt, 0.45f, 0, 1.0f, 0.5f, 0.1f, 0.25f + 0.2f * beat);
+                        // (v0.85 to v0.90 drew ULTRAKILL's 54-pixel ring picture here, which was all blocks at this size: Davi.
+                        // Now two thin rings of drawn lines facing the eye, the inner one closing in and opening with the
+                        // beat, four marks turning round them, and a faint glow.)
+                        const int SEG = 40;
+                        float turn = (float)fmod(st.time * 2.2, 6.2831853);
+                        for (int ring = 0; ring < 2; ring++) {
+                            float rad = ring ? 0.30f + 0.05f * beat : 0.44f;
+                            float pa[3], pb[3];
+                            for (int k = 0; k <= SEG; k++) {
+                                float ang = 6.2831853f * k / SEG, cs = cosf(ang) * rad, sn = sinf(ang) * rad;
+                                for (int i = 0; i < 3; i++) pb[i] = pt[i] + right[i] * cs + up[i] * sn;
+                                if (k) thin_line(pa, pb, ring ? 0.012f : 0.018f, 1.0f, 0.55f + 0.4f * beat, 0.15f + 0.6f * beat, 0.9f);
+                                memcpy(pa, pb, sizeof(pa));
+                            }
+                        }
+                        for (int k = 0; k < 4; k++) {
+                            float ang = turn + 1.5707963f * k, cs = cosf(ang), sn = sinf(ang), pa[3], pb[3];
+                            for (int i = 0; i < 3; i++) {
+                                pa[i] = pt[i] + (right[i] * cs + up[i] * sn) * 0.47f;
+                                pb[i] = pt[i] + (right[i] * cs + up[i] * sn) * 0.58f;
+                            }
+                            thin_line(pa, pb, 0.02f, 1.0f, 0.8f, 0.5f, 0.95f);
+                        }
+                        sprite("softglow", pt, 0.5f, 0, 1.0f, 0.5f, 0.1f, 0.18f + 0.14f * beat);
                     }
                     // Rockets: the 'Rocket' prefab's own model along its way (2.1 u long), behind it its trail
                     // (0.15 s long, 1 u wide down to nothing, orange at alpha 0.39) and at its tail the blinking
@@ -8376,6 +9477,7 @@ static bool draw_full_hud(IDXGISwapChain *sc) {
 static volatile LONG g_freezes = 0;
 static HRESULT WINAPI my_present(IDXGISwapChain *sc, UINT sync, UINT flags) {
     InterlockedIncrement(&g_presents);
+    double perf_t0 = real_s();
     float freeze = g_freeze_request, stop = g_hitstop_request;
     g_hitstop_request = 0;
     if (freeze > 0 && !g_parry_freeze) {
@@ -8392,6 +9494,7 @@ static HRESULT WINAPI my_present(IDXGISwapChain *sc, UINT sync, UINT flags) {
     bool full = (g_ctrl || g_dead) && draw_full_hud(sc);       // (dead: the black screen stays up through the game's own loading)
     if (g_ctrl && !full) draw_hud(sc);
     g_in_hud_draw = false;
+    if (g_ctrl) perf_present(perf_t0);
     if (!(freeze > 0)) {
         if (!(stop > 0) || !g_parry_freeze || !full) return g_orig_present(sc, sync, flags);
         // TimeController.HitStop: the frame of the hit stays up for the length of the stop, with no flash,

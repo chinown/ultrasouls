@@ -30,7 +30,7 @@ Everything is matched against ULTRAKILL's own code and prefab data: speeds, timi
 - **Finishing blows**: an enemy left nearly dead is staggered; F or G finishes it (after Doom Eternal's glory kills).
 - **HUD**: ULTRAKILL's weapon panel, health and stamina, style meter and ranks, boss bars, the displays on the guns.
 - **Feel**: healing from blood, hit stop, parry flash, camera tilt, explosions that throw you.
-- **Enemies the same everywhere**: their health no longer grows with the area or New Game+, so V1's fixed damage works from the Asylum to the Kiln at any character level.
+- **Enemies the same everywhere**: their health no longer grows with the area or New Game+, so V1's fixed damage works from the Asylum to the Kiln at any character level; and they move, turn and attack at ULTRAKILL's Violent pace.
 - **Death**: ULTRAKILL's death sequence and screen, and **R** to restart at the last bonfire: at once if nothing was killed and the bonfire is near, otherwise through the game's own reload, which brings the enemies back. Souls are left in a bloodstain, as in Dark Souls.
 - **Title screen**: Dark Souls' menu as ULTRAKILL's, with its buttons and letters.
 - **V1's body** in third person.
@@ -75,6 +75,6 @@ The addresses in the DLL are for one build of the Steam exe; [docs/DETAILS.md](d
 
 ## Status
 
-Work in progress, built and tested on one machine. Everything up to v0.93 has been run in the game; v0.94's enemy balance has not yet. Version by version notes, how each part works and what is still missing: [docs/DETAILS.md](docs/DETAILS.md).
+Work in progress, built and tested on one machine. Everything up to v0.93 has been run in the game; v0.94's enemy balance and v0.95's enemy pace have not yet. Version by version notes, how each part works and what is still missing: [docs/DETAILS.md](docs/DETAILS.md).
 
 Not affiliated with FromSoftware, Bandai Namco, Arsi "Hakita" Patala or New Blood Interactive.

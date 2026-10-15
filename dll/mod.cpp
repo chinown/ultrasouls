@@ -44,7 +44,7 @@ static const float JUMP_V0 = 9.0f;   // m/s
 static const float JUMP_G = 20.0f;   // m/s^2 while rising; the game's own gravity handles the fall
 static const float AIR_CARRY = 1.3f; // horizontal speed kept in the air, as a multiple of ground speed at takeoff
 
-#define MOD_VERSION "v0.94"
+#define MOD_VERSION "v0.95"
 static HMODULE g_real = nullptr;
 static FILE *g_log = nullptr;
 
@@ -635,6 +635,11 @@ static volatile bool g_death_penalty = true, g_glory_kills = true;
 // held as the nailgun (1 Attractor, 2 Overheat); X swaps the one in the hand; kept in ultrasouls.ini as nailgun=.
 // (Nothing set: the sawblade launchers, as from v0.75.)
 static volatile int g_nail_mask = 0;
+// The enemies' pace in first person (v0.95, Davi: enemies as fast as ULTRAKILL's on Violent). Every enemy's
+// animation runs this much faster (Dark Souls moves its characters by their animations, so walking and running
+// speed up with them): enemy_move_speed for everything but its attacks, enemy_attack_speed for those. 1 and 1
+// are Dark Souls' own.
+static volatile float g_enemy_move_speed = 1.5f, g_enemy_attack_speed = 1.25f;
 static volatile bool g_title_menu = true;        // title_menu: Dark Souls' title screen dressed as ULTRAKILL's main menu
 static volatile bool g_title_column = true;      // title_column: its buttons in ULTRAKILL's left column with its own letters (v0.83; on since v0.93, when it was first run in the game: arrow keys, the pointer and Continue all worked)
 static volatile float g_chain_slow = 1.6f;
@@ -682,6 +687,8 @@ static const uintptr_t OFF_POS_GROUNDED = 0x32;
 static const uintptr_t OFF_POS_NO_ADJUST = 0x1F8;
 
 static void try_instant_fire();
+static void pace_enemies(double t, bool on);
+static volatile bool g_pace_reset = false;        // first person was left: the enemies get the game's own speed back
 
 // The game steps a character through one of two functions with the same arguments, chosen by a flag
 // on the character (ChrPosData+0x6D). Hooking only the first meant the controller did not run on
@@ -1388,10 +1395,11 @@ static void save_settings() {
     settings_path(path);
     FILE *f = _wfopen(path, L"w");
     if (!f) return;
-    fprintf(f, "sensitivity=%.6f\nfov_scale=%.2f\neye_height=%.2f\nvolume=%.2f\ncamera_tilt=%d\nparry_freeze=%d\nhud_motion=%d\nslab=%d\nstyle_gain=%.2f\nstyle_drain=%.2f\nhide_move_keys=%d\nquick_draw=%d\nfast_respawn=%d\nreset_enemies=%d\nchain_slow=%.2f\ntitle_menu=%d\ntitle_column=%d\nrestart_reload=%d\nslab_click=%d\ndeath_penalty=%d\nglory_kills=%d\nnailgun=%d\n", (float)g_sens,
+    fprintf(f, "sensitivity=%.6f\nfov_scale=%.2f\neye_height=%.2f\nvolume=%.2f\ncamera_tilt=%d\nparry_freeze=%d\nhud_motion=%d\nslab=%d\nstyle_gain=%.2f\nstyle_drain=%.2f\nhide_move_keys=%d\nquick_draw=%d\nfast_respawn=%d\nreset_enemies=%d\nchain_slow=%.2f\ntitle_menu=%d\ntitle_column=%d\nrestart_reload=%d\nslab_click=%d\ndeath_penalty=%d\nglory_kills=%d\nnailgun=%d\nenemy_move_speed=%.2f\nenemy_attack_speed=%.2f\n", (float)g_sens,
             (float)g_fov_scale, (float)g_eye_height, (float)g_volume, g_camera_tilt ? 1 : 0, g_parry_freeze ? 1 : 0, g_hud_motion ? 1 : 0, (int)g_slab_mask & 7,
             (float)g_style_gain, (float)g_style_drain, g_hide_move_setting ? 1 : 0, g_quick_draw ? 1 : 0, g_fast_respawn ? 1 : 0, g_respawn_enemies ? 1 : 0,
-            (float)g_chain_slow, g_title_menu ? 1 : 0, g_title_column ? 1 : 0, g_restart_reload ? 1 : 0, g_slab_click ? 1 : 0, g_death_penalty ? 1 : 0, g_glory_kills ? 1 : 0, (int)g_nail_mask & 3);
+            (float)g_chain_slow, g_title_menu ? 1 : 0, g_title_column ? 1 : 0, g_restart_reload ? 1 : 0, g_slab_click ? 1 : 0, g_death_penalty ? 1 : 0, g_glory_kills ? 1 : 0, (int)g_nail_mask & 3, (float)g_enemy_move_speed,
+            (float)g_enemy_attack_speed);
     fclose(f);
 }
 static bool load_settings() {
@@ -1416,6 +1424,8 @@ static bool load_settings() {
         else if (!strcmp(key, "death_penalty")) g_death_penalty = v != 0.0f;
         else if (!strcmp(key, "glory_kills")) g_glory_kills = v != 0.0f;
         else if (!strcmp(key, "nailgun")) g_nail_mask = (int)v & 3;
+        else if (!strcmp(key, "enemy_move_speed") && v >= 0.5f && v <= 3.0f) g_enemy_move_speed = v;
+        else if (!strcmp(key, "enemy_attack_speed") && v >= 0.5f && v <= 3.0f) g_enemy_attack_speed = v;
         else if (!strcmp(key, "reset_enemies")) g_respawn_enemies = v != 0.0f;
         else if (!strcmp(key, "chain_slow") && v >= 0.5f && v <= 6.0f) g_chain_slow = v;
         else if (!strcmp(key, "hud_motion")) g_hud_motion = v != 0.0f;
@@ -1507,7 +1517,12 @@ static uint64_t hook_cam(void *self, float dt, void *a3, void *a4, uint64_t a5, 
         float frame = last > 0 && now - last < 0.1 ? (float)(now - last) : 0.0f;
         last = now;
         if (on && !g_sliding) g_boost = g_boost + V1_BOOST_REGEN * frame > 300.0f ? 300.0f : g_boost + V1_BOOST_REGEN * frame;
+        if (!on && g_pace_reset) {
+            g_pace_reset = false;
+            pace_enemies(now_s(), false);
+        }
         if (on) {
+            g_pace_reset = true;
             double p0 = real_s();
             try_instant_fire();
             double took = real_s() - p0;
@@ -7648,6 +7663,54 @@ static void death_watch(bool player_there, int hp, double t) {
     if (g_dead && t - d.t0 > 180.0) death_end("three minutes");
 }
 
+// ---- The enemies' pace (v0.95). What ULTRAKILL's Violent difficulty does, read from its code against Standard: a
+// husk's animations run 1.25 times as fast (Zombie: speedMultiplier 1.25; Brutal 1.5), a Filth's melee comes back
+// after 0.25 s instead of 0.5 (ZombieMelee.defaultCoolDown), it turns at 2600 degrees a second instead of 800, and the
+// Swordsmachine animates 1.2 times as fast and moves 1.2 times as far. Its enemies also move fast to begin with:
+// 10 to 12.5 units a second for a Stray or a Schism (5 to 6 m/s on Violent), 20 for a Filth or a Swordsmachine
+// (10 m/s), against V1's own 16.5 (8 m/s). A Dark Souls hollow runs at about 4 to 5 m/s and walks at 1.5.
+// So here every enemy's animation speed (ChrAnimData + 0xA8, the field the player's own speed has been changed by
+// since v0.1: Dark Souls moves its characters by their animations, so walking and running speed up with it) is
+// set, every frame in first person: 1.5 for everything but its attacks, which closes most of the gap to ULTRAKILL's
+// pursuit, and 1.25, Violent's own, for its attacks (3000 to 3999), which keeps them fast but still readable and
+// parriable. Left at the game's own speed: deaths, falls and throws (6000 and on, 2500 to 2599: the visceral attack
+// is timed on them), an enemy that is stunned for the visceral attack, and any character whose speed the game
+// has set to something other than 1 itself.
+static float g_pace_set[MAX_TRACKED];             // what was last written into each tracked character (0: nothing of ours)
+static void pace_enemies(double t, bool on) {
+    uintptr_t exe = (uintptr_t)GetModuleHandleA(nullptr);
+    for (int i = 0; i < MAX_TRACKED; i++) {
+        uintptr_t havok = g_tracked[i].havok, owner = 0, ctrl = 0, anim = 0, vt = 0;
+        if (!havok || havok == g_player_pos || !safe_read(havok + OFF_HAVOK_OWNER, &owner, 8) || owner < 0x10000) {
+            g_pace_set[i] = 0;
+            continue;
+        }
+        uintptr_t chr = owner - OWNER_DELTA;
+        if (!safe_read(chr, &vt, 8) || vt != exe + RVA_VT_ENEMY || !safe_read(chr + 0x68, &ctrl, 8) || ctrl < 0x10000 ||
+            !safe_read(ctrl + 0x18, &anim, 8) || anim < 0x10000) {
+            g_pace_set[i] = 0;
+            continue;
+        }
+        float cur = 0;
+        if (!safe_read(anim + OFF_ANIM_SPEED, &cur, 4)) continue;
+        bool ours = g_pace_set[i] > 0 && fabsf(cur - g_pace_set[i]) < 1e-4f;
+        if (!ours && fabsf(cur - 1.0f) > 1e-4f) {        // the game's own speed on it (a slowing effect, a stop): left alone
+            g_pace_set[i] = 0;
+            continue;
+        }
+        float want = 1.0f;
+        int hp = 0;
+        bool stunned = false;
+        for (const Stun &sn : g_stuns) stunned = stunned || (sn.chr == chr && t <= sn.until);
+        if (on && safe_read(chr + OFF_CHR_HP, &hp, 4) && hp > 0 && !stunned && chr != g_visceral_chr) {
+            int id = -1;
+            bool attacking = enemy_attacking(chr, id);
+            want = attacking ? g_enemy_attack_speed : (id >= 6000 || (id >= 2500 && id < 2600)) ? 1.0f : g_enemy_move_speed;
+        }
+        if (fabsf(cur - want) > 1e-4f) safe_write(anim + OFF_ANIM_SPEED, &want, 4);
+        g_pace_set[i] = fabsf(want - 1.0f) < 1e-4f ? 0.0f : want;
+    }
+}
 // once per frame, on the game's thread
 static void try_instant_fire() {
     static double last = 0;
@@ -7964,6 +8027,7 @@ static void try_instant_fire() {
         update_sway(dt);
     }
     if (g_ctrl) watch_enemies(t, dt);
+    pace_enemies(t, g_ctrl && !g_dead);
     style_update(dt);
     update_punch(armed, dt);
     update_whiplash(armed, t, dt);

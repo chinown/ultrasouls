@@ -55,6 +55,18 @@ MOST_SHOTS = 24.0           # no enemy that is not a boss takes more than this
 AREA_EFFECTS = list(range(7001, 7016)) + [7100]
 NEW_GAME_EFFECTS = list(range(7401, 7416))
 
+# ---- The enemies' pace (v0.95; `--vanilla-pace` leaves it as the game has it). The DLL runs the enemies' animations
+# faster in first person (see pace_enemies in mod.cpp); what is in the tables here goes with it. ULTRAKILL's enemies
+# turn fast (a Filth at 2600 degrees a second on Violent, 800 on Standard), see and hear the player across their
+# arena, start fighting at once and never walk back home. Dark Souls' turn at a median of 120 degrees a second, see
+# 30 m, hear 10 m, start a fight within 20 m and give up a chase at 50 to 75 m from home.
+PACE = "--vanilla-pace" not in sys.argv
+PACE_TURN = 2.0             # turning speed (NpcParam.turnVellocity): also how hard an attack tracks the player
+PACE_SIGHT = 1.5            # how far they see (eye_dist)
+PACE_HEARING = 2.0          # how far they hear (ear_dist)
+PACE_ENGAGE = 1.5           # how far off they start a fight (BattleStartDist)
+PACE_PURSUIT = 2.0          # how far they chase before going home (maxBackhomeDist, backhomeDist, backhomeBattleDist)
+
 HEAL_SPEFFECT = 6990        # Butcher Knife's heal-on-hit, reused for every melee weapon
 HEAL_PER_HIT = 100
 MELEE_CATEGORIES = range(0, 10)   # dagger .. fist; excludes bows, crossbows, shields, ammo
@@ -396,6 +408,27 @@ if BALANCE:
         for rid, (hp, shots, boss) in sorted(balanced.items(), key=lambda kv: (not kv[1][2], -kv[1][1])):
             print("  %7d %-28s base health %5d -> %5d (%5.1f shots)%s" % (rid, boss_names.get(rid, ""), hp, npc.get(rid, "hp"), shots, "  boss" if boss else ""))
 
+pace_note = "the enemies' pace left as the game has it (--vanilla-pace)"
+if PACE:
+    def scaled(table, rid, field, k):
+        v = table.get(rid, field)
+        if v <= 0 or v >= 9999:                  # (0 and 9999 mean "never" and "always": left as they are)
+            return 0
+        nv = v * k
+        table.set(rid, field, int(round(min(nv, 9998))) if isinstance(v, int) else float(min(nv, 9998.0)))
+        return 1
+    npc_t, think = g["NpcParam"], g["NpcThinkParam"]
+    n_turn = sum(scaled(npc_t, rid, "turnVellocity", PACE_TURN) for rid in npc_t.order)
+    n_think = 0
+    for rid in think.order:
+        n_think += scaled(think, rid, "eye_dist", PACE_SIGHT)
+        scaled(think, rid, "ear_dist", PACE_HEARING)
+        scaled(think, rid, "BattleStartDist", PACE_ENGAGE)
+        for f in ("maxBackhomeDist", "backhomeDist", "backhomeBattleDist"):
+            scaled(think, rid, f, PACE_PURSUIT)
+    pace_note = ("the enemies' pace: %d turn %.1f times as fast; %d AI rows see %.1f times, hear %.1f times, engage %.1f times and chase %.1f "
+                 "times as far" % (n_turn, PACE_TURN, n_think, PACE_SIGHT, PACE_HEARING, PACE_ENGAGE, PACE_PURSUIT))
+
 os.makedirs(os.path.dirname(OUT), exist_ok=True)
 g.save(OUT)
 
@@ -437,7 +470,15 @@ if BALANCE:
     assert abs(cs.get(7401, "maxHpRate") - 1) < 1e-6 and abs(cs.get(7401, "physicsAttackPowerRate") - 2.4) < 1e-3
     assert KEEP_ENEMY_ATTACK or abs(cs.get(7014, "physicsAttackPowerRate") - 1) < 1e-6
     assert chk["AtkParam_Pc"].get(ARM_ROWS["nail"][0], "atkPhys") == int(REVOLVER_DAMAGE * 0.205)
+if PACE:
+    # read back one row of each: a hollow's turn (the game's 120 degrees a second) and an AI row's sight
+    _src = GameParam(SRC, DEFS)
+    _rid = next(r for r in _src["NpcParam"].order if 0 < _src["NpcParam"].get(r, "turnVellocity") < 9999)
+    assert abs(chk["NpcParam"].get(_rid, "turnVellocity") - _src["NpcParam"].get(_rid, "turnVellocity") * PACE_TURN) < 0.51
+    _rid = next(r for r in _src["NpcThinkParam"].order if 0 < _src["NpcThinkParam"].get(r, "eye_dist") < 9999)
+    assert abs(chk["NpcThinkParam"].get(_rid, "eye_dist") - _src["NpcThinkParam"].get(_rid, "eye_dist") * PACE_SIGHT) < 0.51
 print(balance_note)
+print(pace_note)
 print("V1's body for an unarmoured player: %s" % ("on (the pieces are in the game's parts folder)" if v1_body else "off (the pieces are not installed: tools/ds_v1_body.py)"))
 print("built", os.path.normpath(OUT), os.path.getsize(OUT), "bytes")
 
